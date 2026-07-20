@@ -23,6 +23,11 @@ from isaaclab.utils.noise import UniformNoiseCfg as Unoise
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 
 from .algorithm.config import DEFAULT_INTERFACE_CFG
+from .randomization import (
+    FASTWMR_FRICTION_ATTR,
+    FASTWMR_PAYLOAD_MASS_ATTR,
+    FASTWMR_PUSH_FORCE_TORQUES_ATTR,
+)
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
@@ -64,11 +69,11 @@ def _device(env: "ManagerBasedEnv") -> torch.device:
 
 
 def _privileged_buffer(env: "ManagerBasedEnv", name: str, width: int) -> torch.Tensor:
-    """Read a per-environment DR record, returning zeros until DR is enabled.
+    """Read a per-environment DR record, returning zeros in isolated tests.
 
-    Phase 4 randomization terms will create and update these buffers. Zero
-    fallback keeps task registration and nominal smoke tests independent from
-    randomization while preserving the final tensor layout.
+    The environment startup event creates these buffers before observations are
+    evaluated. The fallback keeps standalone observation-function tests usable
+    without constructing an IsaacLab event manager.
     """
 
     value = getattr(env, name, None)
@@ -87,19 +92,19 @@ def _privileged_buffer(env: "ManagerBasedEnv", name: str, width: int) -> torch.T
 def privileged_friction(env: "ManagerBasedEnv") -> torch.Tensor:
     """Return the scalar friction coefficient applied to each environment."""
 
-    return _privileged_buffer(env, "fastwmr_friction", 1)
+    return _privileged_buffer(env, FASTWMR_FRICTION_ATTR, 1)
 
 
 def privileged_payload_mass(env: "ManagerBasedEnv") -> torch.Tensor:
     """Return the randomized additional payload mass in kilograms."""
 
-    return _privileged_buffer(env, "fastwmr_payload_mass", 1)
+    return _privileged_buffer(env, FASTWMR_PAYLOAD_MASS_ATTR, 1)
 
 
 def privileged_push_force_torque(env: "ManagerBasedEnv") -> torch.Tensor:
     """Return applied body-frame force xyz followed by torque xyz."""
 
-    return _privileged_buffer(env, "fastwmr_push_force_torques", 6)
+    return _privileged_buffer(env, FASTWMR_PUSH_FORCE_TORQUES_ATTR, 6)
 
 
 def privileged_foot_contacts(

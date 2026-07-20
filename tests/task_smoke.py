@@ -18,6 +18,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num-envs", type=int, default=16)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--full-dr", action="store_true")
     return parser.parse_args()
 
 
@@ -31,10 +32,14 @@ simulation_app = app_launcher.app
 
 import gymnasium as gym
 import torch
+import warp as wp
 
 import isaaclab.sim as sim_utils
 import isaaclab_tasks  # noqa: F401
 import isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr  # noqa: F401
+from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.randomization import (
+    FASTWMR_DR_BUFFER_WIDTHS,
+)
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
 
@@ -50,7 +55,8 @@ def _apply_debug_overrides(cfg: object) -> None:
     cfg.seed = ARGS.seed
     cfg.scene.num_envs = ARGS.num_envs
     cfg.observations.policy.enable_corruption = False
-    cfg.events.base_external_force_torque = None
+    if not ARGS.full_dr:
+        cfg.events.base_external_force_torque = None
     cfg.events.push_robot = None
     cfg.curriculum.terrain_levels = None
 
@@ -82,6 +88,49 @@ def _check_observations(task_id: str, observations: dict[str, torch.Tensor]) -> 
         _assert_finite(f"{task_id}/{group_name}", tensor)
 
 
+def _check_dr_buffers(task_id: str, env: object) -> None:
+    for attribute, width in FASTWMR_DR_BUFFER_WIDTHS.items():
+        buffer = getattr(env, attribute, None)
+        if not isinstance(buffer, torch.Tensor):
+            raise AssertionError(f"{task_id} did not initialize env.{attribute}.")
+        if buffer.shape != (ARGS.num_envs, width):
+            raise AssertionError(
+                f"{task_id}/env.{attribute} has shape {buffer.shape}, expected {(ARGS.num_envs, width)}."
+            )
+        if buffer.device != torch.device(env.device) or buffer.dtype != torch.float32:
+            raise AssertionError(f"{task_id}/env.{attribute} has an invalid device or dtype.")
+        _assert_finite(f"{task_id}/env.{attribute}", buffer)
+
+
+def _check_dr_physics(task_id: str, env: object) -> None:
+    robot = env.scene["robot"]
+
+    materials = wp.to_torch(robot.root_view.get_material_properties())
+    recorded_friction = env.fastwmr_friction[:, 0].cpu()
+    expected_friction = recorded_friction[:, None].expand_as(materials[..., 0])
+    if not torch.allclose(materials[..., 0], expected_friction) or not torch.allclose(
+        materials[..., 1], expected_friction
+    ):
+        raise AssertionError(f"{task_id} recorded friction does not match PhysX material properties.")
+
+    payload_term = env.event_manager.get_term_cfg("randomize_fastwmr_payload").func
+    pelvis_id = payload_term.body_ids.to(dtype=torch.long)
+    actual_mass = robot.data.body_mass.torch[:, pelvis_id].squeeze(-1)
+    nominal_mass = payload_term.default_mass[:, pelvis_id].squeeze(-1)
+    if not torch.allclose(actual_mass - nominal_mass, env.fastwmr_payload_mass[:, 0]):
+        raise AssertionError(f"{task_id} recorded payload does not match the applied pelvis mass.")
+
+    if ARGS.full_dr:
+        wrench_cfg = env.event_manager.get_term_cfg("base_external_force_torque")
+        pelvis_id = wrench_cfg.params["asset_cfg"].body_ids[0]
+        composer = robot.permanent_wrench_composer
+        applied_force = wp.to_torch(composer.local_force_b)[:, pelvis_id]
+        applied_torque = wp.to_torch(composer.local_torque_b)[:, pelvis_id]
+        applied_wrench = torch.cat((applied_force, applied_torque), dim=-1)
+        if not torch.allclose(applied_wrench, env.fastwmr_push_force_torques):
+            raise AssertionError(f"{task_id} recorded wrench does not match the applied body-frame wrench.")
+
+
 def _run_task(task_id: str) -> None:
     sim_utils.create_new_stage()
     cfg = parse_env_cfg(task_id, device=ARGS.device, num_envs=ARGS.num_envs)
@@ -99,6 +148,8 @@ def _run_task(task_id: str) -> None:
 
         observations, _ = env.reset(seed=ARGS.seed)
         _check_observations(task_id, observations)
+        _check_dr_buffers(task_id, env.unwrapped)
+        _check_dr_physics(task_id, env.unwrapped)
 
         with torch.inference_mode():
             for step in range(ARGS.steps):

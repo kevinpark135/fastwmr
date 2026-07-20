@@ -33,6 +33,12 @@ Implementation is progressing in independently verified layers:
 - FastSAC C51 critic: added independent online/target categorical twin critics,
   entropy-aware Bellman projection, cross-entropy critic updates, and mean-Q
   actor updates. The default support is 101 atoms over ``[-20, 20]``.
+- FastWMR DR records: added startup-managed per-environment friction, payload,
+  and 6D external-wrench buffers with fixed shapes, partial-env reset support,
+  and privileged-observation wiring.
+- FastWMR exact DR path: replaced opaque built-in samples with environment-level
+  sample/apply/record events for friction, additive pelvis payload, and episodic
+  body-frame pelvis wrench; smoke tests compare records against PhysX tensors.
 
 ## Verification
 
@@ -42,6 +48,9 @@ isolated Isaac Sim smoke gate with:
 ```bash
 python tests/task_smoke.py --steps 1000 --num-envs 16
 ```
+
+Add ``--full-dr`` to retain external wrench randomization and verify every DR
+record directly against the applied PhysX material, mass, and wrench tensors.
 
 Run the compact FastSAC learner gate with:
 

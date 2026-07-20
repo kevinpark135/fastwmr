@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.configclass import configclass
@@ -20,6 +21,12 @@ from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import (
 from isaaclab_assets import G1_29DOF_CFG  # isort: skip
 
 from .observations import FastWMRObservationsCfg, G1_29DOF_JOINT_PATTERNS
+from .randomization import (
+    initialize_fastwmr_dr_buffers,
+    randomize_and_record_friction,
+    randomize_and_record_payload_mass,
+    sample_apply_record_external_wrench,
+)
 
 
 @configclass
@@ -120,11 +127,46 @@ class G1FastWMREnvCfg(LocomotionVelocityRoughEnvCfg):
         self.actions.joint_pos.joint_names = list(G1_29DOF_JOINT_PATTERNS)
         self.actions.joint_pos.preserve_order = False
 
-        # Payload randomization is introduced in phase 4; keep it disabled for
-        # the nominal task-registration gate.
+        # Each FastWMR DR event owns sample -> physics application -> recording.
+        # Disable the inherited terms because their internal samples are not
+        # available to the privileged reconstruction target.
+        self.events.physics_material = None
         self.events.add_base_mass = None
         self.events.base_com = None
-        self.events.base_external_force_torque.params["asset_cfg"].body_names = "pelvis"
+        self.events.initialize_fastwmr_dr_buffers = EventTerm(
+            func=initialize_fastwmr_dr_buffers,
+            mode="startup",
+            params={"nominal_friction": 0.8},
+        )
+        self.events.randomize_fastwmr_friction = EventTerm(
+            func=randomize_and_record_friction,
+            mode="startup",
+            params={
+                "friction_range": (0.2, 1.5),
+                "restitution": 0.0,
+                "num_buckets": 64,
+                "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+            },
+        )
+        self.events.randomize_fastwmr_payload = EventTerm(
+            func=randomize_and_record_payload_mass,
+            mode="startup",
+            params={
+                "payload_mass_range": (-5.0, 5.0),
+                "asset_cfg": SceneEntityCfg("robot", body_names="pelvis"),
+                "min_mass": 1.0,
+            },
+        )
+        self.events.base_external_force_torque = EventTerm(
+            func=sample_apply_record_external_wrench,
+            mode="reset",
+            params={
+                "force_range": (-50.0, 50.0),
+                "torque_range": (-10.0, 10.0),
+                "asset_cfg": SceneEntityCfg("robot", body_names="pelvis"),
+            },
+        )
+        self.events.push_robot = None
         # G1 has precise initial pose — don't scale joint defaults randomly on reset
         self.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)
 
@@ -175,6 +217,8 @@ class G1FastWMREnvCfg_PLAY(G1FastWMREnvCfg):
         self.commands.base_velocity.ranges.heading = (0.0, 0.0)
         # disable randomization for play
         self.observations.policy.enable_corruption = False
-        # remove random pushing
+        self.events.randomize_fastwmr_friction.params["friction_range"] = (0.8, 0.8)
+        self.events.randomize_fastwmr_payload.params["payload_mass_range"] = (0.0, 0.0)
+        # Remove external disturbances while retaining nominal DR records.
         self.events.base_external_force_torque = None
         self.events.push_robot = None
