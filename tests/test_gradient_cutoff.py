@@ -2,10 +2,10 @@
 
 import torch
 
-from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.fastwmr_algorithm.config import (
+from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.config import (
     DEFAULT_INTERFACE_CFG,
 )
-from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.fastwmr_algorithm.utils.feature_builder import (
+from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.utils.feature_builder import (
     build_control_feature,
     build_critic_input,
 )

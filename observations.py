@@ -4,7 +4,7 @@
 """FastWMR policy observations and privileged reconstruction targets.
 
 Term declaration order is part of the algorithm interface. Keep it synchronized
-with :mod:`fastwmr_algorithm.config`; changing an item here must also change the
+with :mod:`algorithm.config`; changing an item here must also change the
 interface-contract tests and the decoder output layout.
 """
 
@@ -22,7 +22,7 @@ from isaaclab.utils.noise import UniformNoiseCfg as Unoise
 
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 
-from .fastwmr_algorithm.config import DEFAULT_INTERFACE_CFG
+from .algorithm.config import DEFAULT_INTERFACE_CFG
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv

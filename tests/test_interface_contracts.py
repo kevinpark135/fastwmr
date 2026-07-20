@@ -2,7 +2,7 @@
 
 import pytest
 
-from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.fastwmr_algorithm.config import (
+from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.config import (
     ControlFeatureMode,
     DEFAULT_INTERFACE_CFG,
     FastWMRInterfaceCfg,

@@ -8,7 +8,7 @@ FastWMR runs. It should bridge task registration and the custom learner without
 pulling torch networks into the environment config import path.
 
 Planned responsibilities:
-- Point training scripts at ``fastwmr_algorithm/config.py`` defaults.
+- Point training scripts at ``algorithm/config.py`` defaults.
 - Expose key CLI-overridable fields: transition replay capacity, estimator
   rollout length, batch size, update count, discount, entropy settings, and
   control-feature ablations.

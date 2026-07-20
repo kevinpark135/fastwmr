@@ -1,6 +1,6 @@
 """Tests for the ordered FastWMR observation contract."""
 
-from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.fastwmr_algorithm.config import (
+from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.config import (
     DEFAULT_INTERFACE_CFG,
     TargetKind,
 )

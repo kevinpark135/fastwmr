@@ -2,7 +2,7 @@
 
 import torch
 
-from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.fastwmr_algorithm.utils.temporal_state import (
+from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.utils.temporal_state import (
     RecurrentState,
     bellman_bootstrap_mask,
     episode_end_mask,
