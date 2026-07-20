@@ -3,8 +3,7 @@
 This directory is the staging area for the FastWMR implementation described in
 `pdf/FastWMR.pdf`, `pdf/directory.pdf`, and `pdf/roadmap.pdf`.
 
-The current files are mostly structure and ownership markers. Implementation
-will be added in layers:
+Implementation is progressing in independently verified layers:
 
 1. Environment/task layer: observations, rewards, randomization, curriculum, and
    baseline task registration.
@@ -22,6 +21,9 @@ will be added in layers:
 - Task smoke gate: registered FastWMR and policy-only FastSAC training/play
   tasks, enabled G1 contact reporters, and completed 1,000 finite random-action
   steps for both training tasks with 16 environments.
+- FastSAC core gate: connected Rough G1 collection to transition replay and the
+  scalar SAC learner, including random-action warm-up, replay wraparound,
+  reset-safe final observations, and finite actor/critic/temperature updates.
 
 ## Verification
 
@@ -30,4 +32,12 @@ isolated Isaac Sim smoke gate with:
 
 ```bash
 python tests/task_smoke.py --steps 1000 --num-envs 16
+```
+
+Run the compact FastSAC learner gate with:
+
+```bash
+python script/train.py --viz none --device cuda:0 --num-envs 16 --steps 12 \
+  --replay-capacity 64 --random-action-steps 1 --minimum-replay-size 32 \
+  --batch-size 32 --num-updates 1 --hidden-dim 64 --rough-debug
 ```

@@ -1,11 +1,74 @@
-"""CLI argument helpers for FastWMR scripts.
+"""Command-line arguments shared by FastWMR training scripts."""
 
-Planned argument groups:
-- task and logging paths
-- FastSAC hyperparameters such as batch size, gamma, update count, and entropy
-  target
-- FastWMR hyperparameters such as estimator rollout length, transition replay
-  capacity, hidden dimension, and control-feature mode
-- ablation toggles for baseline, reconstruction-only control, estimator freeze,
-  gradient cutoff, recent replay horizon, and symmetry augmentation
-"""
+from __future__ import annotations
+
+import argparse
+
+
+FASTSAC_BASELINE_TASK = "Isaac-Velocity-G1-FastSAC-Baseline-v0"
+
+
+def build_train_parser() -> argparse.ArgumentParser:
+    """Create the algorithm parser before IsaacLab adds launcher arguments."""
+
+    parser = argparse.ArgumentParser(description="Train or smoke-test the FastSAC core baseline.")
+    parser.add_argument("--task", default=FASTSAC_BASELINE_TASK)
+    parser.add_argument("--num-envs", type=int, default=64)
+    parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--replay-capacity", type=int, default=1_000_000)
+    parser.add_argument("--replay-storage-device", default="cpu")
+    parser.add_argument("--random-action-steps", type=int, default=10)
+    parser.add_argument("--minimum-replay-size", type=int, default=8192)
+    parser.add_argument("--batch-size", type=int, default=8192)
+    parser.add_argument("--num-updates", type=int, default=8)
+    parser.add_argument("--hidden-dim", type=int, default=768)
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-3)
+    parser.add_argument("--discount", type=float, default=0.97)
+    parser.add_argument("--target-update-rate", type=float, default=0.005)
+    parser.add_argument("--initial-temperature", type=float, default=0.001)
+    parser.add_argument("--target-entropy", type=float, default=0.0)
+    parser.add_argument("--log-interval", type=int, default=25)
+    parser.add_argument(
+        "--episode-length-s",
+        type=float,
+        default=None,
+        help="Optional episode duration override, useful for reset-path smoke tests.",
+    )
+    parser.add_argument(
+        "--rough-debug",
+        action="store_true",
+        help="Use terrain level zero and disable corruption, pushes, and terrain curriculum.",
+    )
+    return parser
+
+
+def validate_train_args(args: argparse.Namespace) -> None:
+    """Reject invalid schedules before expensive simulator construction."""
+
+    positive_fields = (
+        "num_envs",
+        "steps",
+        "replay_capacity",
+        "minimum_replay_size",
+        "batch_size",
+        "num_updates",
+        "hidden_dim",
+        "log_interval",
+    )
+    for name in positive_fields:
+        if getattr(args, name) <= 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be positive.")
+    if args.random_action_steps < 0:
+        raise ValueError("--random-action-steps must be non-negative.")
+    if args.minimum_replay_size < args.batch_size:
+        raise ValueError("--minimum-replay-size must be at least --batch-size.")
+    if args.replay_capacity < args.minimum_replay_size:
+        raise ValueError("--replay-capacity must be at least --minimum-replay-size.")
+    if args.hidden_dim % 4 != 0:
+        raise ValueError("--hidden-dim must be divisible by four.")
+    if args.learning_rate <= 0.0 or args.weight_decay < 0.0:
+        raise ValueError("Optimizer learning rate must be positive and weight decay non-negative.")
+    if args.episode_length_s is not None and args.episode_length_s <= 0.0:
+        raise ValueError("--episode-length-s must be positive when provided.")

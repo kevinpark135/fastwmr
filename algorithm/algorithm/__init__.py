@@ -2,6 +2,7 @@
 
 from .estimator_update import BurnInUnrollOutput, RecurrentSequenceEstimator, burn_in_and_unroll
 from .fastwmr_agent import FastSACReplayUpdateLoop, FastWMRSequenceUpdateLoop, SequenceFeatureProcessor
+from .rollout_worker import FastSACRolloutCollector, RolloutStepResult
 from .sac_update import (
     ActorLossOutput,
     CriticLossOutput,
@@ -22,8 +23,10 @@ __all__ = [
     "CriticLossOutput",
     "EntropyTemperature",
     "FastSACReplayUpdateLoop",
+    "FastSACRolloutCollector",
     "FastWMRSequenceUpdateLoop",
     "RecurrentSequenceEstimator",
+    "RolloutStepResult",
     "SACFeatureSource",
     "SACTransitionBatch",
     "SACUpdateMetrics",
