@@ -9,9 +9,11 @@ from .critic import (
     TwinC51Critic,
     TwinScalarCritic,
 )
+from .history_encoder import HistoryEncoder
 
 __all__ = [
     "C51QNetwork",
+    "HistoryEncoder",
     "ScalarQNetwork",
     "TanhGaussianActor",
     "TargetTwinC51Critic",
