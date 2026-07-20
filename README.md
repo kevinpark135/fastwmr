@@ -11,73 +11,49 @@ Implementation is progressing in independently verified layers:
    world-state estimator, decoder, actor, critic, and FastSAC update.
 3. Script layer: training, evaluation, CLI overrides, logging, and ablations.
 
-## Update Log
-
-- Initial scaffold: created the FastWMR file tree and documented each file's
-  intended responsibility without implementing training code.
-- Interface contract: fixed the G1 29-DoF action layout, 96D policy observation,
-  13D privileged target, done/bootstrap semantics, rollout recurrent-state
-  shape, and detached 109D actor/critic control feature.
-- Task smoke gate: registered FastWMR and policy-only FastSAC training/play
-  tasks, enabled G1 contact reporters, and completed 1,000 finite random-action
-  steps for both training tasks with 16 environments.
-- FastSAC core gate: connected Rough G1 collection to transition replay and the
-  scalar SAC learner, including random-action warm-up, replay wraparound,
-  reset-safe final observations, and finite actor/critic/temperature updates.
-- FastSAC normalization: added checkpointable running observation statistics;
-  replay remains raw while rollout actions and learner batches share the same
-  current normalized representation.
-- FastSAC action bounds: derive symmetric per-joint tanh scales from resolved G1
-  limits, default positions, and IsaacLab action scaling so zero action remains
-  the configured default pose.
-- FastSAC C51 critic: added independent online/target categorical twin critics,
-  entropy-aware Bellman projection, cross-entropy critic updates, and mean-Q
-  actor updates. The default support is 101 atoms over ``[-20, 20]``.
-- FastWMR DR records: added startup-managed per-environment friction, payload,
-  and 6D external-wrench buffers with fixed shapes, partial-env reset support,
-  and privileged-observation wiring.
-- FastWMR exact DR path: replaced opaque built-in samples with environment-level
-  sample/apply/record events for friction, additive pelvis payload, and episodic
-  body-frame pelvis wrench; smoke tests compare records against PhysX tensors.
-- FastWMR privileged target gate: fixed the estimator label to the canonical
-  13D order, made missing or malformed DR records fail immediately, enforced
-  binary foot contacts, and verified partial-environment wrench isolation.
-- Minimal FastSAC reward: replaced the inherited 15-term G1 shaping suite with
-  nine Holosoma-aligned terms shared by FastSAC and FastWMR, including weighted
-  pose, support-foot-relative swing clearance, foot posture, and alive reward.
-
-## Verification
-
-Run lightweight contract and registry tests with ``pytest -q tests``. Run the
-isolated Isaac Sim smoke gate with:
-
-```bash
-python tests/task_smoke.py --steps 1000 --num-envs 16
-```
-
-Add ``--full-dr`` to retain external wrench randomization and verify every DR
-record directly against the applied PhysX material, mass, and wrench tensors.
-
-Run the compact FastSAC learner gate with:
-
-```bash
-python script/train.py --viz none --device cuda:0 --num-envs 16 --steps 12 \
-  --replay-capacity 64 --random-action-steps 1 --minimum-replay-size 32 \
-  --batch-size 32 --num-updates 1 --hidden-dim 64 --rough-debug
-```
-
-The learner uses the C51 critic by default. Pass ``--critic-type scalar`` for
-the scalar FastSAC ablation.
-
 ## References and Attribution
 
+### Research papers
+
+- Younggyo Seo, Carmelo Sferrazza, Juyue Chen, Guanya Shi, Rocky Duan, and
+  Pieter Abbeel. [Learning Sim-to-Real Humanoid Locomotion in 15 Minutes
+  (FastSAC)](pdf/FastSAC.pdf), 2025. This is the primary reference for the
+  FastSAC actor, critic, replay, update, normalization, action-scaling, and
+  minimal-reward design.
+- Younggyo Seo, Carmelo Sferrazza, Haoran Geng, Michal Nauman, Zhao-Heng Yin,
+  and Pieter Abbeel. [FastTD3: Simple, Fast, and Capable Reinforcement Learning
+  for Humanoid Control](pdf/FastTD3.pdf), 2025. This informs the high-throughput
+  off-policy humanoid training setup and distributional critic design.
+- Tuomas Haarnoja, Aurick Zhou, Pieter Abbeel, and Sergey Levine.
+  [Soft Actor-Critic: Off-Policy Maximum Entropy Deep Reinforcement Learning
+  with a Stochastic Actor](pdf/SAC.pdf), 2018. This provides the underlying SAC
+  objective, entropy regularization, and temperature optimization.
+- Wandong Sun, Long Chen, Yongbo Su, Baoshi Cao, Yang Liu, and Zongwu Xie.
+  [Learning Humanoid Locomotion with World Model Reconstruction
+  (WMR)](pdf/WMR.pdf), 2025. This is the primary reference for explicit world
+  reconstruction, privileged estimator targets, recurrent state estimation,
+  and the detached estimator-policy training boundary.
+
+### Project design documents
+
+- [FastWMR design note](pdf/FastWMR.pdf) defines this project's synthesis of
+  FastSAC and WMR, including sequence replay, burn-in, estimator supervision,
+  and domain-randomization records.
+- [Directory design](pdf/directory.pdf) defines module ownership and the target
+  repository structure.
+- [Implementation roadmap](pdf/roadmap.pdf) defines dependency order and staged
+  integration gates.
+
+### Software reference
+
 The FastSAC actor/critic topology, observation normalization, joint-limit-aware
-action scaling, and C51 update in this repository were informed by the official
-[Holosoma](https://github.com/amazon-far/holosoma) implementation. In
-particular, the categorical twin critic follows Holosoma's independent
-per-head target projection and averages the two expected Q-values only for the
-actor objective. This repository is an independent FastWMR implementation and
-does not vendor Holosoma source code.
+action scaling, C51 update, and minimal locomotion reward implementation were
+also informed by the official
+[Holosoma](https://github.com/amazon-far/holosoma) repository. In particular,
+the categorical twin critic follows Holosoma's independent per-head target
+projection and averages the two expected Q-values only for the actor objective.
+This repository is an independent FastWMR implementation and does not vendor
+Holosoma source code.
 
 Please cite Holosoma using the metadata in its official
 [CITATION.cff](https://github.com/amazon-far/holosoma/blob/main/CITATION.cff):
