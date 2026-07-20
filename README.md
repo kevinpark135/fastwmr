@@ -42,6 +42,9 @@ Implementation is progressing in independently verified layers:
 - FastWMR privileged target gate: fixed the estimator label to the canonical
   13D order, made missing or malformed DR records fail immediately, enforced
   binary foot contacts, and verified partial-environment wrench isolation.
+- Minimal FastSAC reward: replaced the inherited 15-term G1 shaping suite with
+  nine Holosoma-aligned terms shared by FastSAC and FastWMR, including weighted
+  pose, support-foot-relative swing clearance, foot posture, and alive reward.
 
 ## Verification
 

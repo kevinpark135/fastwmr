@@ -43,6 +43,9 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.observation
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.randomization import (
     FASTWMR_DR_BUFFER_WIDTHS,
 )
+from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.rewards import (
+    FASTSAC_REWARD_TERM_NAMES,
+)
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
 
@@ -103,6 +106,16 @@ def _check_dr_buffers(task_id: str, env: object) -> None:
         if buffer.device != torch.device(env.device) or buffer.dtype != torch.float32:
             raise AssertionError(f"{task_id}/env.{attribute} has an invalid device or dtype.")
         _assert_finite(f"{task_id}/env.{attribute}", buffer)
+
+
+def _check_reward_terms(task_id: str, env: object) -> None:
+    reward_manager = env.reward_manager
+    if tuple(reward_manager.active_terms) != FASTSAC_REWARD_TERM_NAMES:
+        raise AssertionError(
+            f"{task_id} reward terms are {tuple(reward_manager.active_terms)}, "
+            f"expected {FASTSAC_REWARD_TERM_NAMES}."
+        )
+    _assert_finite(f"{task_id}/reward_terms", reward_manager._step_reward)
 
 
 def _check_privileged_target(
@@ -187,6 +200,7 @@ def _run_task(task_id: str) -> None:
         observations, _ = env.reset(seed=ARGS.seed)
         _check_observations(task_id, observations)
         _check_dr_buffers(task_id, env.unwrapped)
+        _check_reward_terms(task_id, env.unwrapped)
         _check_privileged_target(task_id, env.unwrapped, observations)
         _check_dr_physics(task_id, env.unwrapped)
         _check_partial_wrench_recording(task_id, env.unwrapped)
@@ -205,6 +219,7 @@ def _run_task(task_id: str) -> None:
                 _check_observations(task_id, observations)
                 _check_privileged_target(task_id, env.unwrapped, observations)
                 _assert_finite(f"{task_id}/reward", rewards)
+                _check_reward_terms(task_id, env.unwrapped)
                 if rewards.shape != (ARGS.num_envs,):
                     raise AssertionError(f"{task_id} reward shape is {rewards.shape}.")
                 if terminated.shape != (ARGS.num_envs,) or terminated.dtype is not torch.bool:
