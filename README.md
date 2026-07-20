@@ -30,6 +30,9 @@ Implementation is progressing in independently verified layers:
 - FastSAC action bounds: derive symmetric per-joint tanh scales from resolved G1
   limits, default positions, and IsaacLab action scaling so zero action remains
   the configured default pose.
+- FastSAC C51 critic: added independent online/target categorical twin critics,
+  entropy-aware Bellman projection, cross-entropy critic updates, and mean-Q
+  actor updates. The default support is 101 atoms over ``[-20, 20]``.
 
 ## Verification
 
@@ -46,4 +49,33 @@ Run the compact FastSAC learner gate with:
 python script/train.py --viz none --device cuda:0 --num-envs 16 --steps 12 \
   --replay-capacity 64 --random-action-steps 1 --minimum-replay-size 32 \
   --batch-size 32 --num-updates 1 --hidden-dim 64 --rough-debug
+```
+
+The learner uses the C51 critic by default. Pass ``--critic-type scalar`` for
+the scalar FastSAC ablation.
+
+## References and Attribution
+
+The FastSAC actor/critic topology, observation normalization, joint-limit-aware
+action scaling, and C51 update in this repository were informed by the official
+[Holosoma](https://github.com/amazon-far/holosoma) implementation. In
+particular, the categorical twin critic follows Holosoma's independent
+per-head target projection and averages the two expected Q-values only for the
+actor objective. This repository is an independent FastWMR implementation and
+does not vendor Holosoma source code.
+
+Please cite Holosoma using the metadata in its official
+[CITATION.cff](https://github.com/amazon-far/holosoma/blob/main/CITATION.cff):
+
+```bibtex
+@software{holosoma,
+  author = {{Amazon FAR} and Pieter Abbeel and Juyue Chen and Rocky Duan and
+            Alejandro Escontrela and Manan Gandhi and Samuel Gundry and
+            Xiaoyu Huang and Angjoo Kanazawa and Tomasz Lewicki and Jiaman Li and
+            Karen Liu and Clay Rosenthal and Younggyo Seo and Carlo Sferrazza and
+            Guanya Shi and Linda Shih and Jonathan Tseng and Zhen Wu and
+            Lujie Yang and Brent Yi and Yuanhang Zhang},
+  title  = {Holosoma},
+  url    = {https://github.com/amazon-far/holosoma}
+}
 ```

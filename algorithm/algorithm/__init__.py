@@ -5,6 +5,8 @@ from .fastwmr_agent import FastSACReplayUpdateLoop, FastWMRSequenceUpdateLoop, S
 from .rollout_worker import FastSACRolloutCollector, RolloutStepResult
 from .sac_update import (
     ActorLossOutput,
+    C51CriticLossOutput,
+    C51SACUpdater,
     CriticLossOutput,
     EntropyTemperature,
     SACFeatureSource,
@@ -12,14 +14,19 @@ from .sac_update import (
     SACUpdateMetrics,
     SACUpdater,
     compute_actor_loss,
+    compute_c51_critic_loss,
+    compute_c51_critic_target,
     compute_critic_loss,
     compute_critic_target,
     compute_temperature_loss,
+    project_categorical_distribution,
 )
 
 __all__ = [
     "ActorLossOutput",
     "BurnInUnrollOutput",
+    "C51CriticLossOutput",
+    "C51SACUpdater",
     "CriticLossOutput",
     "EntropyTemperature",
     "FastSACReplayUpdateLoop",
@@ -34,7 +41,10 @@ __all__ = [
     "SequenceFeatureProcessor",
     "burn_in_and_unroll",
     "compute_actor_loss",
+    "compute_c51_critic_loss",
+    "compute_c51_critic_target",
     "compute_critic_loss",
     "compute_critic_target",
     "compute_temperature_loss",
+    "project_categorical_distribution",
 ]

@@ -4,6 +4,9 @@ The learner sees only a prepared SAC feature tensor. In baseline mode this is
 the policy observation; in FastWMR mode it is the stored detached control
 feature ``x_t``. Privileged reconstruction targets and recurrent hidden state
 are intentionally absent from :class:`SACTransitionBatch`.
+
+The categorical target construction follows Holosoma's FastSAC C51 update:
+https://github.com/amazon-far/holosoma
 """
 
 from __future__ import annotations
@@ -19,7 +22,13 @@ import torch.nn.functional as F
 from torch import nn
 
 from ..buffers import TransitionReplayBatch
-from ..networks import TargetTwinScalarCritic, TanhGaussianActor, TwinScalarCritic
+from ..networks import (
+    TargetTwinC51Critic,
+    TargetTwinScalarCritic,
+    TanhGaussianActor,
+    TwinC51Critic,
+    TwinScalarCritic,
+)
 
 
 class SACFeatureSource(str, Enum):
@@ -137,6 +146,17 @@ class CriticLossOutput:
 
 
 @dataclass(frozen=True)
+class C51CriticLossOutput:
+    """Categorical critic loss plus scalar expectations used for metrics."""
+
+    loss: torch.Tensor
+    q1: torch.Tensor
+    q2: torch.Tensor
+    target: torch.Tensor
+    target_distributions: torch.Tensor
+
+
+@dataclass(frozen=True)
 class ActorLossOutput:
     loss: torch.Tensor
     actions: torch.Tensor
@@ -194,10 +214,112 @@ def compute_critic_loss(
     return CriticLossOutput(loss=loss, q1=q1, q2=q2, target=target)
 
 
+def project_categorical_distribution(
+    probabilities: torch.Tensor,
+    target_atoms: torch.Tensor,
+    support: torch.Tensor,
+) -> torch.Tensor:
+    """Project shifted categorical mass back onto an evenly spaced support."""
+
+    if probabilities.shape != target_atoms.shape:
+        raise ValueError("probabilities and target_atoms must have the same shape.")
+    if support.ndim != 1 or support.numel() < 2:
+        raise ValueError("support must be one-dimensional with at least two atoms.")
+    if probabilities.shape[-1] != support.numel():
+        raise ValueError("The distribution atom dimension must match support.")
+    if probabilities.device != target_atoms.device or probabilities.device != support.device:
+        raise ValueError("probabilities, target_atoms, and support must share a device.")
+    if not all(tensor.dtype.is_floating_point for tensor in (probabilities, target_atoms, support)):
+        raise TypeError("C51 projection inputs must have floating-point dtypes.")
+    if not all(torch.isfinite(tensor).all() for tensor in (probabilities, target_atoms, support)):
+        raise ValueError("C51 projection inputs must be finite.")
+
+    spacing = support[1] - support[0]
+    if spacing <= 0.0 or not torch.allclose(
+        support[1:] - support[:-1],
+        spacing.expand_as(support[1:]),
+    ):
+        raise ValueError("support must be strictly increasing and evenly spaced.")
+
+    positions = (target_atoms.clamp(support[0], support[-1]) - support[0]) / spacing
+    lower = positions.floor().to(torch.long)
+    upper = positions.ceil().to(torch.long)
+    lower_weight = upper.to(positions.dtype) - positions
+    upper_weight = positions - lower.to(positions.dtype)
+    exact_atom = lower == upper
+    lower_weight = torch.where(exact_atom, torch.ones_like(lower_weight), lower_weight)
+    upper_weight = torch.where(exact_atom, torch.zeros_like(upper_weight), upper_weight)
+
+    projected = torch.zeros_like(probabilities)
+    projected.scatter_add_(-1, lower, probabilities * lower_weight)
+    projected.scatter_add_(-1, upper, probabilities * upper_weight)
+    return projected
+
+
+@torch.no_grad()
+def compute_c51_critic_target(
+    batch: SACTransitionBatch,
+    actor: TanhGaussianActor,
+    target_critic: TargetTwinC51Critic,
+    temperature: torch.Tensor,
+    discount: float,
+) -> torch.Tensor:
+    """Build one projected target distribution for each target Q head."""
+
+    if not 0.0 <= discount <= 1.0:
+        raise ValueError(f"discount must be in [0, 1], got {discount}.")
+    _validate_temperature(temperature)
+    next_actions, next_log_probabilities = actor.sample(batch.next_states)
+    next_probabilities = target_critic.stacked_probabilities(batch.next_states, next_actions)
+    continuation = discount * batch.bootstrap_mask
+    shifted_atoms = batch.rewards.unsqueeze(-1) + continuation.unsqueeze(-1) * (
+        target_critic.support - temperature * next_log_probabilities.unsqueeze(-1)
+    )
+    shifted_atoms = shifted_atoms.unsqueeze(0).expand_as(next_probabilities)
+    projected = project_categorical_distribution(next_probabilities, shifted_atoms, target_critic.support)
+    if not torch.allclose(
+        projected.sum(dim=-1),
+        torch.ones_like(projected[..., 0]),
+        atol=1e-5,
+        rtol=1e-5,
+    ):
+        raise RuntimeError("Projected C51 target distributions do not sum to one.")
+    return projected
+
+
+def compute_c51_critic_loss(
+    batch: SACTransitionBatch,
+    critic: TwinC51Critic,
+    target_distributions: torch.Tensor,
+) -> C51CriticLossOutput:
+    """Return the summed twin cross-entropy against projected C51 targets."""
+
+    expected_shape = (2, *batch.rewards.shape, critic.cfg.num_atoms)
+    if target_distributions.shape != expected_shape:
+        raise ValueError(
+            f"target_distributions must have shape {expected_shape}, got {tuple(target_distributions.shape)}."
+        )
+    target_distributions = target_distributions.detach()
+    logits = critic.stacked_logits(batch.states, batch.actions)
+    cross_entropy = -(target_distributions * F.log_softmax(logits, dim=-1)).sum(dim=-1)
+    loss = cross_entropy.reshape(2, -1).mean(dim=-1).sum()
+    _require_finite_scalar(loss, "C51 critic loss")
+
+    values = critic.values_from_probabilities(logits.softmax(dim=-1))
+    target_values = critic.values_from_probabilities(target_distributions)
+    return C51CriticLossOutput(
+        loss=loss,
+        q1=values[0],
+        q2=values[1],
+        target=target_values,
+        target_distributions=target_distributions,
+    )
+
+
 def compute_actor_loss(
     states: torch.Tensor,
     actor: TanhGaussianActor,
-    critic: TwinScalarCritic,
+    critic: TwinScalarCritic | TwinC51Critic,
     temperature: torch.Tensor,
 ) -> ActorLossOutput:
     """Compute ``mean(alpha * log_pi - average(Q1, Q2))``."""
@@ -340,6 +462,55 @@ class SACUpdater:
         """Apply one Polyak update to both frozen target Q-networks."""
 
         self.target_critic.soft_update_from(self.critic, self.target_update_rate)
+
+
+class C51SACUpdater(SACUpdater):
+    """FastSAC optimizer coordinator using twin categorical critics."""
+
+    critic: TwinC51Critic
+    target_critic: TargetTwinC51Critic
+
+    def __init__(
+        self,
+        *,
+        actor: TanhGaussianActor,
+        critic: TwinC51Critic,
+        target_critic: TargetTwinC51Critic,
+        temperature: EntropyTemperature,
+        actor_optimizer: torch.optim.Optimizer,
+        critic_optimizer: torch.optim.Optimizer,
+        temperature_optimizer: torch.optim.Optimizer,
+        discount: float = 0.97,
+        target_update_rate: float = 0.005,
+        target_entropy: float = 0.0,
+    ) -> None:
+        super().__init__(
+            actor=actor,
+            critic=critic,  # type: ignore[arg-type]
+            target_critic=target_critic,  # type: ignore[arg-type]
+            temperature=temperature,
+            actor_optimizer=actor_optimizer,
+            critic_optimizer=critic_optimizer,
+            temperature_optimizer=temperature_optimizer,
+            discount=discount,
+            target_update_rate=target_update_rate,
+            target_entropy=target_entropy,
+        )
+
+    def update_critic(self, batch: SACTransitionBatch) -> C51CriticLossOutput:
+        target_distributions = compute_c51_critic_target(
+            batch,
+            self.actor,
+            self.target_critic,
+            self.temperature().detach(),
+            self.discount,
+        )
+        critic_output = compute_c51_critic_loss(batch, self.critic, target_distributions)
+        self.critic_optimizer.zero_grad(set_to_none=True)
+        critic_output.loss.backward()
+        self.critic_optimizer.step()
+        self.critic_optimizer.zero_grad(set_to_none=True)
+        return critic_output
 
 
 def _validate_temperature(temperature: torch.Tensor) -> None:

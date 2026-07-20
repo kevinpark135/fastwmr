@@ -23,6 +23,10 @@ def build_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=8192)
     parser.add_argument("--num-updates", type=int, default=8)
     parser.add_argument("--hidden-dim", type=int, default=768)
+    parser.add_argument("--critic-type", choices=("c51", "scalar"), default="c51")
+    parser.add_argument("--num-atoms", type=int, default=101)
+    parser.add_argument("--value-min", type=float, default=-20.0)
+    parser.add_argument("--value-max", type=float, default=20.0)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-3)
     parser.add_argument("--discount", type=float, default=0.97)
@@ -77,6 +81,10 @@ def validate_train_args(args: argparse.Namespace) -> None:
         raise ValueError("--replay-capacity must be at least --minimum-replay-size.")
     if args.hidden_dim % 4 != 0:
         raise ValueError("--hidden-dim must be divisible by four.")
+    if args.num_atoms < 2:
+        raise ValueError("--num-atoms must be at least two.")
+    if args.value_min >= args.value_max:
+        raise ValueError("--value-min must be smaller than --value-max.")
     if args.learning_rate <= 0.0 or args.weight_decay < 0.0:
         raise ValueError("Optimizer learning rate must be positive and weight decay non-negative.")
     if args.normalization_epsilon <= 0.0 or args.normalization_clip <= 0.0:

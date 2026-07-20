@@ -206,6 +206,32 @@ DEFAULT_CRITIC_CFG = ScalarCriticCfg()
 
 
 @dataclass(frozen=True)
+class DistributionalCriticCfg:
+    """C51 FastSAC critic architecture and fixed value support.
+
+    The defaults match Holosoma's FastSAC configuration. Individual robot
+    experiments may widen the support or increase the atom count.
+    """
+
+    hidden_dim: int = 768
+    num_atoms: int = 101
+    value_min: float = -20.0
+    value_max: float = 20.0
+    use_layer_norm: bool = True
+
+    def __post_init__(self) -> None:
+        if self.hidden_dim <= 0 or self.hidden_dim % 4 != 0:
+            raise ValueError("hidden_dim must be positive and divisible by four.")
+        if self.num_atoms < 2:
+            raise ValueError("num_atoms must be at least two.")
+        if self.value_min >= self.value_max:
+            raise ValueError("value_min must be smaller than value_max.")
+
+
+DEFAULT_DISTRIBUTIONAL_CRITIC_CFG = DistributionalCriticCfg()
+
+
+@dataclass(frozen=True)
 class ObservationNormalizationCfg:
     """Running observation normalization used by rollout and replay learning."""
 
@@ -286,7 +312,7 @@ class FastWMRAlgoCfg:
 
     interface: FastWMRInterfaceCfg = DEFAULT_INTERFACE_CFG
     actor: TanhGaussianActorCfg = DEFAULT_ACTOR_CFG
-    critic: ScalarCriticCfg = DEFAULT_CRITIC_CFG
+    critic: DistributionalCriticCfg = DEFAULT_DISTRIBUTIONAL_CRITIC_CFG
     observation_normalization: ObservationNormalizationCfg = DEFAULT_OBSERVATION_NORMALIZATION_CFG
     joint_limit_action_bounds: JointLimitActionBoundsCfg = DEFAULT_JOINT_LIMIT_ACTION_BOUNDS_CFG
     replay_update: ReplayUpdateCfg = DEFAULT_REPLAY_UPDATE_CFG

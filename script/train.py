@@ -24,6 +24,7 @@ import torch
 import isaaclab_tasks  # noqa: F401
 import isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr  # noqa: F401
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.algorithm import (
+    C51SACUpdater,
     EntropyTemperature,
     FastSACReplayUpdateLoop,
     FastSACRolloutCollector,
@@ -34,14 +35,17 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.b
     TransitionReplayBuffer,
 )
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.config import (
+    DistributionalCriticCfg,
     ObservationNormalizationCfg,
     ReplayUpdateCfg,
     ScalarCriticCfg,
     TanhGaussianActorCfg,
 )
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.networks import (
+    TargetTwinC51Critic,
     TargetTwinScalarCritic,
     TanhGaussianActor,
+    TwinC51Critic,
     TwinScalarCritic,
 )
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.utils import (
@@ -72,7 +76,6 @@ def _build_updater(
     action_high: torch.Tensor,
 ) -> SACUpdater:
     actor_cfg = TanhGaussianActorCfg(hidden_dim=ARGS.hidden_dim)
-    critic_cfg = ScalarCriticCfg(hidden_dim=ARGS.hidden_dim)
     actor = TanhGaussianActor(
         observation_dim,
         action_dim,
@@ -80,15 +83,28 @@ def _build_updater(
         action_low=action_low,
         action_high=action_high,
     ).to(device)
-    critic = TwinScalarCritic(observation_dim, action_dim, cfg=critic_cfg).to(device)
-    target_critic = TargetTwinScalarCritic.from_online(critic)
+    if ARGS.critic_type == "c51":
+        critic_cfg = DistributionalCriticCfg(
+            hidden_dim=ARGS.hidden_dim,
+            num_atoms=ARGS.num_atoms,
+            value_min=ARGS.value_min,
+            value_max=ARGS.value_max,
+        )
+        critic = TwinC51Critic(observation_dim, action_dim, cfg=critic_cfg).to(device)
+        target_critic = TargetTwinC51Critic.from_online(critic)
+        updater_type = C51SACUpdater
+    else:
+        scalar_critic_cfg = ScalarCriticCfg(hidden_dim=ARGS.hidden_dim)
+        critic = TwinScalarCritic(observation_dim, action_dim, cfg=scalar_critic_cfg).to(device)
+        target_critic = TargetTwinScalarCritic.from_online(critic)
+        updater_type = SACUpdater
     temperature = EntropyTemperature(ARGS.initial_temperature).to(device)
     optimizer_kwargs = {
         "lr": ARGS.learning_rate,
         "betas": (0.9, 0.95),
         "weight_decay": ARGS.weight_decay,
     }
-    return SACUpdater(
+    return updater_type(
         actor=actor,
         critic=critic,
         target_critic=target_critic,
@@ -189,7 +205,7 @@ def run() -> None:
                     values = _metric_values(last_metric)
                     metric_text = f"critic={values[0]:.4f} actor={values[1]:.4f} alpha={values[3]:.6f}"
                 print(
-                    f"[FastSAC] step={step_index + 1}/{ARGS.steps} replay={len(replay)} "
+                    f"[FastSAC:{ARGS.critic_type}] step={step_index + 1}/{ARGS.steps} replay={len(replay)} "
                     f"updates={update_loop.gradient_steps} reward={reward_sum / (step_index + 1):.4f} {metric_text}"
                 )
 
@@ -199,7 +215,7 @@ def run() -> None:
         if update_loop.gradient_steps == 0:
             raise AssertionError("Smoke run finished without a gradient update.")
         print(
-            f"[FastSAC] PASS transitions={replay.total_inserted} retained={len(replay)} "
+            f"[FastSAC:{ARGS.critic_type}] PASS transitions={replay.total_inserted} retained={len(replay)} "
             f"gradient_steps={update_loop.gradient_steps} done={done_count} "
             f"normalizer_samples={normalizer.samples_seen if normalizer is not None else 0} "
             f"action_scale=[{updater.actor.action_scale.min().item():.3f},"
