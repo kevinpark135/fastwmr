@@ -13,7 +13,14 @@ from .estimator_update import (
     compute_estimator_loss,
 )
 from .fastwmr_agent import FastSACReplayUpdateLoop, FastWMRSequenceUpdateLoop, SequenceFeatureProcessor
-from .rollout_worker import FastSACRolloutCollector, RolloutStepResult
+from .rollout_worker import (
+    EstimatorRuntimeRebuild,
+    EstimatorRuntimeStep,
+    EstimatorRuntimeUpdate,
+    FastSACRolloutCollector,
+    FastWMREstimatorRuntime,
+    RolloutStepResult,
+)
 from .sac_update import (
     ActorLossOutput,
     C51CriticLossOutput,
@@ -42,11 +49,15 @@ __all__ = [
     "EntropyTemperature",
     "EstimatorLossOutput",
     "EstimatorPrediction",
+    "EstimatorRuntimeRebuild",
+    "EstimatorRuntimeStep",
+    "EstimatorRuntimeUpdate",
     "EstimatorUpdateMetrics",
     "EstimatorUpdateResult",
     "EstimatorUpdater",
     "FastSACReplayUpdateLoop",
     "FastSACRolloutCollector",
+    "FastWMREstimatorRuntime",
     "FastWMRSequenceUpdateLoop",
     "RecurrentSequenceEstimator",
     "RolloutStepResult",
