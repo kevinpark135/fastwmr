@@ -10,6 +10,7 @@ interface-contract tests and the decoder output layout.
 
 from __future__ import annotations
 
+from copy import copy
 from typing import TYPE_CHECKING
 
 import torch
@@ -69,24 +70,34 @@ def _device(env: "ManagerBasedEnv") -> torch.device:
 
 
 def _privileged_buffer(env: "ManagerBasedEnv", name: str, width: int) -> torch.Tensor:
-    """Read a per-environment DR record, returning zeros in isolated tests.
+    """Read one canonical per-environment DR record without implicit conversion.
 
-    The environment startup event creates these buffers before observations are
-    evaluated. The fallback keeps standalone observation-function tests usable
-    without constructing an IsaacLab event manager.
+    IsaacLab probes observation-term shapes while constructing the observation
+    manager, before startup events create the DR buffers. A temporary tensor is
+    allowed only during that constructor probe; a missing runtime buffer fails.
     """
 
     value = getattr(env, name, None)
     if value is None:
-        return torch.zeros((_num_envs(env), width), device=_device(env), dtype=torch.float32)
-
-    tensor = torch.as_tensor(value, device=_device(env), dtype=torch.float32)
-    if tensor.numel() != _num_envs(env) * width:
-        raise ValueError(
-            f"{name} must contain {_num_envs(env) * width} values for shape "
-            f"({_num_envs(env)}, {width}), got shape {tuple(tensor.shape)}."
+        if not hasattr(env, "observation_manager"):
+            return torch.zeros((_num_envs(env), width), device=_device(env), dtype=torch.float32)
+        raise RuntimeError(
+            f"env.{name} is missing. The FastWMR DR-buffer startup event must run "
+            "before privileged observations are evaluated."
         )
-    return tensor.reshape(_num_envs(env), width)
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"env.{name} must be a torch.Tensor, got {type(value).__name__}.")
+
+    expected_shape = (_num_envs(env), width)
+    if value.shape != expected_shape:
+        raise ValueError(f"env.{name} must have shape {expected_shape}, got {tuple(value.shape)}.")
+    if value.device != _device(env):
+        raise ValueError(f"env.{name} must be on {_device(env)}, got {value.device}.")
+    if value.dtype != torch.float32:
+        raise TypeError(f"env.{name} must have dtype torch.float32, got {value.dtype}.")
+    if not torch.isfinite(value).all():
+        raise ValueError(f"env.{name} contains a non-finite privileged target value.")
+    return value
 
 
 def privileged_friction(env: "ManagerBasedEnv") -> torch.Tensor:
@@ -114,6 +125,9 @@ def privileged_foot_contacts(
 ) -> torch.Tensor:
     """Return a two-bit left/right foot contact target as float32."""
 
+    if isinstance(sensor_cfg.body_ids, slice):
+        sensor_cfg = copy(sensor_cfg)
+        sensor_cfg.resolve(env.scene)
     sensor = env.scene[sensor_cfg.name]
     forces = sensor.data.net_forces_w_history
     if forces is None:
@@ -123,6 +137,72 @@ def privileged_foot_contacts(
     if contacts.shape[-1] != 2:
         raise ValueError(f"Expected exactly two foot contact sensors, got shape {tuple(contacts.shape)}.")
     return contacts.to(dtype=torch.float32)
+
+
+def assemble_privileged_reconstruction_target(
+    *,
+    base_lin_vel: torch.Tensor,
+    friction: torch.Tensor,
+    payload_mass: torch.Tensor,
+    push_force_torque: torch.Tensor,
+    foot_contacts: torch.Tensor,
+) -> torch.Tensor:
+    """Assemble and validate the canonical 13D FastWMR estimator target."""
+
+    components = {
+        "base_lin_vel": base_lin_vel,
+        "friction": friction,
+        "payload_mass": payload_mass,
+        "push_force_torque": push_force_torque,
+        "foot_contacts": foot_contacts,
+    }
+    batch_size: int | None = None
+    device: torch.device | None = None
+    ordered_components: list[torch.Tensor] = []
+    for field in DEFAULT_INTERFACE_CFG.reconstruction_layout.fields:
+        value = components[field.name]
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"Privileged field {field.name!r} must be a torch.Tensor.")
+        if value.ndim != 2 or value.shape[-1] != field.width:
+            raise ValueError(
+                f"Privileged field {field.name!r} must have shape (N, {field.width}), "
+                f"got {tuple(value.shape)}."
+            )
+        if not value.dtype.is_floating_point:
+            raise TypeError(f"Privileged field {field.name!r} must be floating point, got {value.dtype}.")
+        if batch_size is None:
+            batch_size = value.shape[0]
+            device = value.device
+        elif value.shape[0] != batch_size or value.device != device:
+            raise ValueError("All privileged fields must share the same batch size and device.")
+        if not torch.isfinite(value).all():
+            raise ValueError(f"Privileged field {field.name!r} contains NaN or Inf values.")
+        ordered_components.append(value)
+
+    if not torch.all((foot_contacts == 0.0) | (foot_contacts == 1.0)):
+        raise ValueError("Privileged foot_contacts must contain binary 0/1 targets.")
+
+    target = torch.cat(ordered_components, dim=-1)
+    expected_dim = DEFAULT_INTERFACE_CFG.reconstruction_target_dim
+    if target.shape != (batch_size, expected_dim):
+        raise RuntimeError(f"Assembled privileged target has shape {target.shape}, expected {(batch_size, expected_dim)}.")
+    return target
+
+
+def privileged_reconstruction_target(
+    env: "ManagerBasedEnv",
+    sensor_cfg: SceneEntityCfg = DEFAULT_CONTACT_SENSOR_CFG,
+    contact_threshold: float = 1.0,
+) -> torch.Tensor:
+    """Read simulator state and DR records into the canonical 13D target."""
+
+    return assemble_privileged_reconstruction_target(
+        base_lin_vel=mdp.base_lin_vel(env),
+        friction=privileged_friction(env),
+        payload_mass=privileged_payload_mass(env),
+        push_force_torque=privileged_push_force_torque(env),
+        foot_contacts=privileged_foot_contacts(env, sensor_cfg=sensor_cfg, threshold=contact_threshold),
+    )
 
 
 @configclass

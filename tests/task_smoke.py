@@ -37,6 +37,9 @@ import warp as wp
 import isaaclab.sim as sim_utils
 import isaaclab_tasks  # noqa: F401
 import isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr  # noqa: F401
+from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.observations import (
+    privileged_reconstruction_target,
+)
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.randomization import (
     FASTWMR_DR_BUFFER_WIDTHS,
 )
@@ -102,6 +105,41 @@ def _check_dr_buffers(task_id: str, env: object) -> None:
         _assert_finite(f"{task_id}/env.{attribute}", buffer)
 
 
+def _check_privileged_target(
+    task_id: str,
+    env: object,
+    observations: dict[str, torch.Tensor],
+) -> None:
+    if "FastWMR" not in task_id:
+        return
+
+    expected = privileged_reconstruction_target(env)
+    actual = observations["privileged"]
+    if not torch.equal(actual, expected):
+        max_error = (actual - expected).abs().max().item()
+        raise AssertionError(
+            f"{task_id}/privileged does not match the canonical 13D target; max error={max_error}."
+        )
+
+
+def _check_partial_wrench_recording(task_id: str, env: object) -> None:
+    """Verify that a reset-style wrench update touches only selected environments."""
+
+    if not ARGS.full_dr or ARGS.num_envs < 2:
+        return
+
+    wrench_cfg = env.event_manager.get_term_cfg("base_external_force_torque")
+    selected = torch.arange(0, ARGS.num_envs, 2, device=env.device, dtype=torch.long)
+    untouched = torch.arange(1, ARGS.num_envs, 2, device=env.device, dtype=torch.long)
+    before = env.fastwmr_push_force_torques.clone()
+
+    wrench_cfg.func(env, selected, **wrench_cfg.params)
+
+    if not torch.equal(env.fastwmr_push_force_torques[untouched], before[untouched]):
+        raise AssertionError(f"{task_id} partial wrench update modified unselected environments.")
+    _check_dr_physics(task_id, env)
+
+
 def _check_dr_physics(task_id: str, env: object) -> None:
     robot = env.scene["robot"]
 
@@ -149,7 +187,15 @@ def _run_task(task_id: str) -> None:
         observations, _ = env.reset(seed=ARGS.seed)
         _check_observations(task_id, observations)
         _check_dr_buffers(task_id, env.unwrapped)
+        _check_privileged_target(task_id, env.unwrapped, observations)
         _check_dr_physics(task_id, env.unwrapped)
+        _check_partial_wrench_recording(task_id, env.unwrapped)
+
+        # Refresh once after the direct partial-reset probe so the returned
+        # privileged observation reflects the newly recorded wrench.
+        observations = env.unwrapped.observation_manager.compute()
+        _check_observations(task_id, observations)
+        _check_privileged_target(task_id, env.unwrapped, observations)
 
         with torch.inference_mode():
             for step in range(ARGS.steps):
@@ -157,6 +203,7 @@ def _run_task(task_id: str) -> None:
                 observations, rewards, terminated, truncated, _ = env.step(actions)
 
                 _check_observations(task_id, observations)
+                _check_privileged_target(task_id, env.unwrapped, observations)
                 _assert_finite(f"{task_id}/reward", rewards)
                 if rewards.shape != (ARGS.num_envs,):
                     raise AssertionError(f"{task_id} reward shape is {rewards.shape}.")

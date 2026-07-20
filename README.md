@@ -39,6 +39,9 @@ Implementation is progressing in independently verified layers:
 - FastWMR exact DR path: replaced opaque built-in samples with environment-level
   sample/apply/record events for friction, additive pelvis payload, and episodic
   body-frame pelvis wrench; smoke tests compare records against PhysX tensors.
+- FastWMR privileged target gate: fixed the estimator label to the canonical
+  13D order, made missing or malformed DR records fail immediately, enforced
+  binary foot contacts, and verified partial-environment wrench isolation.
 
 ## Verification
 
