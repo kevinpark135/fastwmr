@@ -34,16 +34,6 @@ Implementation is progressing in independently verified layers:
   reconstruction, privileged estimator targets, recurrent state estimation,
   and the detached estimator-policy training boundary.
 
-### Project design documents
-
-- [FastWMR design note](pdf/FastWMR.pdf) defines this project's synthesis of
-  FastSAC and WMR, including sequence replay, burn-in, estimator supervision,
-  and domain-randomization records.
-- [Directory design](pdf/directory.pdf) defines module ownership and the target
-  repository structure.
-- [Implementation roadmap](pdf/roadmap.pdf) defines dependency order and staged
-  integration gates.
-
 ### Software reference
 
 The FastSAC actor/critic topology, observation normalization, joint-limit-aware
