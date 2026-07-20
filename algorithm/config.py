@@ -166,6 +166,46 @@ DEFAULT_INTERFACE_CFG = FastWMRInterfaceCfg()
 
 
 @dataclass(frozen=True)
+class TanhGaussianActorCfg:
+    """FastSAC stochastic actor architecture and exploration bounds.
+
+    ``log_std_max=0`` is the FastSAC-specific choice that caps the pre-tanh
+    action standard deviation at one. The three policy widths follow the
+    official implementation as ``hidden_dim``, ``hidden_dim / 2``, and
+    ``hidden_dim / 4``.
+    """
+
+    hidden_dim: int = 512
+    log_std_min: float = -5.0
+    log_std_max: float = 0.0
+    use_layer_norm: bool = True
+
+    def __post_init__(self) -> None:
+        if self.hidden_dim <= 0 or self.hidden_dim % 4 != 0:
+            raise ValueError("hidden_dim must be positive and divisible by four.")
+        if self.log_std_min >= self.log_std_max:
+            raise ValueError("log_std_min must be smaller than log_std_max.")
+
+
+DEFAULT_ACTOR_CFG = TanhGaussianActorCfg()
+
+
+@dataclass(frozen=True)
+class ScalarCriticCfg:
+    """Scalar FastSAC critic used before the C51 extension is introduced."""
+
+    hidden_dim: int = 768
+    use_layer_norm: bool = True
+
+    def __post_init__(self) -> None:
+        if self.hidden_dim <= 0 or self.hidden_dim % 4 != 0:
+            raise ValueError("hidden_dim must be positive and divisible by four.")
+
+
+DEFAULT_CRITIC_CFG = ScalarCriticCfg()
+
+
+@dataclass(frozen=True)
 class FastWMRAlgoCfg:
     """MVP algorithm settings that do not belong to the IsaacLab task config.
 
@@ -176,6 +216,8 @@ class FastWMRAlgoCfg:
     """
 
     interface: FastWMRInterfaceCfg = DEFAULT_INTERFACE_CFG
+    actor: TanhGaussianActorCfg = DEFAULT_ACTOR_CFG
+    critic: ScalarCriticCfg = DEFAULT_CRITIC_CFG
     discount: float = 0.97
     target_update_rate: float = 0.005
     initial_temperature: float = 0.001
