@@ -206,18 +206,60 @@ DEFAULT_CRITIC_CFG = ScalarCriticCfg()
 
 
 @dataclass(frozen=True)
+class ReplayUpdateCfg:
+    """FastSAC collection warm-up and replay update schedule."""
+
+    random_action_steps: int = 10
+    minimum_replay_size: int = 8192
+    batch_size: int = 8192
+    num_updates: int = 8
+
+    def __post_init__(self) -> None:
+        if self.random_action_steps < 0:
+            raise ValueError("random_action_steps must be non-negative.")
+        if self.minimum_replay_size <= 0 or self.batch_size <= 0 or self.num_updates <= 0:
+            raise ValueError("Replay sizes and num_updates must be positive.")
+        if self.minimum_replay_size < self.batch_size:
+            raise ValueError("minimum_replay_size must be at least batch_size.")
+
+
+DEFAULT_REPLAY_UPDATE_CFG = ReplayUpdateCfg()
+
+
+@dataclass(frozen=True)
+class SequenceReplayCfg:
+    """FastWMR R2D2-style replay window dimensions."""
+
+    batch_size: int = 256
+    burn_in_length: int = 16
+    learning_length: int = 8
+    require_episode_start: bool = False
+
+    def __post_init__(self) -> None:
+        if self.batch_size <= 0 or self.learning_length <= 0:
+            raise ValueError("Sequence batch_size and learning_length must be positive.")
+        if self.burn_in_length < 0:
+            raise ValueError("burn_in_length must be non-negative.")
+
+
+DEFAULT_SEQUENCE_REPLAY_CFG = SequenceReplayCfg()
+
+
+@dataclass(frozen=True)
 class FastWMRAlgoCfg:
     """MVP algorithm settings that do not belong to the IsaacLab task config.
 
-    SAC uses ordinary transition replay. Recurrent hidden/cell tensors are
-    rollout-only state, and estimator updates consume a separate recent rollout
-    cache. Exact replay-time recurrent re-inference remains a later research
-    branch rather than an MVP claim.
+    FastSAC uses ordinary transition sampling. FastWMR additionally samples raw
+    boundary-safe sequences and reconstructs learning-time recurrent context
+    with the current estimator. Hidden/cell tensors remain runtime values and
+    are never persisted in replay.
     """
 
     interface: FastWMRInterfaceCfg = DEFAULT_INTERFACE_CFG
     actor: TanhGaussianActorCfg = DEFAULT_ACTOR_CFG
     critic: ScalarCriticCfg = DEFAULT_CRITIC_CFG
+    replay_update: ReplayUpdateCfg = DEFAULT_REPLAY_UPDATE_CFG
+    sequence_replay: SequenceReplayCfg = DEFAULT_SEQUENCE_REPLAY_CFG
     discount: float = 0.97
     target_update_rate: float = 0.005
     initial_temperature: float = 0.001

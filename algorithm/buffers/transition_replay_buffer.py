@@ -1,11 +1,10 @@
 """Transition replay shared by the FastSAC baseline and FastWMR.
 
 FastSAC only needs ``(o_t, a_t, r_t, o_{t+1}, terminated, truncated)``.
-FastWMR keeps that ordinary off-policy sampling contract, but also records the
-raw privileged targets, detached control features, estimator version, and
-temporal indexing needed to diagnose stale representations or add sequence
-re-inference later. Recurrent hidden/cell state is runtime state and must never
-be stored here.
+FastWMR extends that contract with raw privileged targets, detached diagnostic
+features, estimator versions, and temporal indexing. Its sequence sampler
+reconstructs boundary-safe ``B + L`` windows for current-estimator burn-in and
+learning. Recurrent hidden/cell state is runtime state and is never stored here.
 """
 
 from __future__ import annotations
@@ -15,6 +14,9 @@ from dataclasses import dataclass, fields
 import torch
 
 from ..config import DEFAULT_INTERFACE_CFG, FastWMRInterfaceCfg
+
+
+TemporalKey = tuple[int, int, int]
 
 
 @dataclass(frozen=True)
@@ -142,6 +144,161 @@ class TransitionReplayBatch:
         )
 
 
+@dataclass(frozen=True)
+class SequenceReplayBatch:
+    """Boundary-safe FastWMR sequence with burn-in and learning windows.
+
+    Observation-like tensors contain ``burn_in_length + learning_length + 1``
+    values. Transition-like tensors contain one fewer value. Hidden/cell state
+    is reconstructed by the current estimator and is never stored here.
+    """
+
+    observations: torch.Tensor
+    privileged_states: torch.Tensor
+    stored_control_features: torch.Tensor
+    actions: torch.Tensor
+    rewards: torch.Tensor
+    terminated: torch.Tensor
+    truncated: torch.Tensor
+    episode_ids: torch.Tensor
+    env_ids: torch.Tensor
+    timesteps: torch.Tensor
+    reset_boundaries: torch.Tensor
+    insertion_ids: torch.Tensor
+    burn_in_length: int
+    learning_length: int
+
+    def __post_init__(self) -> None:
+        if self.burn_in_length < 0 or self.learning_length <= 0:
+            raise ValueError("Sequence burn-in must be non-negative and learning length positive.")
+        if self.observations.ndim != 3:
+            raise ValueError("observations must have shape (batch, B + L + 1, observation_dim).")
+        transition_shape = (self.observations.shape[0], self.transition_length)
+        observation_shape = (self.observations.shape[0], self.transition_length + 1)
+        if self.observations.shape[:2] != observation_shape:
+            raise ValueError("observations must have shape (batch, B + L + 1, observation_dim).")
+        if (
+            self.privileged_states.ndim != 3
+            or self.stored_control_features.ndim != 3
+            or self.privileged_states.shape[:2] != observation_shape
+            or self.stored_control_features.shape[:2] != observation_shape
+        ):
+            raise ValueError("Privileged states and stored control features must align with observations.")
+        if self.actions.ndim != 3 or self.actions.shape[:2] != transition_shape:
+            raise ValueError("actions must have shape (batch, B + L, action_dim).")
+
+        scalar_fields = (
+            self.rewards,
+            self.terminated,
+            self.truncated,
+            self.episode_ids,
+            self.env_ids,
+            self.timesteps,
+            self.reset_boundaries,
+            self.insertion_ids,
+        )
+        if any(tensor.shape != transition_shape for tensor in scalar_fields):
+            raise ValueError("Sequence transition metadata must have shape (batch, B + L).")
+        if self.terminated.dtype != torch.bool or self.truncated.dtype != torch.bool:
+            raise TypeError("Sequence termination flags must have dtype torch.bool.")
+        if self.reset_boundaries.dtype != torch.bool:
+            raise TypeError("Sequence reset_boundaries must have dtype torch.bool.")
+        integer_fields = (self.episode_ids, self.env_ids, self.timesteps, self.insertion_ids)
+        if any(tensor.dtype != torch.int64 for tensor in integer_fields):
+            raise TypeError("Sequence temporal metadata must have dtype torch.int64.")
+        if torch.any(self.episode_ids != self.episode_ids[:, :1]) or torch.any(self.env_ids != self.env_ids[:, :1]):
+            raise ValueError("Every sampled sequence must stay in one episode and environment.")
+        if torch.any(self.timesteps[:, 1:] != self.timesteps[:, :-1] + 1):
+            raise ValueError("Sequence timesteps must be consecutive.")
+        if torch.any(self.reset_boundaries[:, 1:]):
+            raise ValueError("A sampled sequence must not cross a reset boundary.")
+        if self.transition_length > 1 and torch.any(
+            self.terminated[:, :-1] | self.truncated[:, :-1]
+        ):
+            raise ValueError("Only the final transition in a sequence may end an episode.")
+        floating_fields = (
+            self.observations,
+            self.privileged_states,
+            self.stored_control_features,
+            self.actions,
+            self.rewards,
+        )
+        if not all(tensor.dtype.is_floating_point for tensor in floating_fields):
+            raise TypeError("Sequence observation, action, and reward fields must be floating point.")
+        if not all(torch.isfinite(tensor).all() for tensor in floating_fields):
+            raise ValueError("Sequence floating-point fields must be finite.")
+
+    @property
+    def batch_size(self) -> int:
+        return self.observations.shape[0]
+
+    @property
+    def transition_length(self) -> int:
+        return self.burn_in_length + self.learning_length
+
+    @property
+    def burn_in_observations(self) -> torch.Tensor:
+        return self.observations[:, : self.burn_in_length]
+
+    @property
+    def learning_observations(self) -> torch.Tensor:
+        return self.observations[:, self.burn_in_length :]
+
+    @property
+    def learning_privileged_states(self) -> torch.Tensor:
+        return self.privileged_states[:, self.burn_in_length :]
+
+    @property
+    def learning_stored_control_features(self) -> torch.Tensor:
+        return self.stored_control_features[:, self.burn_in_length :]
+
+    @property
+    def learning_actions(self) -> torch.Tensor:
+        return self.actions[:, self.burn_in_length :]
+
+    @property
+    def learning_rewards(self) -> torch.Tensor:
+        return self.rewards[:, self.burn_in_length :]
+
+    @property
+    def learning_terminated(self) -> torch.Tensor:
+        return self.terminated[:, self.burn_in_length :]
+
+    @property
+    def learning_truncated(self) -> torch.Tensor:
+        return self.truncated[:, self.burn_in_length :]
+
+    @property
+    def context_is_exact(self) -> torch.Tensor:
+        """True when replay starts at the real episode reset rather than mid-prefix."""
+
+        return self.reset_boundaries[:, 0] & (self.timesteps[:, 0] == 0)
+
+    def to(self, device: torch.device | str, non_blocking: bool = False) -> "SequenceReplayBatch":
+        tensor_names = (
+            "observations",
+            "privileged_states",
+            "stored_control_features",
+            "actions",
+            "rewards",
+            "terminated",
+            "truncated",
+            "episode_ids",
+            "env_ids",
+            "timesteps",
+            "reset_boundaries",
+            "insertion_ids",
+        )
+        return SequenceReplayBatch(
+            **{
+                name: getattr(self, name).to(device=device, non_blocking=non_blocking)
+                for name in tensor_names
+            },
+            burn_in_length=self.burn_in_length,
+            learning_length=self.learning_length,
+        )
+
+
 class TransitionReplayBuffer:
     """Preallocated circular replay with vector-environment batch insertion."""
 
@@ -188,6 +345,9 @@ class TransitionReplayBuffer:
         self._final_control_features = vector(spec.control_feature_dim)
         self._final_observation_mask = scalar(torch.bool)
         self._insertion_ids = scalar(torch.int64)
+        self._slot_temporal_keys: list[TemporalKey | None] = [None] * spec.capacity
+        self._temporal_index: dict[TemporalKey, int] = {}
+        self._valid_sequence_starts: dict[int, set[TemporalKey]] = {}
 
     def __len__(self) -> int:
         return self._size
@@ -294,6 +454,13 @@ class TransitionReplayBuffer:
         reset_boundaries = self._optional_boolean_vector(
             reset_boundaries, "reset_boundaries", batch_size, required=metadata_required
         )
+        if metadata_required:
+            if torch.any(episode_ids < 0) or torch.any(env_ids < 0) or torch.any(timesteps < 0):
+                raise ValueError("FastWMR episode_ids, env_ids, and timesteps must be non-negative.")
+            if torch.any(reset_boundaries != (timesteps == 0)):
+                raise ValueError("reset_boundaries must be true exactly when an episode timestep is zero.")
+        if self.spec.control_feature_dim > 0 and torch.any(estimator_versions < 0):
+            raise ValueError("FastWMR estimator_versions must be non-negative.")
 
         if final_observations is None:
             if any(
@@ -382,6 +549,8 @@ class TransitionReplayBuffer:
             final_observation_mask = final_observation_mask[start:]
             insertion_ids = insertion_ids[start:]
         indices = (torch.arange(batch_size, device=self.storage_device) + self._position) % self.capacity
+        temporal_keys = self._make_temporal_keys(env_ids, episode_ids, timesteps)
+        self._validate_temporal_replacements(indices, temporal_keys)
 
         values = {
             "observations": observations,
@@ -408,6 +577,7 @@ class TransitionReplayBuffer:
         for name, value in values.items():
             storage = getattr(self, f"_{name}")
             storage[indices] = value.detach().to(device=self.storage_device, dtype=storage.dtype)
+        self._commit_temporal_replacements(indices, temporal_keys)
 
         self._position = (self._position + batch_size) % self.capacity
         self._size = min(self._size + batch_size, self.capacity)
@@ -430,6 +600,85 @@ class TransitionReplayBuffer:
         batch = self._batch_at(indices)
         return batch if device is None else batch.to(device)
 
+    def can_sample_sequences(
+        self,
+        batch_size: int,
+        burn_in_length: int,
+        learning_length: int,
+        *,
+        require_episode_start: bool = False,
+    ) -> bool:
+        """Return whether enough distinct boundary-safe windows are retained."""
+
+        self._validate_sequence_request(batch_size, burn_in_length, learning_length)
+        starts = self._sequence_starts(
+            burn_in_length + learning_length,
+            require_episode_start=require_episode_start,
+        )
+        return len(starts) >= batch_size
+
+    def sample_sequences(
+        self,
+        batch_size: int,
+        burn_in_length: int,
+        learning_length: int,
+        *,
+        require_episode_start: bool = False,
+        device: torch.device | str | None = None,
+        generator: torch.Generator | None = None,
+    ) -> SequenceReplayBatch:
+        """Sample ``B + L`` consecutive transitions without crossing resets."""
+
+        self._validate_sequence_request(batch_size, burn_in_length, learning_length)
+        transition_length = burn_in_length + learning_length
+        starts = self._sequence_starts(transition_length, require_episode_start=require_episode_start)
+        if len(starts) < batch_size:
+            raise RuntimeError(
+                f"Need {batch_size} valid sequences of length {transition_length}, found {len(starts)}."
+            )
+
+        choices = torch.randperm(len(starts), generator=generator)[:batch_size].tolist()
+        selected_starts = [starts[index] for index in choices]
+        physical_indices = [
+            [self._temporal_index[(env_id, episode_id, timestep + offset)] for offset in range(transition_length)]
+            for env_id, episode_id, timestep in selected_starts
+        ]
+        indices = torch.tensor(physical_indices, dtype=torch.int64, device=self.storage_device)
+        transitions = self._batch_at(indices)
+        final_transitions = self._batch_at(indices[:, -1])
+
+        sequence = SequenceReplayBatch(
+            observations=torch.cat(
+                (transitions.observations, final_transitions.bootstrap_observations.unsqueeze(1)), dim=1
+            ),
+            privileged_states=torch.cat(
+                (
+                    transitions.privileged_states,
+                    final_transitions.bootstrap_privileged_states.unsqueeze(1),
+                ),
+                dim=1,
+            ),
+            stored_control_features=torch.cat(
+                (
+                    transitions.control_features,
+                    final_transitions.bootstrap_control_features.unsqueeze(1),
+                ),
+                dim=1,
+            ),
+            actions=transitions.actions,
+            rewards=transitions.rewards,
+            terminated=transitions.terminated,
+            truncated=transitions.truncated,
+            episode_ids=transitions.episode_ids,
+            env_ids=transitions.env_ids,
+            timesteps=transitions.timesteps,
+            reset_boundaries=transitions.reset_boundaries,
+            insertion_ids=transitions.insertion_ids,
+            burn_in_length=burn_in_length,
+            learning_length=learning_length,
+        )
+        return sequence if device is None else sequence.to(device)
+
     def chronological(self, *, device: torch.device | str | None = None) -> TransitionReplayBatch:
         """Return retained transitions from oldest to newest for tests/debugging."""
 
@@ -447,6 +696,9 @@ class TransitionReplayBuffer:
 
         self._position = 0
         self._size = 0
+        self._slot_temporal_keys = [None] * self.capacity
+        self._temporal_index.clear()
+        self._valid_sequence_starts.clear()
 
     def _batch_at(self, indices: torch.Tensor) -> TransitionReplayBatch:
         return TransitionReplayBatch(
@@ -471,6 +723,112 @@ class TransitionReplayBuffer:
             final_observation_mask=self._final_observation_mask[indices],
             insertion_ids=self._insertion_ids[indices],
         )
+
+    @staticmethod
+    def _make_temporal_keys(
+        env_ids: torch.Tensor,
+        episode_ids: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> list[TemporalKey | None]:
+        values = zip(
+            env_ids.detach().cpu().tolist(),
+            episode_ids.detach().cpu().tolist(),
+            timesteps.detach().cpu().tolist(),
+            strict=True,
+        )
+        return [
+            (int(env_id), int(episode_id), int(timestep))
+            if env_id >= 0 and episode_id >= 0 and timestep >= 0
+            else None
+            for env_id, episode_id, timestep in values
+        ]
+
+    def _validate_temporal_replacements(
+        self,
+        indices: torch.Tensor,
+        new_keys: list[TemporalKey | None],
+    ) -> None:
+        slots = indices.detach().cpu().tolist()
+        non_null_keys = [key for key in new_keys if key is not None]
+        if len(non_null_keys) != len(set(non_null_keys)):
+            raise ValueError("A replay add batch contains duplicate temporal keys.")
+        replaced_slots = set(slots)
+        for key in non_null_keys:
+            existing_slot = self._temporal_index.get(key)
+            if existing_slot is not None and existing_slot not in replaced_slots:
+                raise ValueError(f"Temporal key {key} is already retained in replay.")
+
+    def _commit_temporal_replacements(
+        self,
+        indices: torch.Tensor,
+        new_keys: list[TemporalKey | None],
+    ) -> None:
+        slots = [int(slot) for slot in indices.detach().cpu().tolist()]
+        changed_keys: list[TemporalKey] = []
+        for slot in slots:
+            old_key = self._slot_temporal_keys[slot]
+            if old_key is not None:
+                if self._temporal_index.get(old_key) == slot:
+                    del self._temporal_index[old_key]
+                changed_keys.append(old_key)
+        for slot, key in zip(slots, new_keys, strict=True):
+            self._slot_temporal_keys[slot] = key
+            if key is not None:
+                self._temporal_index[key] = slot
+                changed_keys.append(key)
+
+        for transition_length, valid_starts in self._valid_sequence_starts.items():
+            affected_starts: set[TemporalKey] = set()
+            for env_id, episode_id, timestep in changed_keys:
+                for offset in range(transition_length):
+                    start_timestep = timestep - offset
+                    if start_timestep >= 0:
+                        affected_starts.add((env_id, episode_id, start_timestep))
+            for start in affected_starts:
+                if self._is_valid_sequence_start(start, transition_length):
+                    valid_starts.add(start)
+                else:
+                    valid_starts.discard(start)
+
+    def _sequence_starts(
+        self,
+        transition_length: int,
+        *,
+        require_episode_start: bool,
+    ) -> list[TemporalKey]:
+        if transition_length <= 0:
+            raise ValueError("Sequence transition length must be positive.")
+        if not self.spec.require_temporal_metadata:
+            raise RuntimeError("Sequence sampling requires a FastWMR replay specification.")
+        if transition_length not in self._valid_sequence_starts:
+            self._valid_sequence_starts[transition_length] = {
+                key for key in self._temporal_index if self._is_valid_sequence_start(key, transition_length)
+            }
+        starts = self._valid_sequence_starts[transition_length]
+        if require_episode_start:
+            starts = {key for key in starts if key[2] == 0}
+        return sorted(starts)
+
+    def _is_valid_sequence_start(self, start: TemporalKey, transition_length: int) -> bool:
+        env_id, episode_id, start_timestep = start
+        for offset in range(transition_length):
+            slot = self._temporal_index.get((env_id, episode_id, start_timestep + offset))
+            if slot is None:
+                return False
+            if offset > 0 and bool(self._reset_boundaries[slot].item()):
+                return False
+            if offset < transition_length - 1 and bool((self._terminated[slot] | self._truncated[slot]).item()):
+                return False
+        return True
+
+    @staticmethod
+    def _validate_sequence_request(batch_size: int, burn_in_length: int, learning_length: int) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        if burn_in_length < 0:
+            raise ValueError("burn_in_length must be non-negative.")
+        if learning_length <= 0:
+            raise ValueError("learning_length must be positive.")
 
     @staticmethod
     def _as_matrix(

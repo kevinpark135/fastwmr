@@ -6,8 +6,9 @@ Planned flow:
 3. Decode reconstructed state ``shat_t``.
 4. Build ``x_t = concat(norm(o_t), stop_grad(shat_t))`` through the shared
    feature builder and sample an action from ``pi_theta(x_t)``.
-5. Step the environment, append ``(o_t, s_t)`` to the estimator rollout cache,
-   and append the detached control transition to ordinary SAC replay.
+5. Step the environment and append raw observations, privileged targets,
+   detached diagnostic features, and temporal metadata to transition replay.
+   A recent rollout cache may additionally support online context rebuilding.
 6. Reset hidden state only for terminated or truncated environments, then
    detach it at rollout chunk boundaries.
 """

@@ -8,7 +8,7 @@ will be added in layers:
 
 1. Environment/task layer: observations, rewards, randomization, curriculum, and
    baseline task registration.
-2. Algorithm layer: transition replay, estimator rollout cache, recurrent
+2. Algorithm layer: transition and boundary-safe sequence replay, recurrent
    world-state estimator, decoder, actor, critic, and FastSAC update.
 3. Script layer: training, evaluation, CLI overrides, logging, and ablations.
 
