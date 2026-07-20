@@ -17,7 +17,9 @@ from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import (
 ##
 # Pre-defined configs
 ##
-from isaaclab_assets import G1_MINIMAL_CFG  # isort: skip
+from isaaclab_assets import G1_29DOF_CFG  # isort: skip
+
+from .observations import FastWMRObservationsCfg, G1_29DOF_JOINT_PATTERNS
 
 
 @configclass
@@ -73,40 +75,31 @@ class G1Rewards(RewardsCfg):
                     ".*_shoulder_pitch_joint",
                     ".*_shoulder_roll_joint",
                     ".*_shoulder_yaw_joint",
-                    ".*_elbow_pitch_joint",
-                    ".*_elbow_roll_joint",
+                    ".*_elbow_joint",
+                    ".*_wrist_.*_joint",
                 ],
             )
         },
     )
-    joint_deviation_fingers = RewTerm(
-        func=mdp.joint_deviation_l1,
-        weight=-0.05,
-        params={
-            "asset_cfg": SceneEntityCfg(
-                "robot",
-                joint_names=[
-                    ".*_five_joint",
-                    ".*_three_joint",
-                    ".*_six_joint",
-                    ".*_four_joint",
-                    ".*_zero_joint",
-                    ".*_one_joint",
-                    ".*_two_joint",
-                ],
-            )
-        },
-    )
-    joint_deviation_torso = RewTerm(
+    joint_deviation_waist = RewTerm(
         func=mdp.joint_deviation_l1,
         weight=-0.1,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names="torso_joint")},
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names="waist_.*_joint")},
     )
 
 
 @configclass
-class G1RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
+class G1FastWMREnvCfg(LocomotionVelocityRoughEnvCfg):
+    """FastWMR G1 velocity task.
+
+    This is the single environment config kept for FastWMR. It inherits
+    IsaacLab's rough-terrain velocity base config because FastWMR is intended to
+    train under terrain, friction, push, and payload variation, but the public
+    task name is FastWMR.
+    """
+
     rewards: G1Rewards = G1Rewards()
+    observations: FastWMRObservationsCfg = FastWMRObservationsCfg()
 
     def __post_init__(self):
         # post init of parent
@@ -116,13 +109,22 @@ class G1RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         # threshold to 0.8 rad/s (defaults work for quadrupeds).
         self.commands.base_velocity.vel_yaw_success_threshold = 0.8
         # Scene
-        self.scene.robot = G1_MINIMAL_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
-        self.scene.height_scanner.prim_path = "{ENV_REGEX_NS}/Robot/torso_link"
+        self.scene.robot = G1_29DOF_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        # Contact rewards and the privileged foot-contact target both require
+        # PhysX contact reporters on the robot bodies.
+        self.scene.robot.spawn.activate_contact_sensors = True
+        self.scene.height_scanner.prim_path = "{ENV_REGEX_NS}/Robot/pelvis"
 
-        # G1 uses "torso_link" as base body — disable mass randomization for bipeds
+        # Action, joint-position observation, and joint-velocity observation
+        # must resolve against the same 29 body joints in articulation order.
+        self.actions.joint_pos.joint_names = list(G1_29DOF_JOINT_PATTERNS)
+        self.actions.joint_pos.preserve_order = False
+
+        # Payload randomization is introduced in phase 4; keep it disabled for
+        # the nominal task-registration gate.
         self.events.add_base_mass = None
         self.events.base_com = None
-        self.events.base_external_force_torque.params["asset_cfg"].body_names = "torso_link"
+        self.events.base_external_force_torque.params["asset_cfg"].body_names = "pelvis"
         # G1 has precise initial pose — don't scale joint defaults randomly on reset
         self.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)
 
@@ -146,11 +148,11 @@ class G1RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
 
         # terminations
-        self.terminations.base_contact.params["sensor_cfg"].body_names = "torso_link"
+        self.terminations.base_contact.params["sensor_cfg"].body_names = "pelvis"
 
 
 @configclass
-class G1RoughEnvCfg_PLAY(G1RoughEnvCfg):
+class G1FastWMREnvCfg_PLAY(G1FastWMREnvCfg):
     def __post_init__(self):
         # post init of parent
         super().__post_init__()

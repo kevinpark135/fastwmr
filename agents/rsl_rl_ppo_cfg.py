@@ -11,17 +11,13 @@ from isaaclab_tasks.utils import preset
 
 
 @configclass
-class G1RoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+class G1FastWMRPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
-    # Newton needs ~1.7x the PPO iterations to match PhysX on G1. PhysX saturates near iter 3000
-    # (reward ≈ +18, ep_len ≈ 980) and does not meaningfully improve on either metric past that —
-    # reward oscillates +16 to +19 through iter 7500, ep_len stays flat. Newton reaches the same
-    # (reward, ep_len) quality at iter 5000 (+16 / 984). Comparing reward alone is misleading:
-    # ep_len confirms the robot is stable in both cases. The gap is sample-efficiency, not a
-    # ceiling — no physics or reward tuning closes it.
+    # Legacy PPO runner kept only as a lightweight compatibility reference while
+    # the custom FastWMR off-policy learner is being built.
     max_iterations = preset(default=3000, newton=5000)
     save_interval = 50
-    experiment_name = "g1_rough"
+    experiment_name = "fastwmr"
     actor = RslRlMLPModelCfg(
         hidden_dims=[512, 256, 128],
         activation="elu",
@@ -48,13 +44,3 @@ class G1RoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         max_grad_norm=1.0,
     )
 
-
-@configclass
-class G1FlatPPORunnerCfg(G1RoughPPORunnerCfg):
-    def __post_init__(self):
-        super().__post_init__()
-
-        self.max_iterations = 1500
-        self.experiment_name = "g1_flat"
-        self.actor.hidden_dims = [256, 128, 128]
-        self.critic.hidden_dims = [256, 128, 128]
