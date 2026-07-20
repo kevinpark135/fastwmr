@@ -8,6 +8,7 @@ import torch
 
 from ..buffers import SequenceReplayBatch, TransitionReplayBuffer
 from ..config import ReplayUpdateCfg, SequenceReplayCfg
+from ..utils.normalization import RunningObservationNormalizer
 from .sac_update import SACFeatureSource, SACTransitionBatch, SACUpdateMetrics, SACUpdater
 
 
@@ -24,11 +25,18 @@ class FastSACReplayUpdateLoop:
         cfg: ReplayUpdateCfg,
         *,
         learner_device: torch.device | str,
+        observation_normalizer: RunningObservationNormalizer | None = None,
     ) -> None:
         self.replay = replay
         self.updater = updater
         self.cfg = cfg
         self.learner_device = torch.device(learner_device)
+        self.observation_normalizer = observation_normalizer
+        if observation_normalizer is not None:
+            if observation_normalizer.observation_dim != updater.actor.input_dim:
+                raise ValueError("Observation normalizer and actor input dimensions must match.")
+            if observation_normalizer.mean.device != self.learner_device:
+                raise ValueError("Observation normalizer must be on learner_device.")
         self.environment_steps = 0
         self.gradient_steps = 0
 
@@ -49,6 +57,19 @@ class FastSACReplayUpdateLoop:
             raise ValueError("Environment step increment must be positive.")
         self.environment_steps += steps
 
+    def update_observation_statistics(self, observations: torch.Tensor) -> None:
+        """Record raw rollout observations exactly once at collection time."""
+
+        if self.observation_normalizer is not None:
+            self.observation_normalizer.update(observations)
+
+    def normalize_observations(self, observations: torch.Tensor) -> torch.Tensor:
+        """Apply current statistics without mutating them."""
+
+        if self.observation_normalizer is None:
+            return observations
+        return self.observation_normalizer(observations)
+
     @torch.no_grad()
     def select_actions(self, states: torch.Tensor, *, deterministic: bool = False) -> torch.Tensor:
         """Use uniform bounded actions during warm-up, then the learned actor."""
@@ -59,7 +80,7 @@ class FastSACReplayUpdateLoop:
         if self.warming_up:
             random_values = torch.rand((*states.shape[:-1], actor.action_dim), device=states.device)
             return actor.action_low + random_values * (actor.action_high - actor.action_low)
-        return actor.act(states, deterministic=deterministic)
+        return actor.act(self.normalize_observations(states), deterministic=deterministic)
 
     def run_updates(self, *, generator: torch.Generator | None = None) -> list[SACUpdateMetrics]:
         if not self.ready:
@@ -71,9 +92,22 @@ class FastSACReplayUpdateLoop:
                 replay_batch,
                 feature_source=SACFeatureSource.POLICY_OBSERVATION,
             ).to(self.learner_device)
+            batch = self._normalize_transition_batch(batch)
             metrics.append(self.updater.update(batch))
             self.gradient_steps += 1
         return metrics
+
+    def _normalize_transition_batch(self, batch: SACTransitionBatch) -> SACTransitionBatch:
+        if self.observation_normalizer is None:
+            return batch
+        return SACTransitionBatch(
+            states=self.normalize_observations(batch.states),
+            actions=batch.actions,
+            rewards=batch.rewards,
+            next_states=self.normalize_observations(batch.next_states),
+            terminated=batch.terminated,
+            truncated=batch.truncated,
+        )
 
 
 class FastWMRSequenceUpdateLoop(FastSACReplayUpdateLoop):

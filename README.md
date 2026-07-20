@@ -24,6 +24,12 @@ Implementation is progressing in independently verified layers:
 - FastSAC core gate: connected Rough G1 collection to transition replay and the
   scalar SAC learner, including random-action warm-up, replay wraparound,
   reset-safe final observations, and finite actor/critic/temperature updates.
+- FastSAC normalization: added checkpointable running observation statistics;
+  replay remains raw while rollout actions and learner batches share the same
+  current normalized representation.
+- FastSAC action bounds: derive symmetric per-joint tanh scales from resolved G1
+  limits, default positions, and IsaacLab action scaling so zero action remains
+  the configured default pose.
 
 ## Verification
 

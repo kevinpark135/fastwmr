@@ -206,6 +206,35 @@ DEFAULT_CRITIC_CFG = ScalarCriticCfg()
 
 
 @dataclass(frozen=True)
+class ObservationNormalizationCfg:
+    """Running observation normalization used by rollout and replay learning."""
+
+    enabled: bool = True
+    epsilon: float = 1e-5
+    clip: float | None = 10.0
+
+    def __post_init__(self) -> None:
+        if self.epsilon <= 0.0:
+            raise ValueError("Observation normalization epsilon must be positive.")
+        if self.clip is not None and self.clip <= 0.0:
+            raise ValueError("Observation normalization clip must be positive when provided.")
+
+
+DEFAULT_OBSERVATION_NORMALIZATION_CFG = ObservationNormalizationCfg()
+
+
+@dataclass(frozen=True)
+class JointLimitActionBoundsCfg:
+    """FastSAC symmetric action scaling derived from robot joint limits."""
+
+    enabled: bool = True
+    use_soft_limits: bool = False
+
+
+DEFAULT_JOINT_LIMIT_ACTION_BOUNDS_CFG = JointLimitActionBoundsCfg()
+
+
+@dataclass(frozen=True)
 class ReplayUpdateCfg:
     """FastSAC collection warm-up and replay update schedule."""
 
@@ -258,6 +287,8 @@ class FastWMRAlgoCfg:
     interface: FastWMRInterfaceCfg = DEFAULT_INTERFACE_CFG
     actor: TanhGaussianActorCfg = DEFAULT_ACTOR_CFG
     critic: ScalarCriticCfg = DEFAULT_CRITIC_CFG
+    observation_normalization: ObservationNormalizationCfg = DEFAULT_OBSERVATION_NORMALIZATION_CFG
+    joint_limit_action_bounds: JointLimitActionBoundsCfg = DEFAULT_JOINT_LIMIT_ACTION_BOUNDS_CFG
     replay_update: ReplayUpdateCfg = DEFAULT_REPLAY_UPDATE_CFG
     sequence_replay: SequenceReplayCfg = DEFAULT_SEQUENCE_REPLAY_CFG
     discount: float = 0.97

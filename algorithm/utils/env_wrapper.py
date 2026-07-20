@@ -7,6 +7,8 @@ from typing import Any
 
 import torch
 
+from .action_bounds import ActionBounds, symmetric_joint_limit_action_bounds
+
 
 ObservationGroups = dict[str, torch.Tensor]
 
@@ -110,6 +112,32 @@ class IsaacLabEnvAdapter:
             delattr(self.unwrapped, "_reset_idx")
         self.env.close()
         self._closed = True
+
+    def joint_position_action_bounds(
+        self,
+        *,
+        term_name: str = "joint_pos",
+        use_soft_limits: bool = False,
+    ) -> ActionBounds:
+        """Derive reference FastSAC bounds from one resolved joint action term."""
+
+        action_term = self.unwrapped.action_manager.get_term(term_name)
+        required_attributes = ("_asset", "_joint_ids", "_scale", "_offset", "cfg")
+        if any(not hasattr(action_term, name) for name in required_attributes):
+            raise TypeError(f"Action term {term_name!r} is not a compatible joint-position action term.")
+        if not getattr(action_term.cfg, "use_default_offset", False):
+            raise ValueError("Joint-limit-aware FastSAC bounds require use_default_offset=True.")
+
+        asset = action_term._asset
+        joint_ids = action_term._joint_ids
+        limit_source = asset.data.soft_joint_pos_limits if use_soft_limits else asset.data.joint_pos_limits
+        limits = limit_source.torch[:, joint_ids, :]
+        defaults = asset.data.default_joint_pos.torch[:, joint_ids]
+        offset = torch.as_tensor(action_term._offset, device=defaults.device, dtype=defaults.dtype)
+        offset = torch.broadcast_to(offset, defaults.shape)
+        if not torch.allclose(offset, defaults):
+            raise ValueError("Joint action offset must equal the resolved default joint positions.")
+        return symmetric_joint_limit_action_bounds(limits, defaults, action_term._scale)
 
     @staticmethod
     def policy_observation(observations: ObservationGroups) -> torch.Tensor:

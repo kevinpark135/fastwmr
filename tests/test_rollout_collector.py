@@ -24,7 +24,10 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.n
     TanhGaussianActor,
     TwinScalarCritic,
 )
-from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.utils import IsaacLabEnvAdapter
+from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.utils import (
+    IsaacLabEnvAdapter,
+    RunningObservationNormalizer,
+)
 
 
 class _ObservationManager:
@@ -42,9 +45,49 @@ class _RawEnv:
         self.num_envs = 2
         self.state = torch.zeros(2, 2)
         self.observation_manager = _ObservationManager(self)
+        self.action_manager = _ActionManager(self)
 
     def _reset_idx(self, env_ids: torch.Tensor) -> None:
         self.state[env_ids.long()] = 0.0
+
+
+class _TensorProxy:
+    def __init__(self, value: torch.Tensor) -> None:
+        self.torch = value
+
+
+class _ActionManager:
+    def __init__(self, owner: _RawEnv) -> None:
+        defaults = torch.full((owner.num_envs, 1), 0.5)
+        data = type(
+            "Data",
+            (),
+            {
+                "joint_pos_limits": _TensorProxy(torch.tensor([[[-1.0, 2.0]]]).expand(owner.num_envs, -1, -1)),
+                "soft_joint_pos_limits": _TensorProxy(
+                    torch.tensor([[[-0.5, 1.5]]]).expand(owner.num_envs, -1, -1)
+                ),
+                "default_joint_pos": _TensorProxy(defaults),
+            },
+        )()
+        asset = type("Asset", (), {"data": data})()
+        cfg = type("Cfg", (), {"use_default_offset": True})()
+        self.term = type(
+            "Term",
+            (),
+            {
+                "_asset": asset,
+                "_joint_ids": slice(None),
+                "_scale": 0.5,
+                "_offset": defaults.clone(),
+                "cfg": cfg,
+            },
+        )()
+
+    def get_term(self, name: str):
+        if name != "joint_pos":
+            raise KeyError(name)
+        return self.term
 
 
 class _GymEnv:
@@ -105,14 +148,29 @@ def test_adapter_captures_observation_before_internal_auto_reset() -> None:
     assert raw_env.closed
 
 
+def test_adapter_derives_bounds_from_resolved_joint_action_term() -> None:
+    env = IsaacLabEnvAdapter(_GymEnv())
+
+    hard = env.joint_position_action_bounds()
+    soft = env.joint_position_action_bounds(use_soft_limits=True)
+
+    assert torch.equal(hard.low, torch.tensor([-3.0]))
+    assert torch.equal(hard.high, torch.tensor([3.0]))
+    assert torch.equal(soft.low, torch.tensor([-2.0]))
+    assert torch.equal(soft.high, torch.tensor([2.0]))
+    env.close()
+
+
 def test_collector_runs_replay_wraparound_and_gradient_updates() -> None:
     env = IsaacLabEnvAdapter(_GymEnv())
     replay = TransitionReplayBuffer(ReplayBufferSpec(capacity=4, observation_dim=2, action_dim=1))
+    normalizer = RunningObservationNormalizer(2)
     loop = FastSACReplayUpdateLoop(
         replay,
         _updater(),
         ReplayUpdateCfg(random_action_steps=0, minimum_replay_size=2, batch_size=2, num_updates=1),
         learner_device="cpu",
+        observation_normalizer=normalizer,
     )
     collector = FastSACRolloutCollector(env, replay, loop)
     collector.reset(seed=1)
@@ -124,5 +182,6 @@ def test_collector_runs_replay_wraparound_and_gradient_updates() -> None:
     assert replay.is_full
     assert loop.environment_steps == 3
     assert loop.gradient_steps == 3
+    assert normalizer.samples_seen == 8
     assert all(len(result.updates) == 1 for result in results)
     env.close()

@@ -34,6 +34,7 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.b
     TransitionReplayBuffer,
 )
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.config import (
+    ObservationNormalizationCfg,
     ReplayUpdateCfg,
     ScalarCriticCfg,
     TanhGaussianActorCfg,
@@ -43,7 +44,10 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.n
     TanhGaussianActor,
     TwinScalarCritic,
 )
-from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.utils import IsaacLabEnvAdapter
+from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.utils import (
+    IsaacLabEnvAdapter,
+    RunningObservationNormalizer,
+)
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
 
@@ -59,10 +63,23 @@ def _apply_rough_debug_overrides(cfg: object) -> None:
         cfg.scene.terrain.terrain_generator.curriculum = False
 
 
-def _build_updater(observation_dim: int, action_dim: int, device: torch.device) -> SACUpdater:
+def _build_updater(
+    observation_dim: int,
+    action_dim: int,
+    device: torch.device,
+    *,
+    action_low: torch.Tensor,
+    action_high: torch.Tensor,
+) -> SACUpdater:
     actor_cfg = TanhGaussianActorCfg(hidden_dim=ARGS.hidden_dim)
     critic_cfg = ScalarCriticCfg(hidden_dim=ARGS.hidden_dim)
-    actor = TanhGaussianActor(observation_dim, action_dim, cfg=actor_cfg).to(device)
+    actor = TanhGaussianActor(
+        observation_dim,
+        action_dim,
+        cfg=actor_cfg,
+        action_low=action_low,
+        action_high=action_high,
+    ).to(device)
     critic = TwinScalarCritic(observation_dim, action_dim, cfg=critic_cfg).to(device)
     target_critic = TargetTwinScalarCritic.from_online(critic)
     temperature = EntropyTemperature(ARGS.initial_temperature).to(device)
@@ -107,6 +124,13 @@ def run() -> None:
         observation_dim = int(raw_env.observation_space["policy"].shape[-1])
         action_dim = int(raw_env.unwrapped.action_manager.total_action_dim)
         learner_device = env.device
+        if ARGS.disable_joint_limit_action_bounds:
+            action_low = torch.full((action_dim,), -1.0, device=learner_device)
+            action_high = torch.full((action_dim,), 1.0, device=learner_device)
+        else:
+            action_bounds = env.joint_position_action_bounds(use_soft_limits=ARGS.use_soft_joint_limits)
+            action_low = action_bounds.low
+            action_high = action_bounds.high
         replay = TransitionReplayBuffer(
             ReplayBufferSpec(
                 capacity=ARGS.replay_capacity,
@@ -115,18 +139,34 @@ def run() -> None:
             ),
             storage_device=ARGS.replay_storage_device,
         )
-        updater = _build_updater(observation_dim, action_dim, learner_device)
+        updater = _build_updater(
+            observation_dim,
+            action_dim,
+            learner_device,
+            action_low=action_low,
+            action_high=action_high,
+        )
         update_cfg = ReplayUpdateCfg(
             random_action_steps=ARGS.random_action_steps,
             minimum_replay_size=ARGS.minimum_replay_size,
             batch_size=ARGS.batch_size,
             num_updates=ARGS.num_updates,
         )
+        normalizer = None
+        if not ARGS.disable_observation_normalization:
+            normalizer = RunningObservationNormalizer(
+                observation_dim,
+                ObservationNormalizationCfg(
+                    epsilon=ARGS.normalization_epsilon,
+                    clip=ARGS.normalization_clip,
+                ),
+            ).to(learner_device)
         update_loop = FastSACReplayUpdateLoop(
             replay,
             updater,
             update_cfg,
             learner_device=learner_device,
+            observation_normalizer=normalizer,
         )
         collector = FastSACRolloutCollector(env, replay, update_loop)
         collector.reset(seed=ARGS.seed)
@@ -160,7 +200,10 @@ def run() -> None:
             raise AssertionError("Smoke run finished without a gradient update.")
         print(
             f"[FastSAC] PASS transitions={replay.total_inserted} retained={len(replay)} "
-            f"gradient_steps={update_loop.gradient_steps} done={done_count}"
+            f"gradient_steps={update_loop.gradient_steps} done={done_count} "
+            f"normalizer_samples={normalizer.samples_seen if normalizer is not None else 0} "
+            f"action_scale=[{updater.actor.action_scale.min().item():.3f},"
+            f"{updater.actor.action_scale.max().item():.3f}]"
         )
     finally:
         env.close()

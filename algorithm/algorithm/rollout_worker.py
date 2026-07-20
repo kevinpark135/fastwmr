@@ -44,6 +44,7 @@ class FastSACRolloutCollector:
         self._observations, _ = self.env.reset(seed=seed)
         policy = self.env.policy_observation(self._observations)
         self._validate_policy_shape(policy)
+        self.update_loop.update_observation_statistics(policy)
         return policy
 
     def collect_step(
@@ -71,6 +72,7 @@ class FastSACRolloutCollector:
             final_observations=final_observations,
             final_observation_mask=step.final_observation_mask,
         )
+        self.update_loop.update_observation_statistics(next_observations)
         self._observations = step.observations
         self.update_loop.advance_environment()
         updates = tuple(self.update_loop.run_updates(generator=generator))
