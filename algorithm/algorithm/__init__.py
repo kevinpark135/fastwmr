@@ -1,6 +1,17 @@
 """FastWMR estimator, SAC update, rollout, and learner orchestration modules."""
 
-from .estimator_update import BurnInUnrollOutput, RecurrentSequenceEstimator, burn_in_and_unroll
+from .estimator_update import (
+    BurnInUnrollOutput,
+    EstimatorLossOutput,
+    EstimatorPrediction,
+    EstimatorUpdateMetrics,
+    EstimatorUpdateResult,
+    EstimatorUpdater,
+    RecurrentSequenceEstimator,
+    WorldStateEstimator,
+    burn_in_and_unroll,
+    compute_estimator_loss,
+)
 from .fastwmr_agent import FastSACReplayUpdateLoop, FastWMRSequenceUpdateLoop, SequenceFeatureProcessor
 from .rollout_worker import FastSACRolloutCollector, RolloutStepResult
 from .sac_update import (
@@ -29,6 +40,11 @@ __all__ = [
     "C51SACUpdater",
     "CriticLossOutput",
     "EntropyTemperature",
+    "EstimatorLossOutput",
+    "EstimatorPrediction",
+    "EstimatorUpdateMetrics",
+    "EstimatorUpdateResult",
+    "EstimatorUpdater",
     "FastSACReplayUpdateLoop",
     "FastSACRolloutCollector",
     "FastWMRSequenceUpdateLoop",
@@ -39,7 +55,9 @@ __all__ = [
     "SACUpdateMetrics",
     "SACUpdater",
     "SequenceFeatureProcessor",
+    "WorldStateEstimator",
     "burn_in_and_unroll",
+    "compute_estimator_loss",
     "compute_actor_loss",
     "compute_c51_critic_loss",
     "compute_c51_critic_target",

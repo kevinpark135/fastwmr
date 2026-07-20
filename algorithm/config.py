@@ -301,6 +301,33 @@ DEFAULT_SEQUENCE_REPLAY_CFG = SequenceReplayCfg()
 
 
 @dataclass(frozen=True)
+class EstimatorLossCfg:
+    """WMR reconstruction-loss weights.
+
+    The defaults follow WMR's continuous reconstruction, discrete contact, and
+    latent sparsity coefficients respectively.
+    """
+
+    continuous_weight: float = 1.0
+    discrete_weight: float = 0.3
+    latent_l1_weight: float = 0.005
+
+    def __post_init__(self) -> None:
+        weights = (
+            self.continuous_weight,
+            self.discrete_weight,
+            self.latent_l1_weight,
+        )
+        if any(weight < 0.0 for weight in weights):
+            raise ValueError("Estimator loss weights must be non-negative.")
+        if not any(weight > 0.0 for weight in weights):
+            raise ValueError("At least one estimator loss weight must be positive.")
+
+
+DEFAULT_ESTIMATOR_LOSS_CFG = EstimatorLossCfg()
+
+
+@dataclass(frozen=True)
 class FastWMRAlgoCfg:
     """MVP algorithm settings that do not belong to the IsaacLab task config.
 
@@ -317,6 +344,7 @@ class FastWMRAlgoCfg:
     joint_limit_action_bounds: JointLimitActionBoundsCfg = DEFAULT_JOINT_LIMIT_ACTION_BOUNDS_CFG
     replay_update: ReplayUpdateCfg = DEFAULT_REPLAY_UPDATE_CFG
     sequence_replay: SequenceReplayCfg = DEFAULT_SEQUENCE_REPLAY_CFG
+    estimator_loss: EstimatorLossCfg = DEFAULT_ESTIMATOR_LOSS_CFG
     discount: float = 0.97
     target_update_rate: float = 0.005
     initial_temperature: float = 0.001
