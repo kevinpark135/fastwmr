@@ -33,20 +33,20 @@ deployable proprioceptive observation and the estimator's reconstruction.
 
 ```text
 fastwmr/
-|-- algorithm/
-|   |-- algorithm/       # SAC/FastWMR updates, rollout workers, and checkpoints
-|   |-- buffers/         # Transition replay and estimator rollout cache
-|   |-- networks/        # Actor, critics, recurrent encoder, and decoder
-|   `-- utils/           # Normalization, bounds, logging, evaluation, and adapters
-|-- agents/              # Isaac Lab PPO reference configurations
-|-- script/              # Training, playback, and evaluation entry points
-|-- tests/               # Unit, integration, contract, and task smoke tests
-|-- fastwmr_env_cfg.py   # FastWMR G1 environment configuration
-|-- baseline_env_cfg.py  # Shared-environment FastSAC baseline
-|-- observations.py      # Policy observations and privileged estimator targets
-|-- rewards.py           # Minimal locomotion reward specification
-|-- randomization.py     # Sample, apply, and record domain randomization
-`-- curriculum.py        # Terrain and penalty schedules
+├── algorithm/
+│   ├── algorithm/       # SAC/FastWMR updates, rollout workers, and checkpoints
+│   ├── buffers/         # Transition replay and estimator rollout cache
+│   ├── networks/        # Actor, critics, recurrent encoder, and decoder
+│   └── utils/           # Normalization, bounds, logging, evaluation, and adapters
+├── agents/              # Isaac Lab PPO reference configurations
+├── script/              # Training, playback, and evaluation entry points
+├── tests/               # Unit, integration, contract, and task smoke tests
+├── fastwmr_env_cfg.py   # FastWMR G1 environment configuration
+├── baseline_env_cfg.py  # Shared-environment FastSAC baseline
+├── observations.py      # Policy observations and privileged estimator targets
+├── rewards.py           # Minimal locomotion reward specification
+├── randomization.py     # Sample, apply, and record domain randomization
+└── curriculum.py        # Terrain and penalty schedules
 ```
 
 ## Quick Start
