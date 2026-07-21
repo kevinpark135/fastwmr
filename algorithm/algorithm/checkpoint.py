@@ -49,6 +49,18 @@ class CheckpointLoadResult:
     config: Mapping[str, Any]
 
 
+@dataclass(frozen=True)
+class CheckpointMetadata:
+    """Checkpoint fields needed to construct evaluation-only modules."""
+
+    path: Path
+    mode: TrainingMode
+    counters: CheckpointCounters
+    config: Mapping[str, Any]
+    architecture: Mapping[str, Any]
+    has_normalizer: bool
+
+
 def save_training_checkpoint(
     path: str | Path,
     *,
@@ -247,6 +259,80 @@ def load_training_checkpoint(
     )
 
 
+def inspect_training_checkpoint(
+    path: str | Path,
+    *,
+    map_location: torch.device | str | None = "cpu",
+) -> CheckpointMetadata:
+    """Read trusted checkpoint metadata before constructing evaluation networks."""
+
+    resolved_path, payload = _load_payload(path, map_location=map_location)
+    return CheckpointMetadata(
+        path=resolved_path,
+        mode=TrainingMode(payload.get("mode")),
+        counters=_checkpoint_counters(payload),
+        config=dict(_require_mapping(payload, "config")),
+        architecture=dict(_require_mapping(payload, "architecture")),
+        has_normalizer=payload.get("normalizer") is not None,
+    )
+
+
+def load_policy_checkpoint(
+    path: str | Path,
+    *,
+    mode: TrainingMode | str,
+    actor: torch.nn.Module,
+    estimator: torch.nn.Module | None = None,
+    normalizer: RunningObservationNormalizer | None = None,
+    map_location: torch.device | str | None = None,
+) -> CheckpointLoadResult:
+    """Load only deployment modules, leaving optimizer and replay state behind."""
+
+    resolved_path, payload = _load_payload(path, map_location=map_location)
+    resolved_mode = TrainingMode(mode)
+    checkpoint_mode = TrainingMode(payload.get("mode"))
+    if checkpoint_mode is not resolved_mode:
+        raise ValueError(
+            f"Checkpoint mode is {checkpoint_mode.value!r}, expected {resolved_mode.value!r}."
+        )
+    architecture = _require_mapping(payload, "architecture")
+    expected_actor = {
+        "actor_input_dim": getattr(actor, "input_dim", None),
+        "action_dim": getattr(actor, "action_dim", None),
+    }
+    for name, expected in expected_actor.items():
+        if architecture.get(name) != expected:
+            raise ValueError(
+                f"Checkpoint {name}={architecture.get(name)!r} does not match {expected!r}."
+            )
+
+    models = _require_mapping(payload, "models")
+    estimator_state = models.get("estimator")
+    if resolved_mode is TrainingMode.FASTWMR:
+        if estimator is None or estimator_state is None:
+            raise ValueError("FastWMR policy loading requires estimator checkpoint state.")
+    elif estimator is not None or estimator_state is not None:
+        raise ValueError("FastSAC policy loading must not receive estimator state.")
+    normalizer_state = payload.get("normalizer")
+    if (normalizer_state is None) != (normalizer is None):
+        raise ValueError("Checkpoint and evaluation normalizer settings do not match.")
+
+    actor.load_state_dict(models["actor"])
+    actor.eval()
+    if estimator is not None:
+        estimator.load_state_dict(estimator_state)
+        estimator.eval()
+    if normalizer is not None:
+        normalizer.load_state_dict(normalizer_state)
+        normalizer.eval()
+    return CheckpointLoadResult(
+        path=resolved_path,
+        mode=resolved_mode,
+        counters=_checkpoint_counters(payload),
+        config=dict(_require_mapping(payload, "config")),
+    )
+
+
 def write_config_snapshot(path: str | Path, config: Mapping[str, Any]) -> Path:
     """Atomically write a human-readable JSON snapshot beside checkpoints."""
 
@@ -299,6 +385,38 @@ def _require_mapping(payload: Mapping[str, Any], key: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError(f"Checkpoint field {key!r} must be a mapping.")
     return value
+
+
+def _load_payload(
+    path: str | Path,
+    *,
+    map_location: torch.device | str | None,
+) -> tuple[Path, dict[str, Any]]:
+    resolved_path = Path(path).expanduser().resolve()
+    if not resolved_path.is_file():
+        raise FileNotFoundError(f"Checkpoint does not exist: {resolved_path}")
+    payload = torch.load(resolved_path, map_location=map_location, weights_only=True)
+    if not isinstance(payload, dict):
+        raise ValueError("Checkpoint payload must be a dictionary.")
+    if payload.get("format_version") != CHECKPOINT_FORMAT_VERSION:
+        raise ValueError(
+            f"Unsupported checkpoint format {payload.get('format_version')!r}; "
+            f"expected {CHECKPOINT_FORMAT_VERSION}."
+        )
+    return resolved_path, payload
+
+
+def _checkpoint_counters(payload: Mapping[str, Any]) -> CheckpointCounters:
+    values = _require_mapping(payload, "counters")
+    counters = CheckpointCounters(
+        environment_steps=int(values["environment_steps"]),
+        gradient_steps=int(values["gradient_steps"]),
+        agent_updates=int(values["agent_updates"]),
+        estimator_version=int(values["estimator_version"]),
+    )
+    if min(asdict(counters).values()) < 0:
+        raise ValueError("Checkpoint counters must be non-negative.")
+    return counters
 
 
 def _plain_data(value: Any) -> Any:

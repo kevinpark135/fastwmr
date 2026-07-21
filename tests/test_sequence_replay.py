@@ -156,3 +156,31 @@ def test_sequence_cache_tracks_ring_overwrite_without_stale_starts() -> None:
 
     buffer.clear()
     assert not buffer.can_sample_sequences(batch_size=1, burn_in_length=1, learning_length=2)
+
+
+def test_sequence_sampling_can_be_limited_to_recent_insertions() -> None:
+    buffer = _buffer()
+    for timestep in range(8):
+        _add_vector_step(buffer, timestep)
+
+    assert buffer.can_sample_sequences(
+        batch_size=2,
+        burn_in_length=0,
+        learning_length=2,
+        minimum_insertion_id=12,
+    )
+    sequence = buffer.sample_sequences(
+        batch_size=2,
+        burn_in_length=0,
+        learning_length=2,
+        minimum_insertion_id=12,
+        generator=torch.Generator().manual_seed(11),
+    )
+
+    assert torch.all(sequence.insertion_ids[:, 0] >= 12)
+    assert not buffer.can_sample_sequences(
+        batch_size=1,
+        burn_in_length=0,
+        learning_length=2,
+        minimum_insertion_id=15,
+    )

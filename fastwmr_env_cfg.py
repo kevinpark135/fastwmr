@@ -17,6 +17,7 @@ from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import (
 ##
 from isaaclab_assets import G1_29DOF_CFG  # isort: skip
 
+from .curriculum import FastWMRCurriculumCfg
 from .observations import FastWMRObservationsCfg, G1_29DOF_JOINT_PATTERNS
 from .randomization import (
     initialize_fastwmr_dr_buffers,
@@ -39,6 +40,7 @@ class G1FastWMREnvCfg(LocomotionVelocityRoughEnvCfg):
 
     rewards: FastSACMinimalRewardsCfg = FastSACMinimalRewardsCfg()
     observations: FastWMRObservationsCfg = FastWMRObservationsCfg()
+    curriculum: FastWMRCurriculumCfg = FastWMRCurriculumCfg()
 
     def __post_init__(self):
         # post init of parent
@@ -140,3 +142,4 @@ class G1FastWMREnvCfg_PLAY(G1FastWMREnvCfg):
         # Remove external disturbances while retaining nominal DR records.
         self.events.base_external_force_torque = None
         self.events.push_robot = None
+        self.curriculum.penalty_weights = None

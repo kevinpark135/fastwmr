@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -325,8 +326,12 @@ class EstimatorUpdater:
             sequence.context_is_exact,
         )
 
-    @torch.no_grad()
-    def reconstruct_sequence(self, sequence: SequenceReplayBatch) -> torch.Tensor:
+    def reconstruct_sequence(
+        self,
+        sequence: SequenceReplayBatch,
+        *,
+        detach: bool = True,
+    ) -> torch.Tensor:
         """Re-infer a learning window with the estimator's current parameters.
 
         This is intentionally separate from :meth:`update_sequence`: the
@@ -335,21 +340,25 @@ class EstimatorUpdater:
         newly updated estimator.
         """
 
-        observations = sequence.observations
-        state = self.estimator.initial_state(
-            sequence.batch_size,
-            device=observations.device,
-            dtype=observations.dtype,
-        )
-        if sequence.burn_in_length > 0:
-            burn_in_observations = self._transform(sequence.burn_in_observations)
-            _, state = self.estimator.encoder.forward_sequence(burn_in_observations, state)
-        learning_observations = self._transform(sequence.learning_observations)
-        reconstruction, _ = self.estimator.forward_sequence(
-            learning_observations,
-            state.detach(),
-        )
-        reconstruction = reconstruction.detach()
+        context = torch.no_grad() if detach else nullcontext()
+        with context:
+            observations = sequence.observations
+            state = self.estimator.initial_state(
+                sequence.batch_size,
+                device=observations.device,
+                dtype=observations.dtype,
+            )
+            if sequence.burn_in_length > 0:
+                burn_in_observations = self._transform(sequence.burn_in_observations)
+                with torch.no_grad():
+                    _, state = self.estimator.encoder.forward_sequence(burn_in_observations, state)
+            learning_observations = self._transform(sequence.learning_observations)
+            reconstruction, _ = self.estimator.forward_sequence(
+                learning_observations,
+                state.detach(),
+            )
+        if detach:
+            reconstruction = reconstruction.detach()
         expected_shape = (
             sequence.batch_size,
             sequence.learning_length + 1,
@@ -363,6 +372,56 @@ class EstimatorUpdater:
         if not torch.isfinite(reconstruction).all():
             raise FloatingPointError("Current-estimator reconstruction must remain finite.")
         return reconstruction
+
+    @torch.no_grad()
+    def evaluate_sequence(self, sequence: SequenceReplayBatch) -> EstimatorUpdateResult:
+        """Evaluate reconstruction losses without changing estimator parameters."""
+
+        observations = sequence.observations
+        state = self.estimator.initial_state(
+            sequence.batch_size,
+            device=observations.device,
+            dtype=observations.dtype,
+        )
+        if sequence.burn_in_length > 0:
+            _, state = self.estimator.encoder.forward_sequence(
+                self._transform(sequence.burn_in_observations),
+                state,
+            )
+        prediction = self.estimator.predict_sequence(
+            self._transform(sequence.learning_observations),
+            state.detach(),
+        )
+        losses = compute_estimator_loss(
+            prediction,
+            sequence.learning_privileged_states,
+            interface=self.interface,
+            cfg=self.loss_cfg,
+        )
+        metrics = EstimatorUpdateMetrics(
+            total_loss=float(losses.total_loss),
+            continuous_mse=float(losses.continuous_mse),
+            discrete_bce=float(losses.discrete_bce),
+            latent_l1=float(losses.latent_l1),
+            gradient_norm=0.0,
+            context_exact_fraction=float(sequence.context_is_exact.float().mean()),
+            field_losses={name: float(value) for name, value in losses.field_losses.items()},
+            estimator_version=self.version,
+        )
+        return EstimatorUpdateResult(
+            reconstructions=prediction.reconstruction.detach(),
+            final_state=prediction.final_state.detach(),
+            metrics=metrics,
+        )
+
+    def step_external_gradients(self) -> float:
+        """Apply gradients contributed by the no-cutoff SAC ablation."""
+
+        gradient_norm = self._gradient_norm()
+        self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        self.version += 1
+        return gradient_norm
 
     def update_rollout(self, batch: EstimatorRolloutBatch) -> EstimatorUpdateResult:
         """Update from an ordered rollout while resetting asynchronous episodes."""

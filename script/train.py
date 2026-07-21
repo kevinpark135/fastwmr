@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import time
 import traceback
+from functools import partial
 
 from cli_args import (
     FASTSAC_BASELINE_TASK,
@@ -44,6 +46,7 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.a
     SACUpdater,
     TrainingMode,
     WorldStateEstimator,
+    augment_sequence_batch,
     load_training_checkpoint,
     save_training_checkpoint,
     write_config_snapshot,
@@ -55,8 +58,9 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.b
     TransitionReplayBuffer,
 )
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.config import (
-    DEFAULT_INTERFACE_CFG,
+    ControlFeatureMode,
     DistributionalCriticCfg,
+    FastWMRInterfaceCfg,
     ObservationNormalizationCfg,
     ReplayUpdateCfg,
     ScalarCriticCfg,
@@ -80,6 +84,9 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.u
     fastwmr_agent_metrics_dict,
     format_console_metrics,
     sac_metrics_dict,
+)
+from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.curriculum import (
+    penalty_curriculum_state,
 )
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
@@ -107,6 +114,17 @@ def _apply_rough_debug_overrides(cfg: object) -> None:
         cfg.scene.terrain.terrain_generator.num_rows = 2
         cfg.scene.terrain.terrain_generator.num_cols = 2
         cfg.scene.terrain.terrain_generator.curriculum = False
+
+
+def _apply_penalty_curriculum_overrides(cfg: object) -> None:
+    term = cfg.curriculum.penalty_weights
+    if ARGS.disable_penalty_curriculum:
+        cfg.curriculum.penalty_weights = None
+        return
+    term.params["scales"] = tuple(ARGS.penalty_scales)
+    term.params["episode_length_thresholds"] = tuple(ARGS.penalty_length_thresholds)
+    term.params["ema_decay"] = ARGS.penalty_ema_decay
+    term.params["min_completed_episodes"] = ARGS.penalty_min_completed_episodes
 
 
 def _build_sac_updater(
@@ -236,7 +254,9 @@ def _build_components(
 
     if ARGS.task != FASTWMR_TASK:
         raise ValueError(f"Unsupported training task {ARGS.task!r}.")
-    interface = DEFAULT_INTERFACE_CFG
+    interface = FastWMRInterfaceCfg(
+        control_feature_mode=ControlFeatureMode(ARGS.control_feature_mode)
+    )
     privileged_dim = int(raw_env.observation_space["privileged"].shape[-1])
     actual_dimensions = (observation_dim, privileged_dim, action_dim)
     expected_dimensions = (
@@ -249,13 +269,14 @@ def _build_components(
             f"FastWMR environment dimensions are {actual_dimensions}, expected {expected_dimensions}."
         )
     replay = TransitionReplayBuffer(
-        ReplayBufferSpec.fastwmr(ARGS.replay_capacity),
+        ReplayBufferSpec.fastwmr(ARGS.replay_capacity, interface),
         storage_device=ARGS.replay_storage_device,
     )
     rollout_cache = EstimatorRolloutCache(
         EstimatorRolloutCacheSpec.fastwmr(
             ARGS.estimator_cache_steps,
             env.num_envs,
+            interface,
         ),
         storage_device=ARGS.replay_storage_device,
     )
@@ -278,13 +299,17 @@ def _build_components(
             betas=(0.9, 0.95),
             weight_decay=ARGS.estimator_weight_decay,
         ),
+        interface=interface,
     )
     runtime = FastWMREstimatorRuntime(estimator, env.num_envs)
     processor = FastWMRSequenceFeatureProcessor(
         estimator_updater,
         runtime,
         rollout_cache,
+        interface=interface,
         observation_normalizer=normalizer,
+        gradient_cutoff=not ARGS.disable_gradient_cutoff,
+        estimator_frozen=ARGS.freeze_estimator,
     )
     updater = _build_sac_updater(
         interface.control_feature_dim,
@@ -302,17 +327,26 @@ def _build_components(
             burn_in_length=ARGS.burn_in_length,
             learning_length=ARGS.learning_length,
             require_episode_start=ARGS.require_episode_start,
+            recent_transition_horizon=ARGS.recent_replay_horizon,
         ),
         processor,
         learner_device=device,
-        verify_gradient_boundaries=not ARGS.disable_gradient_boundary_checks,
+        verify_gradient_boundaries=(
+            not ARGS.disable_gradient_boundary_checks
+            and not ARGS.disable_gradient_cutoff
+        ),
+        sequence_augmentation=(
+            partial(augment_sequence_batch, interface=interface)
+            if ARGS.use_symmetry
+            else None
+        ),
     )
     return TrainingComponents(
         mode=TrainingMode.FASTWMR,
         replay=replay,
         updater=updater,
         update_loop=update_loop,
-        collector=FastWMRRolloutCollector(env, replay, update_loop),
+        collector=FastWMRRolloutCollector(env, replay, update_loop, interface=interface),
         normalizer=normalizer,
         estimator_updater=estimator_updater,
         runtime=runtime,
@@ -365,6 +399,7 @@ def run() -> None:
         cfg.episode_length_s = ARGS.episode_length_s
     if ARGS.rough_debug:
         _apply_rough_debug_overrides(cfg)
+    _apply_penalty_curriculum_overrides(cfg)
 
     raw_env = gym.make(ARGS.task, cfg=cfg)
     env = IsaacLabEnvAdapter(raw_env)
@@ -434,9 +469,12 @@ def run() -> None:
         interval_length_sum = 0
         last_sac_metrics = None
         last_agent_update = None
+        training_started = time.perf_counter()
+        collected_steps = 0
 
         for local_step in range(ARGS.steps):
             result = components.collector.collect_step(generator=generator)
+            collected_steps += 1
             interval_reward_sum += float(result.rewards.mean().item())
             interval_steps += 1
             completed = episode_tracker.update(
@@ -456,12 +494,21 @@ def run() -> None:
                 last_agent_update = components.update_loop.last_agent_updates[-1]
 
             global_step = components.update_loop.environment_steps
+            training_elapsed = time.perf_counter() - training_started
+            wallclock_limit_reached = (
+                ARGS.wallclock_limit_s is not None
+                and training_elapsed >= ARGS.wallclock_limit_s
+            )
             if ARGS.checkpoint_interval > 0 and global_step % ARGS.checkpoint_interval == 0:
                 checkpoint_path = checkpoints_directory / f"step_{global_step:09d}.pt"
                 _save_checkpoint(checkpoint_path, components, config)
                 print(f"[{components.mode.value}] checkpoint={checkpoint_path}")
 
-            if global_step % ARGS.log_interval == 0 or local_step + 1 == ARGS.steps:
+            if (
+                global_step % ARGS.log_interval == 0
+                or local_step + 1 == ARGS.steps
+                or wallclock_limit_reached
+            ):
                 metrics: dict[str, int | float] = {
                     "rollout/reward_mean": interval_reward_sum / interval_steps,
                     "rollout/completed_episodes": interval_completed,
@@ -473,6 +520,13 @@ def run() -> None:
                     ),
                     "learner/environment_steps": global_step,
                     "learner/gradient_steps": components.update_loop.gradient_steps,
+                    "learner/wallclock_seconds": training_elapsed,
+                    "ablation/gradient_cutoff": int(not ARGS.disable_gradient_cutoff),
+                    "ablation/estimator_frozen": int(ARGS.freeze_estimator),
+                    "ablation/symmetry": int(ARGS.use_symmetry),
+                    "ablation/reconstruction_only": int(
+                        ARGS.control_feature_mode == "reconstruction_only"
+                    ),
                 }
                 oldest_insertion_id = components.replay.oldest_insertion_id
                 newest_insertion_id = components.replay.newest_insertion_id
@@ -509,6 +563,14 @@ def run() -> None:
                     )
                 if components.rollout_cache is not None:
                     metrics["estimator_cache/steps"] = len(components.rollout_cache)
+                curriculum_state = penalty_curriculum_state(raw_env.unwrapped)
+                if curriculum_state is not None:
+                    metrics.update(
+                        {
+                            f"curriculum/penalty_{name}": value
+                            for name, value in curriculum_state.items()
+                        }
+                    )
                 record = logger.log(global_step, metrics)
                 print(format_console_metrics(record))
                 interval_reward_sum = 0.0
@@ -516,6 +578,12 @@ def run() -> None:
                 interval_completed = 0
                 interval_return_sum = 0.0
                 interval_length_sum = 0
+            if wallclock_limit_reached:
+                print(
+                    f"[{components.mode.value}] wallclock_limit_reached="
+                    f"{training_elapsed:.3f}s"
+                )
+                break
 
         if not ARGS.disable_final_checkpoint:
             final_step = components.update_loop.environment_steps
@@ -523,7 +591,7 @@ def run() -> None:
             _save_checkpoint(checkpoint_path, components, config)
             print(f"[{components.mode.value}] final_checkpoint={checkpoint_path}")
 
-        expected_insertions = ARGS.steps * ARGS.num_envs
+        expected_insertions = collected_steps * ARGS.num_envs
         if components.replay.total_inserted != expected_insertions:
             raise AssertionError(
                 f"Replay inserted {components.replay.total_inserted}, expected {expected_insertions}."

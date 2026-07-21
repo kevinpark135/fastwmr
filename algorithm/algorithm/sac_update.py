@@ -48,6 +48,7 @@ class SACTransitionBatch:
     next_states: torch.Tensor
     terminated: torch.Tensor
     truncated: torch.Tensor
+    allow_state_gradients: bool = False
 
     def __post_init__(self) -> None:
         tensors = (self.states, self.actions, self.rewards, self.next_states, self.terminated, self.truncated)
@@ -73,7 +74,9 @@ class SACTransitionBatch:
             raise TypeError("SAC rewards must have a floating-point dtype.")
         if len({tensor.device for tensor in tensors}) != 1:
             raise ValueError("Every SAC transition field must be on the same device.")
-        if self.states.requires_grad or self.next_states.requires_grad:
+        if not self.allow_state_gradients and (
+            self.states.requires_grad or self.next_states.requires_grad
+        ):
             raise ValueError("SAC replay features must be detached before constructing a batch.")
         finite_tensors = (self.states, self.actions, self.rewards, self.next_states)
         if not all(torch.isfinite(tensor).all() for tensor in finite_tensors):
@@ -325,10 +328,12 @@ def compute_actor_loss(
     actor: TanhGaussianActor,
     critic: TwinScalarCritic | TwinC51Critic,
     temperature: torch.Tensor,
+    *,
+    allow_state_gradients: bool = False,
 ) -> ActorLossOutput:
     """Compute ``mean(alpha * log_pi - average(Q1, Q2))``."""
 
-    if states.requires_grad:
+    if states.requires_grad and not allow_state_gradients:
         raise ValueError("Actor-update states must be detached from the estimator.")
     _validate_temperature(temperature)
     actions, log_probabilities = actor.sample(states)
@@ -425,7 +430,12 @@ class SACUpdater:
             policy_entropy=(-actor_output.log_probabilities.mean()).detach(),
         )
 
-    def update_critic(self, batch: SACTransitionBatch) -> CriticLossOutput:
+    def update_critic(
+        self,
+        batch: SACTransitionBatch,
+        *,
+        retain_graph: bool = False,
+    ) -> CriticLossOutput:
         """Step Q1/Q2 while keeping the actor and target critic untouched."""
 
         target = compute_critic_target(
@@ -437,17 +447,28 @@ class SACUpdater:
         )
         critic_output = compute_critic_loss(batch, self.critic, target)
         self.critic_optimizer.zero_grad(set_to_none=True)
-        critic_output.loss.backward()
+        critic_output.loss.backward(retain_graph=retain_graph)
         self.critic_optimizer.step()
         self.critic_optimizer.zero_grad(set_to_none=True)
         return critic_output
 
-    def update_actor(self, states: torch.Tensor) -> ActorLossOutput:
+    def update_actor(
+        self,
+        states: torch.Tensor,
+        *,
+        allow_state_gradients: bool = False,
+    ) -> ActorLossOutput:
         """Step the actor through action gradients while freezing Q parameters."""
 
         self.actor_optimizer.zero_grad(set_to_none=True)
         with _freeze_parameters(self.critic):
-            actor_output = compute_actor_loss(states, self.actor, self.critic, self.temperature())
+            actor_output = compute_actor_loss(
+                states,
+                self.actor,
+                self.critic,
+                self.temperature(),
+                allow_state_gradients=allow_state_gradients,
+            )
             actor_output.loss.backward()
         self.actor_optimizer.step()
         return actor_output
@@ -504,7 +525,12 @@ class C51SACUpdater(SACUpdater):
             target_entropy=target_entropy,
         )
 
-    def update_critic(self, batch: SACTransitionBatch) -> C51CriticLossOutput:
+    def update_critic(
+        self,
+        batch: SACTransitionBatch,
+        *,
+        retain_graph: bool = False,
+    ) -> C51CriticLossOutput:
         target_distributions = compute_c51_critic_target(
             batch,
             self.actor,
@@ -514,7 +540,7 @@ class C51SACUpdater(SACUpdater):
         )
         critic_output = compute_c51_critic_loss(batch, self.critic, target_distributions)
         self.critic_optimizer.zero_grad(set_to_none=True)
-        critic_output.loss.backward()
+        critic_output.loss.backward(retain_graph=retain_graph)
         self.critic_optimizer.step()
         self.critic_optimizer.zero_grad(set_to_none=True)
         return critic_output

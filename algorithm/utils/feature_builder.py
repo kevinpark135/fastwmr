@@ -25,6 +25,7 @@ def build_control_feature(
     *,
     cfg: FastWMRInterfaceCfg = DEFAULT_INTERFACE_CFG,
     normalizer: ObservationNormalizer | None = None,
+    detach_reconstruction: bool = True,
 ) -> torch.Tensor:
     """Build ``x_t`` while enforcing the estimator gradient cutoff.
 
@@ -45,11 +46,13 @@ def build_control_feature(
     if normalized_observation.shape != policy_observation.shape:
         raise ValueError("The observation normalizer must preserve tensor shape.")
 
-    detached_reconstruction = reconstructed_state.detach()
+    routed_reconstruction = (
+        reconstructed_state.detach() if detach_reconstruction else reconstructed_state
+    )
     if cfg.control_feature_mode is ControlFeatureMode.RECONSTRUCTION_ONLY:
-        feature = detached_reconstruction
+        feature = routed_reconstruction
     else:
-        feature = torch.cat((normalized_observation, detached_reconstruction), dim=-1)
+        feature = torch.cat((normalized_observation, routed_reconstruction), dim=-1)
 
     _check_last_dim(feature, cfg.control_feature_dim, "control_feature")
     return feature

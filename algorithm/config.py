@@ -289,12 +289,15 @@ class SequenceReplayCfg:
     burn_in_length: int = 16
     learning_length: int = 8
     require_episode_start: bool = False
+    recent_transition_horizon: int | None = None
 
     def __post_init__(self) -> None:
         if self.batch_size <= 0 or self.learning_length <= 0:
             raise ValueError("Sequence batch_size and learning_length must be positive.")
         if self.burn_in_length < 0:
             raise ValueError("burn_in_length must be non-negative.")
+        if self.recent_transition_horizon is not None and self.recent_transition_horizon <= 0:
+            raise ValueError("recent_transition_horizon must be positive when provided.")
 
 
 DEFAULT_SEQUENCE_REPLAY_CFG = SequenceReplayCfg()

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 
 SequenceFeatureProcessor = Callable[[SequenceReplayBatch], torch.Tensor]
+SequenceAugmentation = Callable[[SequenceReplayBatch], SequenceReplayBatch]
 
 
 class GradientBoundaryError(RuntimeError):
@@ -39,6 +40,8 @@ class GradientBoundaryReport:
     enabled: bool
     checks: int
     estimator_gradient_norm: float | None
+    cutoff_enabled: bool = True
+    policy_estimator_gradient_norm: float | None = None
 
 
 @dataclass(frozen=True)
@@ -74,14 +77,21 @@ class FastWMRGradientGuard:
         self.clear_all()
         self._assert_all_clean("update start")
 
-    def after_estimator(self) -> float | None:
+    def after_estimator(self, *, require_gradient: bool = True) -> float | None:
         gradient_norm = None
         if self.enabled:
-            gradient_norm = self._require_finite_gradient(
-                self.estimator_updater.estimator,
-                "estimator",
-                "estimator update",
-            )
+            if require_gradient:
+                gradient_norm = self._require_finite_gradient(
+                    self.estimator_updater.estimator,
+                    "estimator",
+                    "estimator update",
+                )
+            else:
+                self._assert_no_gradient(
+                    self.estimator_updater.estimator,
+                    "estimator",
+                    "frozen estimator evaluation",
+                )
             self._assert_no_gradient(self.sac_updater.actor, "actor", "estimator update")
             self._assert_no_gradient(self.sac_updater.critic, "critic", "estimator update")
             self._assert_no_gradient(
@@ -152,11 +162,19 @@ class FastWMRGradientGuard:
         self._assert_no_gradient(self.sac_updater.target_critic, "target critic", "target update")
         self._checks += 1
 
-    def report(self, estimator_gradient_norm: float | None) -> GradientBoundaryReport:
+    def report(
+        self,
+        estimator_gradient_norm: float | None,
+        *,
+        cutoff_enabled: bool = True,
+        policy_estimator_gradient_norm: float | None = None,
+    ) -> GradientBoundaryReport:
         return GradientBoundaryReport(
             enabled=self.enabled,
             checks=self._checks,
             estimator_gradient_norm=estimator_gradient_norm,
+            cutoff_enabled=cutoff_enabled,
+            policy_estimator_gradient_norm=policy_estimator_gradient_norm,
         )
 
     def clear_all(self) -> None:
@@ -266,6 +284,8 @@ class FastWMRSequenceFeatureProcessor:
         *,
         interface: FastWMRInterfaceCfg = DEFAULT_INTERFACE_CFG,
         observation_normalizer: RunningObservationNormalizer | None = None,
+        gradient_cutoff: bool = True,
+        estimator_frozen: bool = False,
     ) -> None:
         if estimator_updater.estimator is not runtime.estimator:
             raise ValueError("Estimator updater and runtime must share the estimator instance.")
@@ -293,6 +313,10 @@ class FastWMRSequenceFeatureProcessor:
         self.rollout_cache = rollout_cache
         self.interface = interface
         self.observation_normalizer = observation_normalizer
+        self.gradient_cutoff = gradient_cutoff
+        self.estimator_frozen = estimator_frozen
+        if estimator_frozen and not gradient_cutoff:
+            raise ValueError("A frozen estimator cannot be combined with disabled gradient cutoff.")
         self.updates = 0
         self.last_estimator_update: EstimatorUpdateResult | None = None
         self.last_runtime_rebuild: EstimatorRuntimeRebuild | None = None
@@ -304,25 +328,28 @@ class FastWMRSequenceFeatureProcessor:
         if sequence.observations.dtype != parameter.dtype:
             raise ValueError("Replay sequence and estimator must share a floating dtype.")
 
-        estimator_update = self.estimator_updater.update_sequence(sequence)
-        reconstructions = self.estimator_updater.reconstruct_sequence(sequence)
-        if len(self.rollout_cache) > 0:
-            runtime_rebuild = self.runtime.rebuild_from_cache(
-                self.rollout_cache,
-                estimator_version=estimator_update.metrics.estimator_version,
-            )
-        else:
-            self.runtime.reset_all(
-                estimator_version=estimator_update.metrics.estimator_version,
-            )
-            runtime_rebuild = None
+        estimator_update = (
+            self.estimator_updater.evaluate_sequence(sequence)
+            if self.estimator_frozen
+            else self.estimator_updater.update_sequence(sequence)
+        )
+        reconstructions = self.estimator_updater.reconstruct_sequence(
+            sequence,
+            detach=self.gradient_cutoff,
+        )
+        runtime_rebuild = None
+        if not self.estimator_frozen and self.gradient_cutoff:
+            runtime_rebuild = self._rebuild_runtime(estimator_update.metrics.estimator_version)
 
         features = build_control_feature(
             sequence.learning_observations,
             reconstructions,
             cfg=self.interface,
             normalizer=self.observation_normalizer,
-        ).detach()
+            detach_reconstruction=self.gradient_cutoff,
+        )
+        if self.gradient_cutoff:
+            features = features.detach()
         if not torch.isfinite(features).all():
             raise FloatingPointError("Current-estimator control features must remain finite.")
 
@@ -330,6 +357,30 @@ class FastWMRSequenceFeatureProcessor:
         self.last_runtime_rebuild = runtime_rebuild
         self.updates += 1
         return features
+
+    def finalize_policy_estimator_step(self) -> float:
+        """Step no-cutoff SAC gradients and rebuild runtime with new weights."""
+
+        if self.gradient_cutoff or self.estimator_frozen:
+            raise RuntimeError("Policy estimator gradients exist only in no-cutoff training.")
+        gradient_norm = self.estimator_updater.step_external_gradients()
+        version = self.estimator_updater.version
+        self.last_runtime_rebuild = self._rebuild_runtime(version)
+        if self.last_estimator_update is not None:
+            self.last_estimator_update = replace(
+                self.last_estimator_update,
+                metrics=replace(self.last_estimator_update.metrics, estimator_version=version),
+            )
+        return gradient_norm
+
+    def _rebuild_runtime(self, estimator_version: int) -> "EstimatorRuntimeRebuild | None":
+        if len(self.rollout_cache) > 0:
+            return self.runtime.rebuild_from_cache(
+                self.rollout_cache,
+                estimator_version=estimator_version,
+            )
+        self.runtime.reset_all(estimator_version=estimator_version)
+        return None
 
 
 class FastWMRAgent:
@@ -346,6 +397,8 @@ class FastWMRAgent:
     ) -> None:
         if feature_processor.interface.actor_input_dim != sac_updater.actor.input_dim:
             raise ValueError("FastWMR agent feature and actor input dimensions must match.")
+        if not feature_processor.gradient_cutoff and verify_gradient_boundaries:
+            raise ValueError("Gradient-boundary checks require gradient cutoff to be enabled.")
         self.sac_updater = sac_updater
         self.feature_processor = feature_processor
         self.gradient_guard = FastWMRGradientGuard(
@@ -367,22 +420,45 @@ class FastWMRAgent:
             estimator_update = self.feature_processor.last_estimator_update
             if estimator_update is None:
                 raise RuntimeError("Feature processing did not produce an estimator update result.")
-            estimator_gradient_norm = self.gradient_guard.after_estimator()
+            estimator_gradient_norm = self.gradient_guard.after_estimator(
+                require_gradient=not self.feature_processor.estimator_frozen,
+            )
 
             batch = _build_sequence_learning_batch(
                 sequence,
                 learning_features,
                 actor_input_dim=self.sac_updater.actor.input_dim,
+                require_detached=self.feature_processor.gradient_cutoff,
             )
-            self.gradient_guard.before_sac(batch)
+            if self.feature_processor.gradient_cutoff:
+                self.gradient_guard.before_sac(batch)
 
-            critic_output = self.sac_updater.update_critic(batch)
+            if self.feature_processor.gradient_cutoff:
+                critic_output = self.sac_updater.update_critic(batch)
+            else:
+                critic_output = self.sac_updater.update_critic(batch, retain_graph=True)
             completed_phases.append("critic")
-            self.gradient_guard.after_critic()
+            if self.feature_processor.gradient_cutoff:
+                self.gradient_guard.after_critic()
 
-            actor_output = self.sac_updater.update_actor(batch.states)
+            if self.feature_processor.gradient_cutoff:
+                actor_output = self.sac_updater.update_actor(batch.states)
+            else:
+                actor_output = self.sac_updater.update_actor(
+                    batch.states,
+                    allow_state_gradients=True,
+                )
             completed_phases.append("actor")
-            self.gradient_guard.after_actor()
+            policy_estimator_gradient_norm = None
+            if self.feature_processor.gradient_cutoff:
+                self.gradient_guard.after_actor()
+            else:
+                policy_estimator_gradient_norm = (
+                    self.feature_processor.finalize_policy_estimator_step()
+                )
+                estimator_update = self.feature_processor.last_estimator_update
+                if estimator_update is None:
+                    raise RuntimeError("No-cutoff estimator finalization lost its update result.")
 
             temperature_loss = self.sac_updater.update_temperature(
                 actor_output.log_probabilities
@@ -413,7 +489,11 @@ class FastWMRAgent:
                 estimator_update=estimator_update,
                 sac_update=sac_metrics,
                 update_order=tuple(completed_phases),
-                gradient_boundary=self.gradient_guard.report(estimator_gradient_norm),
+                gradient_boundary=self.gradient_guard.report(
+                    estimator_gradient_norm,
+                    cutoff_enabled=self.feature_processor.gradient_cutoff,
+                    policy_estimator_gradient_norm=policy_estimator_gradient_norm,
+                ),
             )
             self.update_steps += 1
             self.last_update = result
@@ -427,6 +507,7 @@ def _build_sequence_learning_batch(
     learning_features: torch.Tensor,
     *,
     actor_input_dim: int,
+    require_detached: bool = True,
 ) -> SACTransitionBatch:
     expected_shape = (
         sequence.batch_size,
@@ -438,7 +519,7 @@ def _build_sequence_learning_batch(
             f"Sequence feature processor must return shape {expected_shape}, "
             f"got {tuple(learning_features.shape)}."
         )
-    if learning_features.requires_grad:
+    if require_detached and learning_features.requires_grad:
         raise ValueError("SAC learning features must be detached after estimator update.")
     if not torch.isfinite(learning_features).all():
         raise ValueError("SAC learning features must be finite.")
@@ -449,6 +530,7 @@ def _build_sequence_learning_batch(
         next_states=learning_features[:, 1:],
         terminated=sequence.learning_terminated,
         truncated=sequence.learning_truncated,
+        allow_state_gradients=not require_detached,
     )
 
 
@@ -565,10 +647,12 @@ class FastWMRSequenceUpdateLoop(FastSACReplayUpdateLoop):
         *,
         learner_device: torch.device | str,
         verify_gradient_boundaries: bool = True,
+        sequence_augmentation: SequenceAugmentation | None = None,
     ) -> None:
         super().__init__(replay, updater, cfg, learner_device=learner_device)
         self.sequence_cfg = sequence_cfg
         self.sequence_feature_processor = sequence_feature_processor
+        self.sequence_augmentation = sequence_augmentation
         self.agent = (
             FastWMRAgent(
                 updater,
@@ -582,6 +666,7 @@ class FastWMRSequenceUpdateLoop(FastSACReplayUpdateLoop):
 
     @property
     def ready(self) -> bool:
+        minimum_insertion_id = self._minimum_sequence_insertion_id()
         return (
             not self.warming_up
             and len(self.replay) >= self.cfg.minimum_replay_size
@@ -590,6 +675,7 @@ class FastWMRSequenceUpdateLoop(FastSACReplayUpdateLoop):
                 self.sequence_cfg.burn_in_length,
                 self.sequence_cfg.learning_length,
                 require_episode_start=self.sequence_cfg.require_episode_start,
+                minimum_insertion_id=minimum_insertion_id,
             )
         )
 
@@ -599,15 +685,19 @@ class FastWMRSequenceUpdateLoop(FastSACReplayUpdateLoop):
             return []
         metrics: list[SACUpdateMetrics] = []
         agent_updates: list[FastWMRAgentUpdateResult] = []
+        minimum_insertion_id = self._minimum_sequence_insertion_id()
         for _ in range(self.cfg.num_updates):
             sequence = self.replay.sample_sequences(
                 self.sequence_cfg.batch_size,
                 self.sequence_cfg.burn_in_length,
                 self.sequence_cfg.learning_length,
                 require_episode_start=self.sequence_cfg.require_episode_start,
+                minimum_insertion_id=minimum_insertion_id,
                 device=self.learner_device,
                 generator=generator,
             )
+            if self.sequence_augmentation is not None:
+                sequence = self.sequence_augmentation(sequence)
             if self.agent is not None:
                 agent_update = self.agent.update(sequence)
                 agent_updates.append(agent_update)
@@ -619,6 +709,12 @@ class FastWMRSequenceUpdateLoop(FastSACReplayUpdateLoop):
             self.gradient_steps += 1
         self.last_agent_updates = tuple(agent_updates)
         return metrics
+
+    def _minimum_sequence_insertion_id(self) -> int | None:
+        horizon = self.sequence_cfg.recent_transition_horizon
+        if horizon is None:
+            return None
+        return max(0, self.replay.total_inserted - horizon)
 
     def _build_learning_batch(
         self,

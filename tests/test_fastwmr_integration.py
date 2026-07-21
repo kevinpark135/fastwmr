@@ -17,6 +17,8 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.a
     GradientBoundaryError,
     TrainingMode,
     WorldStateEstimator,
+    inspect_training_checkpoint,
+    load_policy_checkpoint,
     load_training_checkpoint,
     save_training_checkpoint,
     write_config_snapshot,
@@ -28,8 +30,10 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.b
     TransitionReplayBuffer,
 )
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.config import (
+    ControlFeatureMode,
     DEFAULT_INTERFACE_CFG,
     DistributionalCriticCfg,
+    FastWMRInterfaceCfg,
     ReplayUpdateCfg,
     SequenceReplayCfg,
     TanhGaussianActorCfg,
@@ -115,7 +119,12 @@ class _FastWMRGymEnv:
         self.closed = True
 
 
-def _integrated_pipeline() -> tuple[
+def _integrated_pipeline(
+    *,
+    interface: FastWMRInterfaceCfg = DEFAULT_INTERFACE_CFG,
+    gradient_cutoff: bool = True,
+    estimator_frozen: bool = False,
+) -> tuple[
     IsaacLabEnvAdapter,
     TransitionReplayBuffer,
     RunningObservationNormalizer,
@@ -126,11 +135,14 @@ def _integrated_pipeline() -> tuple[
     FastWMRSequenceUpdateLoop,
     FastWMRRolloutCollector,
 ]:
-    interface = DEFAULT_INTERFACE_CFG
     env = IsaacLabEnvAdapter(_FastWMRGymEnv())
-    replay = TransitionReplayBuffer(ReplayBufferSpec.fastwmr(capacity=64))
+    replay = TransitionReplayBuffer(ReplayBufferSpec.fastwmr(capacity=64, interface=interface))
     rollout_cache = EstimatorRolloutCache(
-        EstimatorRolloutCacheSpec.fastwmr(capacity_steps=8, num_envs=env.num_envs)
+        EstimatorRolloutCacheSpec.fastwmr(
+            capacity_steps=8,
+            num_envs=env.num_envs,
+            interface=interface,
+        )
     )
     estimator = WorldStateEstimator(
         HistoryEncoder(interface.policy_observation_dim, hidden_dim=16),
@@ -139,6 +151,7 @@ def _integrated_pipeline() -> tuple[
     estimator_updater = EstimatorUpdater(
         estimator,
         torch.optim.Adam(estimator.parameters(), lr=1e-3),
+        interface=interface,
     )
     runtime = FastWMREstimatorRuntime(estimator, num_envs=env.num_envs)
     normalizer = RunningObservationNormalizer(interface.policy_observation_dim)
@@ -146,7 +159,10 @@ def _integrated_pipeline() -> tuple[
         estimator_updater,
         runtime,
         rollout_cache,
+        interface=interface,
         observation_normalizer=normalizer,
+        gradient_cutoff=gradient_cutoff,
+        estimator_frozen=estimator_frozen,
     )
 
     actor = TanhGaussianActor(
@@ -187,8 +203,9 @@ def _integrated_pipeline() -> tuple[
         SequenceReplayCfg(batch_size=1, burn_in_length=1, learning_length=2),
         processor,
         learner_device="cpu",
+        verify_gradient_boundaries=gradient_cutoff,
     )
-    collector = FastWMRRolloutCollector(env, replay, update_loop)
+    collector = FastWMRRolloutCollector(env, replay, update_loop, interface=interface)
     return (
         env,
         replay,
@@ -620,6 +637,137 @@ def test_checkpoint_rejects_mode_and_normalizer_mismatch(tmp_path) -> None:
             rollout_cache=update_loop.sequence_feature_processor.rollout_cache,
             map_location="cpu",
         )
+    env.close()
+
+
+def test_policy_checkpoint_loads_actor_estimator_and_normalizer(tmp_path) -> None:
+    source = _integrated_pipeline()
+    target = _integrated_pipeline()
+    source_env = source[0]
+    target_env = target[0]
+    source_normalizer = source[2]
+    source_estimator_updater = source[4]
+    source_loop = source[7]
+    target_normalizer = target[2]
+    target_estimator = target[3]
+    target_loop = target[7]
+    source_normalizer.update(torch.randn(4, source_normalizer.observation_dim))
+    checkpoint = save_training_checkpoint(
+        tmp_path / "policy.pt",
+        mode=TrainingMode.FASTWMR,
+        sac_updater=source_loop.updater,
+        update_loop=source_loop,
+        normalizer=source_normalizer,
+        estimator_updater=source_estimator_updater,
+        config={"arguments": {"hidden_dim": 16}},
+    )
+
+    metadata = inspect_training_checkpoint(checkpoint)
+    result = load_policy_checkpoint(
+        checkpoint,
+        mode=TrainingMode.FASTWMR,
+        actor=target_loop.updater.actor,
+        estimator=target_estimator,
+        normalizer=target_normalizer,
+        map_location="cpu",
+    )
+
+    assert metadata.mode is TrainingMode.FASTWMR
+    assert metadata.has_normalizer
+    assert result.counters == metadata.counters
+    _assert_module_equal(source_loop.updater.actor, target_loop.updater.actor)
+    _assert_module_equal(source[3], target_estimator)
+    _assert_module_equal(source_normalizer, target_normalizer)
+    assert not target_loop.updater.actor.training
+    assert not target_estimator.training
+    assert not target_normalizer.training
+    source_env.close()
+    target_env.close()
+
+
+def test_no_cutoff_routes_policy_gradients_into_estimator() -> None:
+    torch.manual_seed(38)
+    (
+        env,
+        _replay,
+        _normalizer,
+        _estimator,
+        estimator_updater,
+        runtime,
+        processor,
+        update_loop,
+        collector,
+    ) = _integrated_pipeline(gradient_cutoff=False)
+    collector.reset(seed=38)
+    for _ in range(5):
+        collector.collect_step()
+
+    assert update_loop.gradient_steps > 0
+    assert estimator_updater.version == update_loop.gradient_steps * 2
+    assert runtime.estimator_version == estimator_updater.version
+    assert processor.last_estimator_update is not None
+    assert update_loop.last_agent_updates
+    boundary = update_loop.last_agent_updates[-1].gradient_boundary
+    assert not boundary.cutoff_enabled
+    assert boundary.policy_estimator_gradient_norm is not None
+    assert boundary.policy_estimator_gradient_norm > 0.0
+    env.close()
+
+
+def test_frozen_estimator_is_evaluated_without_parameter_updates() -> None:
+    torch.manual_seed(39)
+    (
+        env,
+        _replay,
+        _normalizer,
+        estimator,
+        estimator_updater,
+        runtime,
+        _processor,
+        update_loop,
+        collector,
+    ) = _integrated_pipeline(estimator_frozen=True)
+    initial_parameters = [parameter.detach().clone() for parameter in estimator.parameters()]
+    collector.reset(seed=39)
+    for _ in range(5):
+        collector.collect_step()
+
+    assert update_loop.gradient_steps > 0
+    assert estimator_updater.version == 0
+    assert runtime.estimator_version == 0
+    assert runtime.rebuilds == 0
+    assert all(
+        torch.equal(before, after)
+        for before, after in zip(initial_parameters, estimator.parameters(), strict=True)
+    )
+    boundary = update_loop.last_agent_updates[-1].gradient_boundary
+    assert boundary.estimator_gradient_norm is None
+    env.close()
+
+
+def test_reconstruction_only_ablation_runs_integrated_update() -> None:
+    interface = FastWMRInterfaceCfg(
+        control_feature_mode=ControlFeatureMode.RECONSTRUCTION_ONLY
+    )
+    (
+        env,
+        replay,
+        _normalizer,
+        _estimator,
+        _estimator_updater,
+        _runtime,
+        _processor,
+        update_loop,
+        collector,
+    ) = _integrated_pipeline(interface=interface)
+    initial_feature = collector.reset(seed=40)
+    for _ in range(5):
+        collector.collect_step()
+
+    assert initial_feature.shape == (env.num_envs, interface.reconstruction_target_dim)
+    assert replay.spec.control_feature_dim == interface.reconstruction_target_dim
+    assert update_loop.updater.actor.input_dim == interface.reconstruction_target_dim
+    assert update_loop.gradient_steps > 0
     env.close()
 
 

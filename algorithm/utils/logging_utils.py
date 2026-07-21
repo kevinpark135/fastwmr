@@ -161,11 +161,23 @@ def fastwmr_agent_metrics_dict(update: object) -> dict[str, float | int]:
             "estimator/version": int(estimator.estimator_version),
             "gradient_boundary/checks": int(update.gradient_boundary.checks),
             "gradient_boundary/enabled": int(update.gradient_boundary.enabled),
+            "gradient_boundary/cutoff_enabled": int(
+                getattr(update.gradient_boundary, "cutoff_enabled", True)
+            ),
         }
     )
     if update.gradient_boundary.estimator_gradient_norm is not None:
         output["gradient_boundary/estimator_gradient_norm"] = float(
             update.gradient_boundary.estimator_gradient_norm
+        )
+    policy_gradient_norm = getattr(
+        update.gradient_boundary,
+        "policy_estimator_gradient_norm",
+        None,
+    )
+    if policy_gradient_norm is not None:
+        output["gradient_boundary/policy_estimator_gradient_norm"] = float(
+            policy_gradient_norm
         )
     for name, value in estimator.field_losses.items():
         output[f"estimator/field/{name}"] = float(value)

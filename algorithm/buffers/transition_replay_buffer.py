@@ -639,6 +639,7 @@ class TransitionReplayBuffer:
         learning_length: int,
         *,
         require_episode_start: bool = False,
+        minimum_insertion_id: int | None = None,
     ) -> bool:
         """Return whether enough distinct boundary-safe windows are retained."""
 
@@ -646,6 +647,7 @@ class TransitionReplayBuffer:
         starts = self._sequence_starts(
             burn_in_length + learning_length,
             require_episode_start=require_episode_start,
+            minimum_insertion_id=minimum_insertion_id,
         )
         return len(starts) >= batch_size
 
@@ -656,6 +658,7 @@ class TransitionReplayBuffer:
         learning_length: int,
         *,
         require_episode_start: bool = False,
+        minimum_insertion_id: int | None = None,
         device: torch.device | str | None = None,
         generator: torch.Generator | None = None,
     ) -> SequenceReplayBatch:
@@ -663,7 +666,11 @@ class TransitionReplayBuffer:
 
         self._validate_sequence_request(batch_size, burn_in_length, learning_length)
         transition_length = burn_in_length + learning_length
-        starts = self._sequence_starts(transition_length, require_episode_start=require_episode_start)
+        starts = self._sequence_starts(
+            transition_length,
+            require_episode_start=require_episode_start,
+            minimum_insertion_id=minimum_insertion_id,
+        )
         if len(starts) < batch_size:
             raise RuntimeError(
                 f"Need {batch_size} valid sequences of length {transition_length}, found {len(starts)}."
@@ -843,6 +850,7 @@ class TransitionReplayBuffer:
         transition_length: int,
         *,
         require_episode_start: bool,
+        minimum_insertion_id: int | None = None,
     ) -> list[TemporalKey]:
         if transition_length <= 0:
             raise ValueError("Sequence transition length must be positive.")
@@ -855,6 +863,15 @@ class TransitionReplayBuffer:
         starts = self._valid_sequence_starts[transition_length]
         if require_episode_start:
             starts = {key for key in starts if key[2] == 0}
+        if minimum_insertion_id is not None:
+            if minimum_insertion_id < 0:
+                raise ValueError("minimum_insertion_id must be non-negative.")
+            starts = {
+                key
+                for key in starts
+                if int(self._insertion_ids[self._temporal_index[key]].item())
+                >= minimum_insertion_id
+            }
         return sorted(starts)
 
     def _is_valid_sequence_start(self, start: TemporalKey, transition_length: int) -> bool:
