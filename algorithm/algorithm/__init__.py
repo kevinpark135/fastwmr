@@ -14,8 +14,13 @@ from .estimator_update import (
 )
 from .fastwmr_agent import (
     FastSACReplayUpdateLoop,
+    FastWMRAgent,
+    FastWMRAgentUpdateResult,
+    FastWMRGradientGuard,
     FastWMRSequenceFeatureProcessor,
     FastWMRSequenceUpdateLoop,
+    GradientBoundaryError,
+    GradientBoundaryReport,
     SequenceFeatureProcessor,
 )
 from .rollout_worker import (
@@ -64,11 +69,16 @@ __all__ = [
     "EstimatorUpdater",
     "FastSACReplayUpdateLoop",
     "FastSACRolloutCollector",
+    "FastWMRAgent",
+    "FastWMRAgentUpdateResult",
+    "FastWMRGradientGuard",
     "FastWMREstimatorRuntime",
     "FastWMRRolloutCollector",
     "FastWMRRolloutStepResult",
     "FastWMRSequenceFeatureProcessor",
     "FastWMRSequenceUpdateLoop",
+    "GradientBoundaryError",
+    "GradientBoundaryReport",
     "RecurrentSequenceEstimator",
     "RolloutStepResult",
     "SACFeatureSource",

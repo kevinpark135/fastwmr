@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.algorithm import (
     C51SACUpdater,
     EntropyTemperature,
     EstimatorUpdater,
+    FastWMRAgent,
     FastWMREstimatorRuntime,
     FastWMRRolloutCollector,
     FastWMRSequenceFeatureProcessor,
     FastWMRSequenceUpdateLoop,
+    GradientBoundaryError,
     WorldStateEstimator,
 )
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.buffers import (
@@ -237,7 +240,15 @@ def test_integrated_collection_updates_estimator_runtime_and_c51_sac() -> None:
         for update in result.updates
         for metric in update.__dict__.values()
     )
-    assert all(parameter.grad is not None for parameter in estimator.parameters())
+    assert update_loop.agent is not None
+    assert update_loop.agent.update_steps == update_loop.gradient_steps
+    assert all(parameter.grad is None for parameter in estimator.parameters())
+    assert all(
+        update.update_order == FastWMRAgent.UPDATE_ORDER
+        and update.gradient_boundary.enabled
+        and update.gradient_boundary.checks == 7
+        for update in update_loop.last_agent_updates
+    )
     env.close()
 
 
@@ -279,4 +290,155 @@ def test_replayed_sac_features_use_current_estimator_and_cut_its_gradients() -> 
     sac_batch = update_loop._build_learning_batch(sequence, features)
     update_loop.updater.update(sac_batch)
     assert all(parameter.grad is None for parameter in estimator.parameters())
+    env.close()
+
+
+def test_agent_executes_optimizer_phases_in_declared_order() -> None:
+    torch.manual_seed(33)
+    (
+        env,
+        replay,
+        _normalizer,
+        estimator,
+        estimator_updater,
+        _runtime,
+        _processor,
+        update_loop,
+        collector,
+    ) = _integrated_pipeline()
+    collector.reset(seed=33)
+    for _ in range(4):
+        collector.collect_step()
+    sequence = replay.sample_sequences(
+        batch_size=1,
+        burn_in_length=1,
+        learning_length=2,
+        device="cpu",
+        generator=torch.Generator().manual_seed(33),
+    )
+    agent = update_loop.agent
+    assert agent is not None
+
+    events: list[str] = []
+    original_estimator = estimator_updater.update_sequence
+    original_critic = update_loop.updater.update_critic
+    original_actor = update_loop.updater.update_actor
+    original_temperature = update_loop.updater.update_temperature
+    original_target = update_loop.updater.update_target
+
+    def update_estimator(sample):
+        events.append("estimator")
+        return original_estimator(sample)
+
+    def update_critic(batch):
+        events.append("critic")
+        return original_critic(batch)
+
+    def update_actor(states):
+        events.append("actor")
+        return original_actor(states)
+
+    def update_temperature(log_probabilities):
+        events.append("temperature")
+        return original_temperature(log_probabilities)
+
+    def update_target():
+        events.append("target")
+        return original_target()
+
+    estimator_updater.update_sequence = update_estimator
+    update_loop.updater.update_critic = update_critic
+    update_loop.updater.update_actor = update_actor
+    update_loop.updater.update_temperature = update_temperature
+    update_loop.updater.update_target = update_target
+
+    result = agent.update(sequence)
+
+    assert tuple(events) == FastWMRAgent.UPDATE_ORDER
+    assert result.update_order == FastWMRAgent.UPDATE_ORDER
+    assert result.gradient_boundary.estimator_gradient_norm is not None
+    assert result.gradient_boundary.estimator_gradient_norm > 0.0
+    modules = (
+        estimator,
+        update_loop.updater.critic,
+        update_loop.updater.actor,
+        update_loop.updater.temperature,
+        update_loop.updater.target_critic,
+    )
+    assert all(parameter.grad is None for module in modules for parameter in module.parameters())
+    env.close()
+
+
+def test_gradient_guard_detects_actor_to_estimator_leak_and_cleans_up() -> None:
+    torch.manual_seed(34)
+    (
+        env,
+        replay,
+        _normalizer,
+        estimator,
+        _estimator_updater,
+        _runtime,
+        _processor,
+        update_loop,
+        collector,
+    ) = _integrated_pipeline()
+    collector.reset(seed=34)
+    for _ in range(4):
+        collector.collect_step()
+    sequence = replay.sample_sequences(
+        batch_size=1,
+        burn_in_length=1,
+        learning_length=2,
+        device="cpu",
+        generator=torch.Generator().manual_seed(34),
+    )
+    agent = update_loop.agent
+    assert agent is not None
+    original_actor = update_loop.updater.update_actor
+
+    def leaking_actor_update(states):
+        output = original_actor(states)
+        parameter = next(estimator.parameters())
+        parameter.grad = torch.ones_like(parameter)
+        return output
+
+    update_loop.updater.update_actor = leaking_actor_update
+
+    with pytest.raises(
+        GradientBoundaryError,
+        match="actor update leaked a gradient into estimator",
+    ):
+        agent.update(sequence)
+
+    modules = (
+        estimator,
+        update_loop.updater.critic,
+        update_loop.updater.actor,
+        update_loop.updater.temperature,
+        update_loop.updater.target_critic,
+    )
+    assert all(parameter.grad is None for module in modules for parameter in module.parameters())
+    env.close()
+
+
+def test_agent_rejects_optimizer_parameter_overlap() -> None:
+    (
+        env,
+        _replay,
+        _normalizer,
+        estimator,
+        _estimator_updater,
+        _runtime,
+        processor,
+        update_loop,
+        _collector,
+    ) = _integrated_pipeline()
+    actor_parameters = list(update_loop.updater.actor.parameters())
+    update_loop.updater.actor_optimizer = torch.optim.Adam(
+        (*actor_parameters, next(estimator.parameters())),
+        lr=3e-4,
+    )
+
+    with pytest.raises(ValueError, match="actor optimizer must own exactly"):
+        FastWMRAgent(update_loop.updater, processor)
     env.close()

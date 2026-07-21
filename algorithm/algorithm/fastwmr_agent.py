@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
+from torch import nn
 
 from ..buffers import EstimatorRolloutCache, SequenceReplayBatch, TransitionReplayBuffer
 from ..config import (
@@ -24,6 +26,226 @@ if TYPE_CHECKING:
 
 
 SequenceFeatureProcessor = Callable[[SequenceReplayBatch], torch.Tensor]
+
+
+class GradientBoundaryError(RuntimeError):
+    """Raised when an optimizer phase writes gradients outside its ownership."""
+
+
+@dataclass(frozen=True)
+class GradientBoundaryReport:
+    """Diagnostics from one complete set of FastWMR gradient checks."""
+
+    enabled: bool
+    checks: int
+    estimator_gradient_norm: float | None
+
+
+@dataclass(frozen=True)
+class FastWMRAgentUpdateResult:
+    """Estimator and SAC diagnostics produced by one ordered agent update."""
+
+    estimator_update: EstimatorUpdateResult
+    sac_update: SACUpdateMetrics
+    update_order: tuple[str, ...]
+    gradient_boundary: GradientBoundaryReport
+
+
+class FastWMRGradientGuard:
+    """Enforce optimizer ownership and estimator-to-SAC gradient cutoff."""
+
+    def __init__(
+        self,
+        estimator_updater: EstimatorUpdater,
+        sac_updater: SACUpdater,
+        *,
+        enabled: bool = True,
+    ) -> None:
+        self.estimator_updater = estimator_updater
+        self.sac_updater = sac_updater
+        self.enabled = enabled
+        self._checks = 0
+        self._validate_optimizer_ownership()
+
+    def begin_update(self) -> None:
+        """Clear stale gradients before ownership checks begin."""
+
+        self._checks = 0
+        self.clear_all()
+        self._assert_all_clean("update start")
+
+    def after_estimator(self) -> float | None:
+        gradient_norm = None
+        if self.enabled:
+            gradient_norm = self._require_finite_gradient(
+                self.estimator_updater.estimator,
+                "estimator",
+                "estimator update",
+            )
+            self._assert_no_gradient(self.sac_updater.actor, "actor", "estimator update")
+            self._assert_no_gradient(self.sac_updater.critic, "critic", "estimator update")
+            self._assert_no_gradient(
+                self.sac_updater.temperature,
+                "temperature",
+                "estimator update",
+            )
+            self._assert_no_gradient(
+                self.sac_updater.target_critic,
+                "target critic",
+                "estimator update",
+            )
+            self._checks += 1
+
+        # The estimator optimizer leaves gradients available for diagnostics.
+        # Remove them before critic or actor backward can run.
+        self.estimator_updater.optimizer.zero_grad(set_to_none=True)
+        self._assert_no_gradient(self.estimator_updater.estimator, "estimator", "SAC boundary")
+        return gradient_norm
+
+    def before_sac(self, batch: SACTransitionBatch) -> None:
+        if batch.states.requires_grad or batch.next_states.requires_grad:
+            raise GradientBoundaryError("SAC features must be detached from the estimator graph.")
+        self._assert_no_gradient(self.estimator_updater.estimator, "estimator", "SAC start")
+        if self.enabled:
+            self._checks += 1
+
+    def after_critic(self) -> None:
+        if not self.enabled:
+            return
+        self._assert_no_gradient(self.estimator_updater.estimator, "estimator", "critic update")
+        self._assert_no_gradient(self.sac_updater.actor, "actor", "critic update")
+        self._assert_no_gradient(self.sac_updater.temperature, "temperature", "critic update")
+        self._assert_no_gradient(self.sac_updater.target_critic, "target critic", "critic update")
+        self._checks += 1
+
+    def after_actor(self) -> None:
+        if not self.enabled:
+            return
+        self._assert_no_gradient(self.estimator_updater.estimator, "estimator", "actor update")
+        self._assert_no_gradient(self.sac_updater.critic, "critic", "actor update")
+        self._assert_no_gradient(self.sac_updater.temperature, "temperature", "actor update")
+        self._assert_no_gradient(self.sac_updater.target_critic, "target critic", "actor update")
+        self._require_finite_gradient(self.sac_updater.actor, "actor", "actor update")
+        self._checks += 1
+
+    def after_temperature(self) -> None:
+        if not self.enabled:
+            return
+        self._assert_no_gradient(self.estimator_updater.estimator, "estimator", "temperature update")
+        self._assert_no_gradient(self.sac_updater.critic, "critic", "temperature update")
+        self._assert_no_gradient(
+            self.sac_updater.target_critic,
+            "target critic",
+            "temperature update",
+        )
+        self._require_finite_gradient(
+            self.sac_updater.temperature,
+            "temperature",
+            "temperature update",
+        )
+        self._checks += 1
+
+    def after_target(self) -> None:
+        if not self.enabled:
+            return
+        self._assert_no_gradient(self.estimator_updater.estimator, "estimator", "target update")
+        self._assert_no_gradient(self.sac_updater.target_critic, "target critic", "target update")
+        self._checks += 1
+
+    def report(self, estimator_gradient_norm: float | None) -> GradientBoundaryReport:
+        return GradientBoundaryReport(
+            enabled=self.enabled,
+            checks=self._checks,
+            estimator_gradient_norm=estimator_gradient_norm,
+        )
+
+    def clear_all(self) -> None:
+        """Leave no parameter gradients live between integrated updates."""
+
+        self.estimator_updater.optimizer.zero_grad(set_to_none=True)
+        self.sac_updater.critic_optimizer.zero_grad(set_to_none=True)
+        self.sac_updater.actor_optimizer.zero_grad(set_to_none=True)
+        self.sac_updater.temperature_optimizer.zero_grad(set_to_none=True)
+        for parameter in self.sac_updater.target_critic.parameters():
+            parameter.grad = None
+
+    def _assert_all_clean(self, phase: str) -> None:
+        if not self.enabled:
+            return
+        for name, module in self._modules().items():
+            self._assert_no_gradient(module, name, phase)
+        self._checks += 1
+
+    def _validate_optimizer_ownership(self) -> None:
+        modules = {
+            "estimator": self.estimator_updater.estimator,
+            "critic": self.sac_updater.critic,
+            "actor": self.sac_updater.actor,
+            "temperature": self.sac_updater.temperature,
+        }
+        optimizers = {
+            "estimator": self.estimator_updater.optimizer,
+            "critic": self.sac_updater.critic_optimizer,
+            "actor": self.sac_updater.actor_optimizer,
+            "temperature": self.sac_updater.temperature_optimizer,
+        }
+        if len({id(optimizer) for optimizer in optimizers.values()}) != len(optimizers):
+            raise ValueError("FastWMR requires four distinct optimizer instances.")
+
+        owned_parameter_ids: dict[str, set[int]] = {}
+        for name, module in modules.items():
+            module_ids = {id(parameter) for parameter in module.parameters() if parameter.requires_grad}
+            optimizer_ids = {
+                id(parameter)
+                for group in optimizers[name].param_groups
+                for parameter in group["params"]
+            }
+            if not module_ids or optimizer_ids != module_ids:
+                raise ValueError(f"The {name} optimizer must own exactly the trainable {name} parameters.")
+            owned_parameter_ids[name] = module_ids
+
+        names = tuple(owned_parameter_ids)
+        for index, name in enumerate(names):
+            for other_name in names[index + 1 :]:
+                if owned_parameter_ids[name] & owned_parameter_ids[other_name]:
+                    raise ValueError(f"{name} and {other_name} optimizer parameters must be disjoint.")
+        if any(parameter.requires_grad for parameter in self.sac_updater.target_critic.parameters()):
+            raise ValueError("Target critic parameters must remain frozen.")
+
+    def _modules(self) -> dict[str, nn.Module]:
+        return {
+            "estimator": self.estimator_updater.estimator,
+            "critic": self.sac_updater.critic,
+            "actor": self.sac_updater.actor,
+            "temperature": self.sac_updater.temperature,
+            "target critic": self.sac_updater.target_critic,
+        }
+
+    @staticmethod
+    def _assert_no_gradient(module: nn.Module, name: str, phase: str) -> None:
+        for parameter in module.parameters():
+            gradient = parameter.grad
+            if gradient is None:
+                continue
+            if not torch.isfinite(gradient).all():
+                raise GradientBoundaryError(f"{phase} left a non-finite gradient on {name}.")
+            if torch.count_nonzero(gradient).item() != 0:
+                raise GradientBoundaryError(f"{phase} leaked a gradient into {name}.")
+
+    @staticmethod
+    def _require_finite_gradient(module: nn.Module, name: str, phase: str) -> float:
+        squared_norm: torch.Tensor | None = None
+        for parameter in module.parameters():
+            gradient = parameter.grad
+            if gradient is None:
+                continue
+            if not torch.isfinite(gradient).all():
+                raise GradientBoundaryError(f"{phase} produced a non-finite {name} gradient.")
+            contribution = gradient.detach().square().sum()
+            squared_norm = contribution if squared_norm is None else squared_norm + contribution
+        if squared_norm is None:
+            raise GradientBoundaryError(f"{phase} did not produce a {name} gradient.")
+        return float(torch.sqrt(squared_norm))
 
 
 class FastWMRSequenceFeatureProcessor:
@@ -108,6 +330,123 @@ class FastWMRSequenceFeatureProcessor:
         self.last_runtime_rebuild = runtime_rebuild
         self.updates += 1
         return features
+
+
+class FastWMRAgent:
+    """Own the ordered estimator and FastSAC optimizer lifecycle."""
+
+    UPDATE_ORDER = ("estimator", "critic", "actor", "temperature", "target")
+
+    def __init__(
+        self,
+        sac_updater: SACUpdater,
+        feature_processor: FastWMRSequenceFeatureProcessor,
+        *,
+        verify_gradient_boundaries: bool = True,
+    ) -> None:
+        if feature_processor.interface.actor_input_dim != sac_updater.actor.input_dim:
+            raise ValueError("FastWMR agent feature and actor input dimensions must match.")
+        self.sac_updater = sac_updater
+        self.feature_processor = feature_processor
+        self.gradient_guard = FastWMRGradientGuard(
+            feature_processor.estimator_updater,
+            sac_updater,
+            enabled=verify_gradient_boundaries,
+        )
+        self.update_steps = 0
+        self.last_update: FastWMRAgentUpdateResult | None = None
+
+    def update(self, sequence: SequenceReplayBatch) -> FastWMRAgentUpdateResult:
+        """Run estimator, critic, actor, alpha, and target phases in order."""
+
+        completed_phases: list[str] = []
+        self.gradient_guard.begin_update()
+        try:
+            learning_features = self.feature_processor(sequence)
+            completed_phases.append("estimator")
+            estimator_update = self.feature_processor.last_estimator_update
+            if estimator_update is None:
+                raise RuntimeError("Feature processing did not produce an estimator update result.")
+            estimator_gradient_norm = self.gradient_guard.after_estimator()
+
+            batch = _build_sequence_learning_batch(
+                sequence,
+                learning_features,
+                actor_input_dim=self.sac_updater.actor.input_dim,
+            )
+            self.gradient_guard.before_sac(batch)
+
+            critic_output = self.sac_updater.update_critic(batch)
+            completed_phases.append("critic")
+            self.gradient_guard.after_critic()
+
+            actor_output = self.sac_updater.update_actor(batch.states)
+            completed_phases.append("actor")
+            self.gradient_guard.after_actor()
+
+            temperature_loss = self.sac_updater.update_temperature(
+                actor_output.log_probabilities
+            )
+            completed_phases.append("temperature")
+            self.gradient_guard.after_temperature()
+
+            self.sac_updater.update_target()
+            completed_phases.append("target")
+            self.gradient_guard.after_target()
+
+            if tuple(completed_phases) != self.UPDATE_ORDER:
+                raise RuntimeError(f"FastWMR update order drifted to {tuple(completed_phases)}.")
+            sac_metrics = SACUpdateMetrics(
+                critic_loss=critic_output.loss.detach(),
+                actor_loss=actor_output.loss.detach(),
+                temperature_loss=temperature_loss.detach(),
+                temperature=self.sac_updater.temperature().detach(),
+                target_q_mean=critic_output.target.mean().detach(),
+                q1_mean=critic_output.q1.mean().detach(),
+                q2_mean=critic_output.q2.mean().detach(),
+                policy_entropy=(-actor_output.log_probabilities.mean()).detach(),
+            )
+            result = FastWMRAgentUpdateResult(
+                estimator_update=estimator_update,
+                sac_update=sac_metrics,
+                update_order=tuple(completed_phases),
+                gradient_boundary=self.gradient_guard.report(estimator_gradient_norm),
+            )
+            self.update_steps += 1
+            self.last_update = result
+            return result
+        finally:
+            self.gradient_guard.clear_all()
+
+
+def _build_sequence_learning_batch(
+    sequence: SequenceReplayBatch,
+    learning_features: torch.Tensor,
+    *,
+    actor_input_dim: int,
+) -> SACTransitionBatch:
+    expected_shape = (
+        sequence.batch_size,
+        sequence.learning_length + 1,
+        actor_input_dim,
+    )
+    if learning_features.shape != expected_shape:
+        raise ValueError(
+            f"Sequence feature processor must return shape {expected_shape}, "
+            f"got {tuple(learning_features.shape)}."
+        )
+    if learning_features.requires_grad:
+        raise ValueError("SAC learning features must be detached after estimator update.")
+    if not torch.isfinite(learning_features).all():
+        raise ValueError("SAC learning features must be finite.")
+    return SACTransitionBatch(
+        states=learning_features[:, :-1],
+        actions=sequence.learning_actions,
+        rewards=sequence.learning_rewards,
+        next_states=learning_features[:, 1:],
+        terminated=sequence.learning_terminated,
+        truncated=sequence.learning_truncated,
+    )
 
 
 class FastSACReplayUpdateLoop:
@@ -222,10 +561,21 @@ class FastWMRSequenceUpdateLoop(FastSACReplayUpdateLoop):
         sequence_feature_processor: SequenceFeatureProcessor,
         *,
         learner_device: torch.device | str,
+        verify_gradient_boundaries: bool = True,
     ) -> None:
         super().__init__(replay, updater, cfg, learner_device=learner_device)
         self.sequence_cfg = sequence_cfg
         self.sequence_feature_processor = sequence_feature_processor
+        self.agent = (
+            FastWMRAgent(
+                updater,
+                sequence_feature_processor,
+                verify_gradient_boundaries=verify_gradient_boundaries,
+            )
+            if isinstance(sequence_feature_processor, FastWMRSequenceFeatureProcessor)
+            else None
+        )
+        self.last_agent_updates: tuple[FastWMRAgentUpdateResult, ...] = ()
 
     @property
     def ready(self) -> bool:
@@ -241,9 +591,11 @@ class FastWMRSequenceUpdateLoop(FastSACReplayUpdateLoop):
         )
 
     def run_updates(self, *, generator: torch.Generator | None = None) -> list[SACUpdateMetrics]:
+        self.last_agent_updates = ()
         if not self.ready:
             return []
         metrics: list[SACUpdateMetrics] = []
+        agent_updates: list[FastWMRAgentUpdateResult] = []
         for _ in range(self.cfg.num_updates):
             sequence = self.replay.sample_sequences(
                 self.sequence_cfg.batch_size,
@@ -253,10 +605,16 @@ class FastWMRSequenceUpdateLoop(FastSACReplayUpdateLoop):
                 device=self.learner_device,
                 generator=generator,
             )
-            learning_features = self.sequence_feature_processor(sequence)
-            batch = self._build_learning_batch(sequence, learning_features)
-            metrics.append(self.updater.update(batch))
+            if self.agent is not None:
+                agent_update = self.agent.update(sequence)
+                agent_updates.append(agent_update)
+                metrics.append(agent_update.sac_update)
+            else:
+                learning_features = self.sequence_feature_processor(sequence)
+                batch = self._build_learning_batch(sequence, learning_features)
+                metrics.append(self.updater.update(batch))
             self.gradient_steps += 1
+        self.last_agent_updates = tuple(agent_updates)
         return metrics
 
     def _build_learning_batch(
@@ -264,24 +622,8 @@ class FastWMRSequenceUpdateLoop(FastSACReplayUpdateLoop):
         sequence: SequenceReplayBatch,
         learning_features: torch.Tensor,
     ) -> SACTransitionBatch:
-        expected_shape = (
-            sequence.batch_size,
-            sequence.learning_length + 1,
-            self.updater.actor.input_dim,
-        )
-        if learning_features.shape != expected_shape:
-            raise ValueError(
-                f"Sequence feature processor must return shape {expected_shape}, got {tuple(learning_features.shape)}."
-            )
-        if learning_features.requires_grad:
-            raise ValueError("SAC learning features must be detached after estimator update.")
-        if not torch.isfinite(learning_features).all():
-            raise ValueError("SAC learning features must be finite.")
-        return SACTransitionBatch(
-            states=learning_features[:, :-1],
-            actions=sequence.learning_actions,
-            rewards=sequence.learning_rewards,
-            next_states=learning_features[:, 1:],
-            terminated=sequence.learning_terminated,
-            truncated=sequence.learning_truncated,
+        return _build_sequence_learning_batch(
+            sequence,
+            learning_features,
+            actor_input_dim=self.updater.actor.input_dim,
         )
