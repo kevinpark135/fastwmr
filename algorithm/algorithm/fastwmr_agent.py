@@ -402,8 +402,11 @@ class FastWMRAgent:
                 temperature_loss=temperature_loss.detach(),
                 temperature=self.sac_updater.temperature().detach(),
                 target_q_mean=critic_output.target.mean().detach(),
+                target_q_std=critic_output.target.std(unbiased=False).detach(),
                 q1_mean=critic_output.q1.mean().detach(),
+                q1_std=critic_output.q1.std(unbiased=False).detach(),
                 q2_mean=critic_output.q2.mean().detach(),
+                q2_std=critic_output.q2.std(unbiased=False).detach(),
                 policy_entropy=(-actor_output.log_probabilities.mean()).detach(),
             )
             result = FastWMRAgentUpdateResult(

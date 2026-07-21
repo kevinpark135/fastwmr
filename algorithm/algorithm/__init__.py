@@ -51,12 +51,24 @@ from .sac_update import (
     compute_temperature_loss,
     project_categorical_distribution,
 )
+from .checkpoint import (
+    CHECKPOINT_FORMAT_VERSION,
+    CheckpointCounters,
+    CheckpointLoadResult,
+    TrainingMode,
+    load_training_checkpoint,
+    save_training_checkpoint,
+    write_config_snapshot,
+)
 
 __all__ = [
     "ActorLossOutput",
     "BurnInUnrollOutput",
+    "CHECKPOINT_FORMAT_VERSION",
     "C51CriticLossOutput",
     "C51SACUpdater",
+    "CheckpointCounters",
+    "CheckpointLoadResult",
     "CriticLossOutput",
     "EntropyTemperature",
     "EstimatorLossOutput",
@@ -86,6 +98,7 @@ __all__ = [
     "SACUpdateMetrics",
     "SACUpdater",
     "SequenceFeatureProcessor",
+    "TrainingMode",
     "WorldStateEstimator",
     "burn_in_and_unroll",
     "compute_estimator_loss",
@@ -95,5 +108,8 @@ __all__ = [
     "compute_critic_loss",
     "compute_critic_target",
     "compute_temperature_loss",
+    "load_training_checkpoint",
     "project_categorical_distribution",
+    "save_training_checkpoint",
+    "write_config_snapshot",
 ]

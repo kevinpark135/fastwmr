@@ -245,6 +245,17 @@ class FastWMREstimatorRuntime:
         self._last_reconstruction = None
         return self._state.clear()
 
+    def restart(self, *, estimator_version: int) -> RecurrentState:
+        """Restore a checkpoint version while discarding all ephemeral state."""
+
+        if estimator_version < 0:
+            raise ValueError("estimator_version must be non-negative.")
+        self._estimator_version = estimator_version
+        self._environment_steps = 0
+        self._rebuilds = 0
+        self._last_reconstruction = None
+        return self._state.clear()
+
     @torch.no_grad()
     def rebuild_from_batch(
         self,

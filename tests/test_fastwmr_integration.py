@@ -15,7 +15,11 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.a
     FastWMRSequenceFeatureProcessor,
     FastWMRSequenceUpdateLoop,
     GradientBoundaryError,
+    TrainingMode,
     WorldStateEstimator,
+    load_training_checkpoint,
+    save_training_checkpoint,
+    write_config_snapshot,
 )
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.buffers import (
     EstimatorRolloutCache,
@@ -442,3 +446,186 @@ def test_agent_rejects_optimizer_parameter_overlap() -> None:
     with pytest.raises(ValueError, match="actor optimizer must own exactly"):
         FastWMRAgent(update_loop.updater, processor)
     env.close()
+
+
+def test_checkpoint_resume_restores_models_optimizers_normalizer_and_counters(tmp_path) -> None:
+    torch.manual_seed(35)
+    (
+        source_env,
+        source_replay,
+        source_normalizer,
+        source_estimator,
+        source_estimator_updater,
+        source_runtime,
+        _source_processor,
+        source_loop,
+        source_collector,
+    ) = _integrated_pipeline()
+    source_collector.reset(seed=35)
+    for _ in range(6):
+        source_collector.collect_step()
+    sequence = source_replay.sample_sequences(
+        batch_size=1,
+        burn_in_length=1,
+        learning_length=2,
+        device="cpu",
+        generator=torch.Generator().manual_seed(35),
+    )
+    fixed_observations = torch.randn(3, DEFAULT_INTERFACE_CFG.policy_observation_dim)
+    fixed_features = torch.randn(3, DEFAULT_INTERFACE_CFG.control_feature_dim)
+    normalized_before = source_normalizer(fixed_observations)
+    action_before = source_loop.updater.actor.act(fixed_features, deterministic=True)
+    checkpoint_path = tmp_path / "checkpoints" / "step.pt"
+    config = {"seed": 35, "sequence": {"burn_in": 1, "learning": 2}}
+
+    save_training_checkpoint(
+        checkpoint_path,
+        mode=TrainingMode.FASTWMR,
+        sac_updater=source_loop.updater,
+        update_loop=source_loop,
+        normalizer=source_normalizer,
+        estimator_updater=source_estimator_updater,
+        config=config,
+    )
+    snapshot_path = write_config_snapshot(tmp_path / "config_snapshot.json", config)
+
+    (
+        target_env,
+        target_replay,
+        target_normalizer,
+        target_estimator,
+        target_estimator_updater,
+        target_runtime,
+        _target_processor,
+        target_loop,
+        target_collector,
+    ) = _integrated_pipeline()
+    target_collector.reset(seed=351)
+    for _ in range(4):
+        target_collector.collect_step()
+    assert target_replay.total_inserted > 0
+    assert target_loop.sequence_feature_processor.updates > 0
+    loaded = load_training_checkpoint(
+        checkpoint_path,
+        mode=TrainingMode.FASTWMR,
+        sac_updater=target_loop.updater,
+        update_loop=target_loop,
+        normalizer=target_normalizer,
+        estimator_updater=target_estimator_updater,
+        runtime=target_runtime,
+        rollout_cache=target_loop.sequence_feature_processor.rollout_cache,
+        map_location="cpu",
+    )
+
+    assert loaded.config == config
+    assert loaded.counters.environment_steps == source_loop.environment_steps
+    assert loaded.counters.gradient_steps == source_loop.gradient_steps
+    assert loaded.counters.estimator_version == source_estimator_updater.version
+    assert target_loop.environment_steps == source_loop.environment_steps
+    assert target_loop.gradient_steps == source_loop.gradient_steps
+    assert target_loop.agent is not None and source_loop.agent is not None
+    assert target_loop.agent.update_steps == source_loop.agent.update_steps
+    assert target_estimator_updater.version == source_estimator_updater.version
+    assert target_runtime.estimator_version == source_runtime.estimator_version
+    assert target_runtime.environment_steps == 0
+    assert target_runtime.rebuilds == 0
+    assert torch.count_nonzero(target_runtime.state.hidden) == 0
+    assert torch.count_nonzero(target_runtime.state.cell) == 0
+    assert len(target_replay) == 0
+    assert target_replay.total_inserted == 0
+    assert len(target_loop.sequence_feature_processor.rollout_cache) == 0
+    assert target_loop.sequence_feature_processor.updates == loaded.counters.agent_updates
+    assert target_loop.sequence_feature_processor.last_estimator_update is None
+    assert target_loop.sequence_feature_processor.last_runtime_rebuild is None
+    torch.testing.assert_close(target_normalizer(fixed_observations), normalized_before)
+    torch.testing.assert_close(
+        target_loop.updater.actor.act(fixed_features, deterministic=True),
+        action_before,
+    )
+    _assert_module_equal(source_estimator, target_estimator)
+    _assert_module_equal(source_loop.updater.actor, target_loop.updater.actor)
+    _assert_module_equal(source_loop.updater.critic, target_loop.updater.critic)
+    _assert_module_equal(source_loop.updater.target_critic, target_loop.updater.target_critic)
+    _assert_module_equal(source_loop.updater.temperature, target_loop.updater.temperature)
+    assert snapshot_path.read_text(encoding="utf-8").endswith("\n")
+
+    torch.manual_seed(350)
+    source_update = source_loop.agent.update(sequence)
+    torch.manual_seed(350)
+    target_update = target_loop.agent.update(sequence)
+    _assert_module_equal(source_estimator, target_estimator)
+    _assert_module_equal(source_loop.updater.actor, target_loop.updater.actor)
+    _assert_module_equal(source_loop.updater.critic, target_loop.updater.critic)
+    _assert_module_equal(source_loop.updater.target_critic, target_loop.updater.target_critic)
+    _assert_module_equal(source_loop.updater.temperature, target_loop.updater.temperature)
+    torch.testing.assert_close(
+        source_update.sac_update.critic_loss,
+        target_update.sac_update.critic_loss,
+    )
+    assert source_update.estimator_update.metrics.total_loss == pytest.approx(
+        target_update.estimator_update.metrics.total_loss
+    )
+    source_env.close()
+    target_env.close()
+
+
+def test_checkpoint_rejects_mode_and_normalizer_mismatch(tmp_path) -> None:
+    (
+        env,
+        _replay,
+        normalizer,
+        _estimator,
+        estimator_updater,
+        runtime,
+        _processor,
+        update_loop,
+        _collector,
+    ) = _integrated_pipeline()
+    checkpoint_path = save_training_checkpoint(
+        tmp_path / "fastwmr.pt",
+        mode=TrainingMode.FASTWMR,
+        sac_updater=update_loop.updater,
+        update_loop=update_loop,
+        normalizer=normalizer,
+        estimator_updater=estimator_updater,
+    )
+
+    mismatched_mode_path = tmp_path / "mismatched_mode.pt"
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    payload["mode"] = TrainingMode.FASTSAC.value
+    torch.save(payload, mismatched_mode_path)
+
+    with pytest.raises(ValueError, match="Checkpoint mode is 'fastsac'"):
+        load_training_checkpoint(
+            mismatched_mode_path,
+            mode=TrainingMode.FASTWMR,
+            sac_updater=update_loop.updater,
+            update_loop=update_loop,
+            normalizer=normalizer,
+            estimator_updater=estimator_updater,
+            runtime=runtime,
+            rollout_cache=update_loop.sequence_feature_processor.rollout_cache,
+            map_location="cpu",
+        )
+
+    with pytest.raises(ValueError, match="normalizer settings do not match"):
+        load_training_checkpoint(
+            checkpoint_path,
+            mode=TrainingMode.FASTWMR,
+            sac_updater=update_loop.updater,
+            update_loop=update_loop,
+            normalizer=None,
+            estimator_updater=estimator_updater,
+            runtime=runtime,
+            rollout_cache=update_loop.sequence_feature_processor.rollout_cache,
+            map_location="cpu",
+        )
+    env.close()
+
+
+def _assert_module_equal(source: torch.nn.Module, target: torch.nn.Module) -> None:
+    source_state = source.state_dict()
+    target_state = target.state_dict()
+    assert source_state.keys() == target_state.keys()
+    for name in source_state:
+        torch.testing.assert_close(source_state[name], target_state[name])

@@ -366,6 +366,38 @@ class TransitionReplayBuffer:
 
         return self._total_inserted
 
+    @property
+    def oldest_insertion_id(self) -> int | None:
+        """Insertion ID of the oldest retained transition."""
+
+        index = self._oldest_physical_index()
+        return None if index is None else int(self._insertion_ids[index].item())
+
+    @property
+    def newest_insertion_id(self) -> int | None:
+        """Insertion ID of the newest retained transition."""
+
+        index = self._newest_physical_index()
+        return None if index is None else int(self._insertion_ids[index].item())
+
+    @property
+    def oldest_estimator_version(self) -> int | None:
+        """Estimator version attached to the oldest retained transition."""
+
+        if self.spec.control_feature_dim == 0:
+            return None
+        index = self._oldest_physical_index()
+        return None if index is None else int(self._estimator_versions[index].item())
+
+    @property
+    def newest_estimator_version(self) -> int | None:
+        """Estimator version attached to the newest retained transition."""
+
+        if self.spec.control_feature_dim == 0:
+            return None
+        index = self._newest_physical_index()
+        return None if index is None else int(self._estimator_versions[index].item())
+
     def can_sample(self, batch_size: int) -> bool:
         if batch_size <= 0:
             raise ValueError(f"batch_size must be positive, got {batch_size}.")
@@ -699,6 +731,22 @@ class TransitionReplayBuffer:
         self._slot_temporal_keys = [None] * self.capacity
         self._temporal_index.clear()
         self._valid_sequence_starts.clear()
+
+    def reset(self) -> None:
+        """Drop replay contents and restart insertion IDs for a fresh run."""
+
+        self.clear()
+        self._total_inserted = 0
+
+    def _oldest_physical_index(self) -> int | None:
+        if self._size == 0:
+            return None
+        return self._position if self.is_full else 0
+
+    def _newest_physical_index(self) -> int | None:
+        if self._size == 0:
+            return None
+        return (self._position - 1) % self.capacity
 
     def _batch_at(self, indices: torch.Tensor) -> TransitionReplayBatch:
         return TransitionReplayBatch(

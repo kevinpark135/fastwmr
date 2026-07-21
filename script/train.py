@@ -1,11 +1,15 @@
-"""Executable FastSAC baseline collector and learner for the Rough G1 task."""
+"""Train FastSAC or FastWMR on the shared Rough G1 environment."""
 
 from __future__ import annotations
 
-import math
 import traceback
 
-from cli_args import FASTSAC_BASELINE_TASK, build_train_parser, validate_train_args
+from cli_args import (
+    FASTSAC_BASELINE_TASK,
+    FASTWMR_TASK,
+    build_train_parser,
+    validate_train_args,
+)
 
 from isaaclab.app import AppLauncher
 
@@ -18,6 +22,10 @@ validate_train_args(ARGS)
 APP_LAUNCHER = AppLauncher(ARGS)
 SIMULATION_APP = APP_LAUNCHER.app
 
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
 import gymnasium as gym
 import torch
 
@@ -26,33 +34,67 @@ import isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr  # noqa: 
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.algorithm import (
     C51SACUpdater,
     EntropyTemperature,
+    EstimatorUpdater,
     FastSACReplayUpdateLoop,
     FastSACRolloutCollector,
+    FastWMREstimatorRuntime,
+    FastWMRRolloutCollector,
+    FastWMRSequenceFeatureProcessor,
+    FastWMRSequenceUpdateLoop,
     SACUpdater,
+    TrainingMode,
+    WorldStateEstimator,
+    load_training_checkpoint,
+    save_training_checkpoint,
+    write_config_snapshot,
 )
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.buffers import (
+    EstimatorRolloutCache,
+    EstimatorRolloutCacheSpec,
     ReplayBufferSpec,
     TransitionReplayBuffer,
 )
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.config import (
+    DEFAULT_INTERFACE_CFG,
     DistributionalCriticCfg,
     ObservationNormalizationCfg,
     ReplayUpdateCfg,
     ScalarCriticCfg,
+    SequenceReplayCfg,
     TanhGaussianActorCfg,
 )
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.networks import (
+    HistoryEncoder,
     TargetTwinC51Critic,
     TargetTwinScalarCritic,
     TanhGaussianActor,
     TwinC51Critic,
     TwinScalarCritic,
+    WorldStateDecoder,
 )
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.utils import (
+    EpisodeStatisticsTracker,
     IsaacLabEnvAdapter,
     RunningObservationNormalizer,
+    TrainingMetricsLogger,
+    fastwmr_agent_metrics_dict,
+    format_console_metrics,
+    sac_metrics_dict,
 )
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
+
+
+@dataclass
+class TrainingComponents:
+    mode: TrainingMode
+    replay: TransitionReplayBuffer
+    updater: SACUpdater
+    update_loop: FastSACReplayUpdateLoop
+    collector: FastSACRolloutCollector | FastWMRRolloutCollector
+    normalizer: RunningObservationNormalizer | None
+    estimator_updater: EstimatorUpdater | None = None
+    runtime: FastWMREstimatorRuntime | None = None
+    rollout_cache: EstimatorRolloutCache | None = None
 
 
 def _apply_rough_debug_overrides(cfg: object) -> None:
@@ -67,35 +109,40 @@ def _apply_rough_debug_overrides(cfg: object) -> None:
         cfg.scene.terrain.terrain_generator.curriculum = False
 
 
-def _build_updater(
-    observation_dim: int,
+def _build_sac_updater(
+    state_dim: int,
     action_dim: int,
     device: torch.device,
     *,
     action_low: torch.Tensor,
     action_high: torch.Tensor,
 ) -> SACUpdater:
-    actor_cfg = TanhGaussianActorCfg(hidden_dim=ARGS.hidden_dim)
     actor = TanhGaussianActor(
-        observation_dim,
+        state_dim,
         action_dim,
-        cfg=actor_cfg,
+        cfg=TanhGaussianActorCfg(hidden_dim=ARGS.hidden_dim),
         action_low=action_low,
         action_high=action_high,
     ).to(device)
     if ARGS.critic_type == "c51":
-        critic_cfg = DistributionalCriticCfg(
-            hidden_dim=ARGS.hidden_dim,
-            num_atoms=ARGS.num_atoms,
-            value_min=ARGS.value_min,
-            value_max=ARGS.value_max,
-        )
-        critic = TwinC51Critic(observation_dim, action_dim, cfg=critic_cfg).to(device)
+        critic = TwinC51Critic(
+            state_dim,
+            action_dim,
+            cfg=DistributionalCriticCfg(
+                hidden_dim=ARGS.hidden_dim,
+                num_atoms=ARGS.num_atoms,
+                value_min=ARGS.value_min,
+                value_max=ARGS.value_max,
+            ),
+        ).to(device)
         target_critic = TargetTwinC51Critic.from_online(critic)
         updater_type = C51SACUpdater
     else:
-        scalar_critic_cfg = ScalarCriticCfg(hidden_dim=ARGS.hidden_dim)
-        critic = TwinScalarCritic(observation_dim, action_dim, cfg=scalar_critic_cfg).to(device)
+        critic = TwinScalarCritic(
+            state_dim,
+            action_dim,
+            cfg=ScalarCriticCfg(hidden_dim=ARGS.hidden_dim),
+        ).to(device)
         target_critic = TargetTwinScalarCritic.from_online(critic)
         updater_type = SACUpdater
     temperature = EntropyTemperature(ARGS.initial_temperature).to(device)
@@ -111,21 +158,206 @@ def _build_updater(
         temperature=temperature,
         actor_optimizer=torch.optim.Adam(actor.parameters(), **optimizer_kwargs),
         critic_optimizer=torch.optim.Adam(critic.parameters(), **optimizer_kwargs),
-        temperature_optimizer=torch.optim.Adam(temperature.parameters(), lr=ARGS.learning_rate, betas=(0.9, 0.95)),
+        temperature_optimizer=torch.optim.Adam(
+            temperature.parameters(),
+            lr=ARGS.learning_rate,
+            betas=(0.9, 0.95),
+        ),
         discount=ARGS.discount,
         target_update_rate=ARGS.target_update_rate,
         target_entropy=ARGS.target_entropy,
     )
 
 
-def _metric_values(metric: object) -> tuple[float, ...]:
-    names = ("critic_loss", "actor_loss", "temperature_loss", "temperature", "target_q_mean")
-    return tuple(float(getattr(metric, name).item()) for name in names)
+def _build_normalizer(
+    observation_dim: int,
+    device: torch.device,
+) -> RunningObservationNormalizer | None:
+    if ARGS.disable_observation_normalization:
+        return None
+    return RunningObservationNormalizer(
+        observation_dim,
+        ObservationNormalizationCfg(
+            epsilon=ARGS.normalization_epsilon,
+            clip=ARGS.normalization_clip,
+        ),
+    ).to(device)
+
+
+def _build_components(
+    raw_env: object,
+    env: IsaacLabEnvAdapter,
+    *,
+    action_low: torch.Tensor,
+    action_high: torch.Tensor,
+) -> TrainingComponents:
+    observation_dim = int(raw_env.observation_space["policy"].shape[-1])
+    action_dim = int(raw_env.unwrapped.action_manager.total_action_dim)
+    device = env.device
+    update_cfg = ReplayUpdateCfg(
+        random_action_steps=ARGS.random_action_steps,
+        minimum_replay_size=ARGS.minimum_replay_size,
+        batch_size=ARGS.batch_size,
+        num_updates=ARGS.num_updates,
+    )
+    normalizer = _build_normalizer(observation_dim, device)
+
+    if ARGS.task == FASTSAC_BASELINE_TASK:
+        replay = TransitionReplayBuffer(
+            ReplayBufferSpec(
+                capacity=ARGS.replay_capacity,
+                observation_dim=observation_dim,
+                action_dim=action_dim,
+            ),
+            storage_device=ARGS.replay_storage_device,
+        )
+        updater = _build_sac_updater(
+            observation_dim,
+            action_dim,
+            device,
+            action_low=action_low,
+            action_high=action_high,
+        )
+        update_loop = FastSACReplayUpdateLoop(
+            replay,
+            updater,
+            update_cfg,
+            learner_device=device,
+            observation_normalizer=normalizer,
+        )
+        return TrainingComponents(
+            mode=TrainingMode.FASTSAC,
+            replay=replay,
+            updater=updater,
+            update_loop=update_loop,
+            collector=FastSACRolloutCollector(env, replay, update_loop),
+            normalizer=normalizer,
+        )
+
+    if ARGS.task != FASTWMR_TASK:
+        raise ValueError(f"Unsupported training task {ARGS.task!r}.")
+    interface = DEFAULT_INTERFACE_CFG
+    privileged_dim = int(raw_env.observation_space["privileged"].shape[-1])
+    actual_dimensions = (observation_dim, privileged_dim, action_dim)
+    expected_dimensions = (
+        interface.policy_observation_dim,
+        interface.reconstruction_target_dim,
+        interface.action_dim,
+    )
+    if actual_dimensions != expected_dimensions:
+        raise ValueError(
+            f"FastWMR environment dimensions are {actual_dimensions}, expected {expected_dimensions}."
+        )
+    replay = TransitionReplayBuffer(
+        ReplayBufferSpec.fastwmr(ARGS.replay_capacity),
+        storage_device=ARGS.replay_storage_device,
+    )
+    rollout_cache = EstimatorRolloutCache(
+        EstimatorRolloutCacheSpec.fastwmr(
+            ARGS.estimator_cache_steps,
+            env.num_envs,
+        ),
+        storage_device=ARGS.replay_storage_device,
+    )
+    estimator = WorldStateEstimator(
+        HistoryEncoder(
+            observation_dim,
+            hidden_dim=ARGS.estimator_hidden_dim,
+            num_layers=ARGS.estimator_num_layers,
+        ),
+        WorldStateDecoder(
+            ARGS.estimator_hidden_dim,
+            hidden_dim=ARGS.estimator_hidden_dim,
+        ),
+    ).to(device)
+    estimator_updater = EstimatorUpdater(
+        estimator,
+        torch.optim.Adam(
+            estimator.parameters(),
+            lr=ARGS.estimator_learning_rate,
+            betas=(0.9, 0.95),
+            weight_decay=ARGS.estimator_weight_decay,
+        ),
+    )
+    runtime = FastWMREstimatorRuntime(estimator, env.num_envs)
+    processor = FastWMRSequenceFeatureProcessor(
+        estimator_updater,
+        runtime,
+        rollout_cache,
+        observation_normalizer=normalizer,
+    )
+    updater = _build_sac_updater(
+        interface.control_feature_dim,
+        action_dim,
+        device,
+        action_low=action_low,
+        action_high=action_high,
+    )
+    update_loop = FastWMRSequenceUpdateLoop(
+        replay,
+        updater,
+        update_cfg,
+        SequenceReplayCfg(
+            batch_size=ARGS.sequence_batch_size,
+            burn_in_length=ARGS.burn_in_length,
+            learning_length=ARGS.learning_length,
+            require_episode_start=ARGS.require_episode_start,
+        ),
+        processor,
+        learner_device=device,
+        verify_gradient_boundaries=not ARGS.disable_gradient_boundary_checks,
+    )
+    return TrainingComponents(
+        mode=TrainingMode.FASTWMR,
+        replay=replay,
+        updater=updater,
+        update_loop=update_loop,
+        collector=FastWMRRolloutCollector(env, replay, update_loop),
+        normalizer=normalizer,
+        estimator_updater=estimator_updater,
+        runtime=runtime,
+        rollout_cache=rollout_cache,
+    )
+
+
+def _run_directory() -> Path:
+    if ARGS.resume is not None:
+        checkpoint_path = ARGS.resume.expanduser().resolve()
+        if checkpoint_path.parent.name == "checkpoints":
+            return checkpoint_path.parent.parent
+        return checkpoint_path.parent
+    run_name = ARGS.run_name
+    if run_name is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        mode = TrainingMode.FASTWMR if ARGS.task == FASTWMR_TASK else TrainingMode.FASTSAC
+        run_name = f"{timestamp}_{mode.value}"
+    return Path(ARGS.log_dir).expanduser().resolve() / run_name
+
+
+def _checkpoint_config(components: TrainingComponents) -> dict[str, object]:
+    return {
+        "mode": components.mode.value,
+        "arguments": vars(ARGS),
+    }
+
+
+def _save_checkpoint(
+    path: Path,
+    components: TrainingComponents,
+    config: dict[str, object],
+) -> Path:
+    return save_training_checkpoint(
+        path,
+        mode=components.mode,
+        sac_updater=components.updater,
+        update_loop=components.update_loop,
+        normalizer=components.normalizer,
+        estimator_updater=components.estimator_updater,
+        config=config,
+    )
 
 
 def run() -> None:
-    if ARGS.task != FASTSAC_BASELINE_TASK:
-        raise ValueError(f"Stage-2 runner currently supports only {FASTSAC_BASELINE_TASK!r}.")
     torch.manual_seed(ARGS.seed)
     cfg = parse_env_cfg(ARGS.task, device=ARGS.device, num_envs=ARGS.num_envs)
     cfg.seed = ARGS.seed
@@ -136,92 +368,175 @@ def run() -> None:
 
     raw_env = gym.make(ARGS.task, cfg=cfg)
     env = IsaacLabEnvAdapter(raw_env)
+    logger: TrainingMetricsLogger | None = None
     try:
-        observation_dim = int(raw_env.observation_space["policy"].shape[-1])
         action_dim = int(raw_env.unwrapped.action_manager.total_action_dim)
-        learner_device = env.device
         if ARGS.disable_joint_limit_action_bounds:
-            action_low = torch.full((action_dim,), -1.0, device=learner_device)
-            action_high = torch.full((action_dim,), 1.0, device=learner_device)
+            action_low = torch.full((action_dim,), -1.0, device=env.device)
+            action_high = torch.full((action_dim,), 1.0, device=env.device)
         else:
-            action_bounds = env.joint_position_action_bounds(use_soft_limits=ARGS.use_soft_joint_limits)
+            action_bounds = env.joint_position_action_bounds(
+                use_soft_limits=ARGS.use_soft_joint_limits
+            )
             action_low = action_bounds.low
             action_high = action_bounds.high
-        replay = TransitionReplayBuffer(
-            ReplayBufferSpec(
-                capacity=ARGS.replay_capacity,
-                observation_dim=observation_dim,
-                action_dim=action_dim,
-            ),
-            storage_device=ARGS.replay_storage_device,
-        )
-        updater = _build_updater(
-            observation_dim,
-            action_dim,
-            learner_device,
+        components = _build_components(
+            raw_env,
+            env,
             action_low=action_low,
             action_high=action_high,
         )
-        update_cfg = ReplayUpdateCfg(
-            random_action_steps=ARGS.random_action_steps,
-            minimum_replay_size=ARGS.minimum_replay_size,
-            batch_size=ARGS.batch_size,
-            num_updates=ARGS.num_updates,
-        )
-        normalizer = None
-        if not ARGS.disable_observation_normalization:
-            normalizer = RunningObservationNormalizer(
-                observation_dim,
-                ObservationNormalizationCfg(
-                    epsilon=ARGS.normalization_epsilon,
-                    clip=ARGS.normalization_clip,
-                ),
-            ).to(learner_device)
-        update_loop = FastSACReplayUpdateLoop(
-            replay,
-            updater,
-            update_cfg,
-            learner_device=learner_device,
-            observation_normalizer=normalizer,
-        )
-        collector = FastSACRolloutCollector(env, replay, update_loop)
-        collector.reset(seed=ARGS.seed)
+        run_directory = _run_directory()
+        checkpoints_directory = run_directory / "checkpoints"
+        config = _checkpoint_config(components)
 
-        last_metric = None
-        reward_sum = 0.0
-        done_count = 0
+        if ARGS.resume is not None:
+            resumed = load_training_checkpoint(
+                ARGS.resume,
+                mode=components.mode,
+                sac_updater=components.updater,
+                update_loop=components.update_loop,
+                normalizer=components.normalizer,
+                estimator_updater=components.estimator_updater,
+                runtime=components.runtime,
+                rollout_cache=components.rollout_cache,
+                map_location=env.device,
+            )
+            print(
+                f"[{components.mode.value}] resumed {resumed.path} at "
+                f"environment_step={resumed.counters.environment_steps} "
+                f"gradient_step={resumed.counters.gradient_steps}"
+            )
+            initial_snapshot = run_directory / "config_snapshot.json"
+            if not initial_snapshot.exists():
+                write_config_snapshot(initial_snapshot, resumed.config)
+            resume_snapshot = (
+                run_directory
+                / f"resume_config_snapshot_step_{resumed.counters.environment_steps:09d}.json"
+            )
+            write_config_snapshot(resume_snapshot, config)
+        else:
+            write_config_snapshot(run_directory / "config_snapshot.json", config)
+        logger = TrainingMetricsLogger(
+            run_directory,
+            mode=components.mode.value,
+            append=ARGS.resume is not None,
+        )
+
+        components.collector.reset(seed=ARGS.seed)
+        episode_tracker = EpisodeStatisticsTracker(env.num_envs, device=env.device)
         generator = torch.Generator(device="cpu").manual_seed(ARGS.seed)
-        for step_index in range(ARGS.steps):
-            result = collector.collect_step(generator=generator)
-            reward_sum += float(result.rewards.mean().item())
-            done_count += int((result.terminated | result.truncated).sum().item())
+        initial_gradient_steps = components.update_loop.gradient_steps
+        interval_reward_sum = 0.0
+        interval_steps = 0
+        interval_completed = 0
+        interval_return_sum = 0.0
+        interval_length_sum = 0
+        last_sac_metrics = None
+        last_agent_update = None
+
+        for local_step in range(ARGS.steps):
+            result = components.collector.collect_step(generator=generator)
+            interval_reward_sum += float(result.rewards.mean().item())
+            interval_steps += 1
+            completed = episode_tracker.update(
+                result.rewards,
+                result.terminated,
+                result.truncated,
+            )
+            interval_completed += completed.count
+            interval_return_sum += completed.return_sum
+            interval_length_sum += completed.length_sum
             if result.updates:
-                last_metric = result.updates[-1]
-                if not all(math.isfinite(value) for value in _metric_values(last_metric)):
-                    raise FloatingPointError("FastSAC update produced a non-finite metric.")
-            if (step_index + 1) % ARGS.log_interval == 0 or step_index + 1 == ARGS.steps:
-                metric_text = "waiting-for-replay"
-                if last_metric is not None:
-                    values = _metric_values(last_metric)
-                    metric_text = f"critic={values[0]:.4f} actor={values[1]:.4f} alpha={values[3]:.6f}"
-                print(
-                    f"[FastSAC:{ARGS.critic_type}] step={step_index + 1}/{ARGS.steps} replay={len(replay)} "
-                    f"updates={update_loop.gradient_steps} reward={reward_sum / (step_index + 1):.4f} {metric_text}"
-                )
+                last_sac_metrics = result.updates[-1]
+            if (
+                isinstance(components.update_loop, FastWMRSequenceUpdateLoop)
+                and components.update_loop.last_agent_updates
+            ):
+                last_agent_update = components.update_loop.last_agent_updates[-1]
+
+            global_step = components.update_loop.environment_steps
+            if ARGS.checkpoint_interval > 0 and global_step % ARGS.checkpoint_interval == 0:
+                checkpoint_path = checkpoints_directory / f"step_{global_step:09d}.pt"
+                _save_checkpoint(checkpoint_path, components, config)
+                print(f"[{components.mode.value}] checkpoint={checkpoint_path}")
+
+            if global_step % ARGS.log_interval == 0 or local_step + 1 == ARGS.steps:
+                metrics: dict[str, int | float] = {
+                    "rollout/reward_mean": interval_reward_sum / interval_steps,
+                    "rollout/completed_episodes": interval_completed,
+                    "replay/size": len(components.replay),
+                    "replay/total_inserted": components.replay.total_inserted,
+                    "replay/overwritten": max(
+                        0,
+                        components.replay.total_inserted - len(components.replay),
+                    ),
+                    "learner/environment_steps": global_step,
+                    "learner/gradient_steps": components.update_loop.gradient_steps,
+                }
+                oldest_insertion_id = components.replay.oldest_insertion_id
+                newest_insertion_id = components.replay.newest_insertion_id
+                if oldest_insertion_id is not None and newest_insertion_id is not None:
+                    metrics.update(
+                        {
+                            "replay/oldest_age": newest_insertion_id - oldest_insertion_id,
+                            "replay/newest_insertion_id": newest_insertion_id,
+                        }
+                    )
+                oldest_estimator_version = components.replay.oldest_estimator_version
+                newest_estimator_version = components.replay.newest_estimator_version
+                if oldest_estimator_version is not None and newest_estimator_version is not None:
+                    metrics.update(
+                        {
+                            "replay/oldest_estimator_version": oldest_estimator_version,
+                            "replay/newest_estimator_version": newest_estimator_version,
+                        }
+                    )
+                if interval_completed:
+                    metrics["episode/return_mean"] = interval_return_sum / interval_completed
+                    metrics["episode/length_mean"] = interval_length_sum / interval_completed
+                if last_sac_metrics is not None:
+                    metrics.update(sac_metrics_dict(last_sac_metrics))
+                if last_agent_update is not None:
+                    metrics.update(fastwmr_agent_metrics_dict(last_agent_update))
+                if components.runtime is not None:
+                    metrics.update(
+                        {
+                            "runtime/hidden_norm": components.runtime.hidden_norm,
+                            "runtime/rebuilds": components.runtime.rebuilds,
+                            "runtime/estimator_version": components.runtime.estimator_version,
+                        }
+                    )
+                if components.rollout_cache is not None:
+                    metrics["estimator_cache/steps"] = len(components.rollout_cache)
+                record = logger.log(global_step, metrics)
+                print(format_console_metrics(record))
+                interval_reward_sum = 0.0
+                interval_steps = 0
+                interval_completed = 0
+                interval_return_sum = 0.0
+                interval_length_sum = 0
+
+        if not ARGS.disable_final_checkpoint:
+            final_step = components.update_loop.environment_steps
+            checkpoint_path = checkpoints_directory / f"final_step_{final_step:09d}.pt"
+            _save_checkpoint(checkpoint_path, components, config)
+            print(f"[{components.mode.value}] final_checkpoint={checkpoint_path}")
 
         expected_insertions = ARGS.steps * ARGS.num_envs
-        if replay.total_inserted != expected_insertions:
-            raise AssertionError(f"Replay inserted {replay.total_inserted}, expected {expected_insertions} transitions.")
-        if update_loop.gradient_steps == 0:
-            raise AssertionError("Smoke run finished without a gradient update.")
+        if components.replay.total_inserted != expected_insertions:
+            raise AssertionError(
+                f"Replay inserted {components.replay.total_inserted}, expected {expected_insertions}."
+            )
+        completed_updates = components.update_loop.gradient_steps - initial_gradient_steps
         print(
-            f"[FastSAC:{ARGS.critic_type}] PASS transitions={replay.total_inserted} retained={len(replay)} "
-            f"gradient_steps={update_loop.gradient_steps} done={done_count} "
-            f"normalizer_samples={normalizer.samples_seen if normalizer is not None else 0} "
-            f"action_scale=[{updater.actor.action_scale.min().item():.3f},"
-            f"{updater.actor.action_scale.max().item():.3f}]"
+            f"[{components.mode.value}] PASS transitions={components.replay.total_inserted} "
+            f"retained={len(components.replay)} new_gradient_steps={completed_updates} "
+            f"normalizer_samples={components.normalizer.samples_seen if components.normalizer is not None else 0}"
         )
     finally:
+        if logger is not None:
+            logger.close()
         env.close()
 
 

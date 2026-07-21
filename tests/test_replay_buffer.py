@@ -24,6 +24,8 @@ def _base_transition(start: int, count: int, observation_dim: int = 3, action_di
 
 def test_fastsac_replay_wraps_and_keeps_newest_transitions() -> None:
     buffer = TransitionReplayBuffer(ReplayBufferSpec(capacity=5, observation_dim=3, action_dim=2))
+    assert buffer.oldest_insertion_id is None
+    assert buffer.newest_insertion_id is None
 
     buffer.add(**_base_transition(0, 3))
     buffer.add(**_base_transition(3, 4))
@@ -32,6 +34,10 @@ def test_fastsac_replay_wraps_and_keeps_newest_transitions() -> None:
     assert len(buffer) == 5
     assert buffer.is_full
     assert buffer.total_inserted == 7
+    assert buffer.oldest_insertion_id == 2
+    assert buffer.newest_insertion_id == 6
+    assert buffer.oldest_estimator_version is None
+    assert buffer.newest_estimator_version is None
     assert torch.equal(retained.rewards, torch.arange(2, 7, dtype=torch.float32))
     assert torch.equal(retained.insertion_ids, torch.arange(2, 7))
     assert retained.privileged_states.shape == (5, 0)
@@ -94,6 +100,8 @@ def test_fastwmr_replay_preserves_every_extended_field() -> None:
     assert retained.control_features.shape == (2, 5)
     assert retained.next_control_features.shape == (2, 5)
     assert torch.equal(retained.estimator_versions, torch.tensor([7, 8]))
+    assert buffer.oldest_estimator_version == 7
+    assert buffer.newest_estimator_version == 8
     assert torch.equal(retained.episode_ids, torch.tensor([11, 12]))
     assert torch.equal(retained.env_ids, torch.tensor([0, 1]))
     assert torch.equal(retained.timesteps, torch.tensor([4, 9]))
@@ -140,3 +148,9 @@ def test_oversized_insert_retains_only_capacity_newest_values() -> None:
     assert torch.equal(retained.rewards, torch.tensor([2.0, 3.0, 4.0]))
     assert buffer.total_inserted == 5
     assert torch.equal(retained.insertion_ids, torch.tensor([2, 3, 4]))
+
+    buffer.reset()
+
+    assert len(buffer) == 0
+    assert buffer.total_inserted == 0
+    assert buffer.oldest_insertion_id is None

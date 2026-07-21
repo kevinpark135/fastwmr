@@ -75,7 +75,8 @@ class SACTransitionBatch:
             raise ValueError("Every SAC transition field must be on the same device.")
         if self.states.requires_grad or self.next_states.requires_grad:
             raise ValueError("SAC replay features must be detached before constructing a batch.")
-        if not all(torch.isfinite(tensor).all() for tensor in (self.states, self.actions, self.rewards, self.next_states)):
+        finite_tensors = (self.states, self.actions, self.rewards, self.next_states)
+        if not all(torch.isfinite(tensor).all() for tensor in finite_tensors):
             raise ValueError("SAC transition floating-point fields must be finite.")
 
     @classmethod
@@ -171,8 +172,11 @@ class SACUpdateMetrics:
     temperature_loss: torch.Tensor
     temperature: torch.Tensor
     target_q_mean: torch.Tensor
+    target_q_std: torch.Tensor
     q1_mean: torch.Tensor
+    q1_std: torch.Tensor
     q2_mean: torch.Tensor
+    q2_std: torch.Tensor
     policy_entropy: torch.Tensor
 
 
@@ -413,8 +417,11 @@ class SACUpdater:
             temperature_loss=alpha_loss.detach(),
             temperature=self.temperature().detach(),
             target_q_mean=critic_output.target.mean().detach(),
+            target_q_std=critic_output.target.std(unbiased=False).detach(),
             q1_mean=critic_output.q1.mean().detach(),
+            q1_std=critic_output.q1.std(unbiased=False).detach(),
             q2_mean=critic_output.q2.mean().detach(),
+            q2_std=critic_output.q2.std(unbiased=False).detach(),
             policy_entropy=(-actor_output.log_probabilities.mean()).detach(),
         )
 
