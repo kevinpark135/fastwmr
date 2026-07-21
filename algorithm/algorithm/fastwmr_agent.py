@@ -3,16 +3,111 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import torch
 
-from ..buffers import SequenceReplayBatch, TransitionReplayBuffer
-from ..config import ReplayUpdateCfg, SequenceReplayCfg
+from ..buffers import EstimatorRolloutCache, SequenceReplayBatch, TransitionReplayBuffer
+from ..config import (
+    DEFAULT_INTERFACE_CFG,
+    FastWMRInterfaceCfg,
+    ReplayUpdateCfg,
+    SequenceReplayCfg,
+)
+from ..utils.feature_builder import build_control_feature
 from ..utils.normalization import RunningObservationNormalizer
+from .estimator_update import EstimatorUpdateResult, EstimatorUpdater
 from .sac_update import SACFeatureSource, SACTransitionBatch, SACUpdateMetrics, SACUpdater
+
+if TYPE_CHECKING:
+    from .rollout_worker import EstimatorRuntimeRebuild, FastWMREstimatorRuntime
 
 
 SequenceFeatureProcessor = Callable[[SequenceReplayBatch], torch.Tensor]
+
+
+class FastWMRSequenceFeatureProcessor:
+    """Update the estimator and rebuild detached SAC features from raw replay.
+
+    Every call performs three synchronized operations: optimize the estimator
+    on a boundary-safe replay sequence, re-infer that sequence with the new
+    parameters, and rebuild online recurrent memory from the recent rollout
+    cache. The policy observation can be normalized for SAC without changing
+    the raw observation history seen by the recurrent estimator.
+    """
+
+    def __init__(
+        self,
+        estimator_updater: EstimatorUpdater,
+        runtime: "FastWMREstimatorRuntime",
+        rollout_cache: EstimatorRolloutCache,
+        *,
+        interface: FastWMRInterfaceCfg = DEFAULT_INTERFACE_CFG,
+        observation_normalizer: RunningObservationNormalizer | None = None,
+    ) -> None:
+        if estimator_updater.estimator is not runtime.estimator:
+            raise ValueError("Estimator updater and runtime must share the estimator instance.")
+        if estimator_updater.observation_transform is not runtime.observation_transform:
+            raise ValueError("Estimator updater and runtime must share the observation transform.")
+        if estimator_updater.interface != interface:
+            raise ValueError("Estimator updater and sequence processor must share the interface contract.")
+        if estimator_updater.version != runtime.estimator_version:
+            raise ValueError("Estimator updater and runtime versions must match before integration.")
+        if rollout_cache.spec.num_envs != runtime.num_envs:
+            raise ValueError("Estimator rollout cache and runtime environment counts must match.")
+        if rollout_cache.spec.observation_dim != interface.policy_observation_dim:
+            raise ValueError("Estimator rollout cache observation width does not match the interface.")
+        if rollout_cache.spec.privileged_state_dim != interface.reconstruction_target_dim:
+            raise ValueError("Estimator rollout cache target width does not match the interface.")
+        if observation_normalizer is not None:
+            if observation_normalizer.observation_dim != interface.policy_observation_dim:
+                raise ValueError("Observation normalizer width does not match the policy observation.")
+            parameter = next(estimator_updater.estimator.parameters())
+            if observation_normalizer.mean.device != parameter.device:
+                raise ValueError("Observation normalizer and estimator must share a device.")
+
+        self.estimator_updater = estimator_updater
+        self.runtime = runtime
+        self.rollout_cache = rollout_cache
+        self.interface = interface
+        self.observation_normalizer = observation_normalizer
+        self.updates = 0
+        self.last_estimator_update: EstimatorUpdateResult | None = None
+        self.last_runtime_rebuild: EstimatorRuntimeRebuild | None = None
+
+    def __call__(self, sequence: SequenceReplayBatch) -> torch.Tensor:
+        parameter = next(self.estimator_updater.estimator.parameters())
+        if sequence.observations.device != parameter.device:
+            raise ValueError("Replay sequence and estimator must share a device.")
+        if sequence.observations.dtype != parameter.dtype:
+            raise ValueError("Replay sequence and estimator must share a floating dtype.")
+
+        estimator_update = self.estimator_updater.update_sequence(sequence)
+        reconstructions = self.estimator_updater.reconstruct_sequence(sequence)
+        if len(self.rollout_cache) > 0:
+            runtime_rebuild = self.runtime.rebuild_from_cache(
+                self.rollout_cache,
+                estimator_version=estimator_update.metrics.estimator_version,
+            )
+        else:
+            self.runtime.reset_all(
+                estimator_version=estimator_update.metrics.estimator_version,
+            )
+            runtime_rebuild = None
+
+        features = build_control_feature(
+            sequence.learning_observations,
+            reconstructions,
+            cfg=self.interface,
+            normalizer=self.observation_normalizer,
+        ).detach()
+        if not torch.isfinite(features).all():
+            raise FloatingPointError("Current-estimator control features must remain finite.")
+
+        self.last_estimator_update = estimator_update
+        self.last_runtime_rebuild = runtime_rebuild
+        self.updates += 1
+        return features
 
 
 class FastSACReplayUpdateLoop:

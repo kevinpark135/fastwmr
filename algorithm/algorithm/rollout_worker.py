@@ -11,10 +11,16 @@ from ..buffers import (
     EstimatorRolloutCache,
     TransitionReplayBuffer,
 )
+from ..config import DEFAULT_INTERFACE_CFG, FastWMRInterfaceCfg
 from ..utils.env_wrapper import IsaacLabEnvAdapter
+from ..utils.feature_builder import build_control_feature
 from ..utils.temporal_state import RecurrentState, RecurrentStateManager
 from .estimator_update import EstimatorUpdateResult, EstimatorUpdater, WorldStateEstimator
-from .fastwmr_agent import FastSACReplayUpdateLoop
+from .fastwmr_agent import (
+    FastSACReplayUpdateLoop,
+    FastWMRSequenceFeatureProcessor,
+    FastWMRSequenceUpdateLoop,
+)
 from .sac_update import SACUpdateMetrics
 
 
@@ -26,6 +32,18 @@ class RolloutStepResult:
     terminated: torch.Tensor
     truncated: torch.Tensor
     updates: tuple[SACUpdateMetrics, ...]
+
+
+@dataclass(frozen=True)
+class FastWMRRolloutStepResult:
+    """Diagnostics from one integrated estimator and SAC collection step."""
+
+    rewards: torch.Tensor
+    terminated: torch.Tensor
+    truncated: torch.Tensor
+    updates: tuple[SACUpdateMetrics, ...]
+    estimator_updates: int
+    estimator_version: int
 
 
 @dataclass(frozen=True)
@@ -99,6 +117,7 @@ class FastWMREstimatorRuntime:
         self._estimator_version = estimator_version
         self._environment_steps = 0
         self._rebuilds = 0
+        self._last_reconstruction: torch.Tensor | None = None
 
     @property
     def state(self) -> RecurrentState:
@@ -107,6 +126,22 @@ class FastWMREstimatorRuntime:
     @property
     def estimator_version(self) -> int:
         return self._estimator_version
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
+
+    @property
+    def current_reconstruction(self) -> torch.Tensor:
+        """Reconstruction aligned with the runtime's current observation."""
+
+        if self._last_reconstruction is None:
+            raise RuntimeError("The estimator runtime has not processed an observation yet.")
+        return self._last_reconstruction
 
     @property
     def environment_steps(self) -> int:
@@ -151,7 +186,32 @@ class FastWMREstimatorRuntime:
         self._state.replace(next_state)
         reconstruction = reconstruction.detach()
         self._validate_reconstruction(reconstruction, expected_time=None)
+        self._last_reconstruction = reconstruction
         self._environment_steps += 1
+        return EstimatorRuntimeStep(
+            reconstruction=reconstruction,
+            estimator_version=self._estimator_version,
+            hidden_norm=self._state.hidden_norm,
+        )
+
+    @torch.no_grad()
+    def preview(self, observations: torch.Tensor) -> EstimatorRuntimeStep:
+        """Reconstruct successors without mutating recurrent runtime state.
+
+        Auto-reset environments expose terminal observations separately from
+        the returned post-reset observations. This preview uses the pre-reset
+        recurrent context for those terminal values while leaving the online
+        state ready to process the actual next observation.
+        """
+
+        self._validate_observations(observations)
+        transformed = self._transform(observations)
+        reconstruction, _ = self.estimator.forward_rollout(
+            transformed,
+            self._state.state,
+        )
+        reconstruction = reconstruction.detach()
+        self._validate_reconstruction(reconstruction, expected_time=None)
         return EstimatorRuntimeStep(
             reconstruction=reconstruction,
             estimator_version=self._estimator_version,
@@ -165,7 +225,10 @@ class FastWMREstimatorRuntime:
     ) -> RecurrentState:
         """Clear only environments whose current episode has ended."""
 
-        return self._state.reset_done(terminated, truncated)
+        state = self._state.reset_done(terminated, truncated)
+        if torch.any(terminated | truncated):
+            self._last_reconstruction = None
+        return state
 
     def detach_state(self) -> RecurrentState:
         """Explicit collection-chunk graph boundary."""
@@ -179,6 +242,7 @@ class FastWMREstimatorRuntime:
             if estimator_version < self._estimator_version:
                 raise ValueError("estimator_version cannot move backwards.")
             self._estimator_version = estimator_version
+        self._last_reconstruction = None
         return self._state.clear()
 
     @torch.no_grad()
@@ -218,6 +282,9 @@ class FastWMREstimatorRuntime:
             expected_time=batch.sequence_length,
         )
         final_state = self._state.replace(state)
+        self._last_reconstruction = reconstructions[:, -1]
+        if final_reset_mask is not None and torch.any(final_reset_mask):
+            self._last_reconstruction = None
         self._estimator_version = estimator_version
         self._rebuilds += 1
         return EstimatorRuntimeRebuild(
@@ -407,3 +474,236 @@ class FastSACRolloutCollector:
         expected = (self.env.num_envs, self.replay.spec.observation_dim)
         if observations.shape != expected:
             raise ValueError(f"Policy observation shape must be {expected}, got {tuple(observations.shape)}.")
+
+
+class FastWMRRolloutCollector:
+    """Collect full FastWMR transitions and keep online memory synchronized.
+
+    Raw proprioception and privileged targets are recorded for replay-time
+    estimator training. Actor and critics only receive the detached 109D
+    control feature. On auto-reset, terminal reconstruction is previewed from
+    the old recurrent context before completed environment slices are reset.
+    """
+
+    def __init__(
+        self,
+        env: IsaacLabEnvAdapter,
+        replay: TransitionReplayBuffer,
+        update_loop: FastWMRSequenceUpdateLoop,
+        *,
+        interface: FastWMRInterfaceCfg = DEFAULT_INTERFACE_CFG,
+    ) -> None:
+        if replay is not update_loop.replay:
+            raise ValueError("Collector and update loop must share the same replay buffer.")
+        processor = update_loop.sequence_feature_processor
+        if not isinstance(processor, FastWMRSequenceFeatureProcessor):
+            raise TypeError(
+                "FastWMRRolloutCollector requires FastWMRSequenceFeatureProcessor "
+                "to synchronize estimator updates."
+            )
+        if processor.interface != interface:
+            raise ValueError("Collector and sequence processor must share the interface contract.")
+        expected_dimensions = (
+            interface.policy_observation_dim,
+            interface.action_dim,
+            interface.reconstruction_target_dim,
+            interface.control_feature_dim,
+        )
+        replay_dimensions = (
+            replay.spec.observation_dim,
+            replay.spec.action_dim,
+            replay.spec.privileged_state_dim,
+            replay.spec.control_feature_dim,
+        )
+        if replay_dimensions != expected_dimensions or not replay.spec.require_temporal_metadata:
+            raise ValueError("FastWMR collector requires the complete FastWMR replay contract.")
+        if update_loop.updater.actor.input_dim != interface.actor_input_dim:
+            raise ValueError("FastWMR actor input width does not match the control feature contract.")
+        if update_loop.updater.actor.action_dim != interface.action_dim:
+            raise ValueError("FastWMR actor action width does not match the interface contract.")
+        if processor.runtime.num_envs != env.num_envs:
+            raise ValueError("Environment and estimator runtime environment counts must match.")
+        if processor.runtime.device != env.device:
+            raise ValueError("Environment and estimator runtime must share a device.")
+        actor_device = next(update_loop.updater.actor.parameters()).device
+        if actor_device != processor.runtime.device or update_loop.learner_device != actor_device:
+            raise ValueError("Actor, learner, and estimator runtime must share a device.")
+
+        self.env = env
+        self.replay = replay
+        self.update_loop = update_loop
+        self.processor = processor
+        self.runtime = processor.runtime
+        self.rollout_cache = processor.rollout_cache
+        self.interface = interface
+        self._observations: dict[str, torch.Tensor] | None = None
+        self._episode_ids: torch.Tensor | None = None
+        self._timesteps: torch.Tensor | None = None
+        self._reset_boundaries: torch.Tensor | None = None
+        self._env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.int64)
+
+    def reset(self, *, seed: int | None = None) -> torch.Tensor:
+        """Reset the environment and initialize every recurrent context."""
+
+        observations, _ = self.env.reset(seed=seed)
+        policy, privileged = self._observation_groups(observations)
+        if self._episode_ids is None:
+            episode_id = 0
+        else:
+            episode_id = int(self._episode_ids.max().item()) + 1
+        self._episode_ids = torch.full_like(self._env_ids, episode_id)
+        self._timesteps = torch.zeros_like(self._env_ids)
+        self._reset_boundaries = torch.ones(
+            self.env.num_envs,
+            device=self.env.device,
+            dtype=torch.bool,
+        )
+
+        self.rollout_cache.clear()
+        self.runtime.reset_all(estimator_version=self.processor.estimator_updater.version)
+        self._update_observation_statistics(policy)
+        self.rollout_cache.add(policy, privileged, self._reset_boundaries)
+        runtime_step = self.runtime.step(
+            policy,
+            reset_boundaries=self._reset_boundaries,
+            expected_estimator_version=self.processor.estimator_updater.version,
+        )
+        self._observations = observations
+        return self._build_control_feature(policy, runtime_step.reconstruction)
+
+    def collect_step(
+        self,
+        *,
+        deterministic: bool = False,
+        generator: torch.Generator | None = None,
+    ) -> FastWMRRolloutStepResult:
+        if (
+            self._observations is None
+            or self._episode_ids is None
+            or self._timesteps is None
+            or self._reset_boundaries is None
+        ):
+            raise RuntimeError("Call reset() before collecting FastWMR transitions.")
+
+        observations, privileged = self._observation_groups(self._observations)
+        control_features = self._build_control_feature(
+            observations,
+            self.runtime.current_reconstruction,
+        )
+        estimator_versions = torch.full_like(
+            self._env_ids,
+            self.runtime.estimator_version,
+        )
+        actions = self.update_loop.select_actions(
+            control_features,
+            deterministic=deterministic,
+        )
+        step = self.env.step(actions)
+        next_observations, next_privileged = self._observation_groups(step.observations)
+        final_observations, final_privileged = self._observation_groups(step.final_observations)
+
+        # Preview terminal successors before reset, then advance returned
+        # post-reset observations with only completed environment slices zeroed.
+        done = step.terminated | step.truncated
+        if torch.any(done):
+            final_reconstruction = self.runtime.preview(final_observations).reconstruction
+            final_control_features = self._build_control_feature(
+                final_observations,
+                final_reconstruction,
+            )
+        else:
+            final_control_features = torch.zeros_like(control_features)
+        self._update_observation_statistics(next_observations)
+        self.rollout_cache.add(next_observations, next_privileged, done)
+        next_runtime_step = self.runtime.step(
+            next_observations,
+            reset_boundaries=done,
+            expected_estimator_version=self.processor.estimator_updater.version,
+        )
+        next_control_features = self._build_control_feature(
+            next_observations,
+            next_runtime_step.reconstruction,
+        )
+
+        self.replay.add(
+            observations=observations,
+            actions=actions,
+            rewards=step.rewards,
+            next_observations=next_observations,
+            terminated=step.terminated,
+            truncated=step.truncated,
+            privileged_states=privileged,
+            next_privileged_states=next_privileged,
+            control_features=control_features,
+            next_control_features=next_control_features,
+            estimator_versions=estimator_versions,
+            episode_ids=self._episode_ids,
+            env_ids=self._env_ids,
+            timesteps=self._timesteps,
+            reset_boundaries=self._reset_boundaries,
+            final_observations=final_observations,
+            final_privileged_states=final_privileged,
+            final_control_features=final_control_features,
+            final_observation_mask=step.final_observation_mask,
+        )
+
+        self._observations = step.observations
+        self._episode_ids = self._episode_ids + done.to(dtype=torch.int64)
+        self._timesteps = torch.where(done, torch.zeros_like(self._timesteps), self._timesteps + 1)
+        self._reset_boundaries = done
+        self.update_loop.advance_environment()
+        previous_estimator_updates = self.processor.updates
+        updates = tuple(self.update_loop.run_updates(generator=generator))
+        return FastWMRRolloutStepResult(
+            rewards=step.rewards.detach(),
+            terminated=step.terminated.detach(),
+            truncated=step.truncated.detach(),
+            updates=updates,
+            estimator_updates=self.processor.updates - previous_estimator_updates,
+            estimator_version=self.runtime.estimator_version,
+        )
+
+    def _observation_groups(
+        self,
+        observation_groups: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        policy = self.env.policy_observation(observation_groups)
+        privileged = self.env.privileged_observation(observation_groups)
+        expected_policy = (self.env.num_envs, self.interface.policy_observation_dim)
+        expected_privileged = (self.env.num_envs, self.interface.reconstruction_target_dim)
+        if policy.shape != expected_policy:
+            raise ValueError(
+                f"Policy observation shape must be {expected_policy}, got {tuple(policy.shape)}."
+            )
+        if privileged.shape != expected_privileged:
+            raise ValueError(
+                f"Privileged observation shape must be {expected_privileged}, "
+                f"got {tuple(privileged.shape)}."
+            )
+        if policy.device != self.runtime.device or privileged.device != self.runtime.device:
+            raise ValueError("FastWMR observation groups must be on the runtime device.")
+        if policy.dtype != self.runtime.dtype or privileged.dtype != self.runtime.dtype:
+            raise ValueError("FastWMR observation groups must match the estimator dtype.")
+        if not torch.isfinite(policy).all() or not torch.isfinite(privileged).all():
+            raise ValueError("FastWMR observation groups must remain finite.")
+        return policy, privileged
+
+    def _update_observation_statistics(self, observations: torch.Tensor) -> None:
+        normalizer = self.processor.observation_normalizer
+        if normalizer is not None:
+            normalizer.update(observations)
+
+    def _build_control_feature(
+        self,
+        observations: torch.Tensor,
+        reconstruction: torch.Tensor,
+    ) -> torch.Tensor:
+        features = build_control_feature(
+            observations,
+            reconstruction,
+            cfg=self.interface,
+            normalizer=self.processor.observation_normalizer,
+        ).detach()
+        if not torch.isfinite(features).all():
+            raise FloatingPointError("FastWMR rollout control features must remain finite.")
+        return features

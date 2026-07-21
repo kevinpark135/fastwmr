@@ -85,6 +85,28 @@ def test_long_rollout_does_not_retain_an_autograd_graph() -> None:
     assert math.isfinite(runtime.hidden_norm)
 
 
+def test_preview_reconstructs_successor_without_mutating_online_state() -> None:
+    torch.manual_seed(211)
+    runtime = FastWMREstimatorRuntime(_estimator(), num_envs=2)
+    current = runtime.step(
+        torch.randn(2, DEFAULT_INTERFACE_CFG.policy_observation_dim)
+    )
+    hidden_before = runtime.state.hidden.clone()
+    cell_before = runtime.state.cell.clone()
+    steps_before = runtime.environment_steps
+
+    preview = runtime.preview(
+        torch.randn(2, DEFAULT_INTERFACE_CFG.policy_observation_dim)
+    )
+
+    assert preview.reconstruction.shape == current.reconstruction.shape
+    assert not preview.reconstruction.requires_grad
+    torch.testing.assert_close(runtime.state.hidden, hidden_before)
+    torch.testing.assert_close(runtime.state.cell, cell_before)
+    torch.testing.assert_close(runtime.current_reconstruction, current.reconstruction)
+    assert runtime.environment_steps == steps_before
+
+
 def test_reset_boundary_matches_fresh_zero_state_context() -> None:
     torch.manual_seed(22)
     estimator = _estimator()

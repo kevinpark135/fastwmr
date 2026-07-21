@@ -12,13 +12,20 @@ from .estimator_update import (
     burn_in_and_unroll,
     compute_estimator_loss,
 )
-from .fastwmr_agent import FastSACReplayUpdateLoop, FastWMRSequenceUpdateLoop, SequenceFeatureProcessor
+from .fastwmr_agent import (
+    FastSACReplayUpdateLoop,
+    FastWMRSequenceFeatureProcessor,
+    FastWMRSequenceUpdateLoop,
+    SequenceFeatureProcessor,
+)
 from .rollout_worker import (
     EstimatorRuntimeRebuild,
     EstimatorRuntimeStep,
     EstimatorRuntimeUpdate,
     FastSACRolloutCollector,
     FastWMREstimatorRuntime,
+    FastWMRRolloutCollector,
+    FastWMRRolloutStepResult,
     RolloutStepResult,
 )
 from .sac_update import (
@@ -58,6 +65,9 @@ __all__ = [
     "FastSACReplayUpdateLoop",
     "FastSACRolloutCollector",
     "FastWMREstimatorRuntime",
+    "FastWMRRolloutCollector",
+    "FastWMRRolloutStepResult",
+    "FastWMRSequenceFeatureProcessor",
     "FastWMRSequenceUpdateLoop",
     "RecurrentSequenceEstimator",
     "RolloutStepResult",

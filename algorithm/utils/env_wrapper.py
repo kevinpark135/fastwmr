@@ -150,6 +150,21 @@ class IsaacLabEnvAdapter:
         return policy
 
     @staticmethod
+    def privileged_observation(observations: ObservationGroups) -> torch.Tensor:
+        """Return the simulator-only world-state reconstruction target."""
+
+        try:
+            privileged = observations["privileged"]
+        except KeyError as error:
+            raise KeyError("FastWMR observations must contain a 'privileged' group.") from error
+        if privileged.ndim != 2 or not privileged.dtype.is_floating_point:
+            raise ValueError(
+                "The privileged observation must be a floating tensor of shape "
+                "(num_envs, target_dim)."
+            )
+        return privileged
+
+    @staticmethod
     def _validate_observations(observations: Any, *, clone: bool = False) -> ObservationGroups:
         if not isinstance(observations, dict):
             raise TypeError("IsaacLab observations must be a dictionary of tensor groups.")

@@ -325,6 +325,45 @@ class EstimatorUpdater:
             sequence.context_is_exact,
         )
 
+    @torch.no_grad()
+    def reconstruct_sequence(self, sequence: SequenceReplayBatch) -> torch.Tensor:
+        """Re-infer a learning window with the estimator's current parameters.
+
+        This is intentionally separate from :meth:`update_sequence`: the
+        reconstruction returned by an optimizer step was produced before that
+        step. FastWMR's SAC path instead consumes features recomputed with the
+        newly updated estimator.
+        """
+
+        observations = sequence.observations
+        state = self.estimator.initial_state(
+            sequence.batch_size,
+            device=observations.device,
+            dtype=observations.dtype,
+        )
+        if sequence.burn_in_length > 0:
+            burn_in_observations = self._transform(sequence.burn_in_observations)
+            _, state = self.estimator.encoder.forward_sequence(burn_in_observations, state)
+        learning_observations = self._transform(sequence.learning_observations)
+        reconstruction, _ = self.estimator.forward_sequence(
+            learning_observations,
+            state.detach(),
+        )
+        reconstruction = reconstruction.detach()
+        expected_shape = (
+            sequence.batch_size,
+            sequence.learning_length + 1,
+            self.interface.reconstruction_target_dim,
+        )
+        if reconstruction.shape != expected_shape:
+            raise ValueError(
+                f"Current-estimator reconstruction must have shape {expected_shape}, "
+                f"got {tuple(reconstruction.shape)}."
+            )
+        if not torch.isfinite(reconstruction).all():
+            raise FloatingPointError("Current-estimator reconstruction must remain finite.")
+        return reconstruction
+
     def update_rollout(self, batch: EstimatorRolloutBatch) -> EstimatorUpdateResult:
         """Update from an ordered rollout while resetting asynchronous episodes."""
 
