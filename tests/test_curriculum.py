@@ -11,6 +11,7 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.curriculum 
     PENALTY_TARGET_WEIGHTS,
     penalty_curriculum_state,
     penalty_weight_curriculum,
+    terrain_curriculum_state,
 )
 
 
@@ -66,6 +67,27 @@ def test_penalty_curriculum_starts_weak_and_only_moves_up() -> None:
     unchanged = penalty_weight_curriculum(env, torch.tensor([0, 1]), **kwargs)
     assert unchanged["level"] == 2
     assert penalty_curriculum_state(env) == unchanged
+
+
+def test_terrain_curriculum_state_summarizes_vector_levels() -> None:
+    env = SimpleNamespace(
+        scene=SimpleNamespace(
+            terrain=SimpleNamespace(
+                terrain_levels=torch.tensor([0, 1, 2, 5]),
+                max_terrain_level=10,
+            )
+        )
+    )
+
+    state = terrain_curriculum_state(env)
+
+    assert state == {
+        "level_mean": pytest.approx(2.0),
+        "level_min": 0,
+        "level_max": 5,
+        "level_cap": 9,
+    }
+    assert terrain_curriculum_state(SimpleNamespace()) is None
 
 
 @pytest.mark.parametrize(

@@ -19,6 +19,7 @@ from .logging_utils import (
     TrainingMetricsLogger,
     fastwmr_agent_metrics_dict,
     format_console_metrics,
+    format_console_metrics_header,
     sac_metrics_dict,
 )
 from .normalization import RunningObservationNormalizer
@@ -49,6 +50,7 @@ __all__ = [
     "episode_end_mask",
     "fastwmr_agent_metrics_dict",
     "format_console_metrics",
+    "format_console_metrics_header",
     "load_evaluation_record",
     "sac_metrics_dict",
     "symmetric_joint_limit_action_bounds",

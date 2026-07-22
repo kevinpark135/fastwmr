@@ -160,6 +160,28 @@ def penalty_curriculum_state(env: object) -> dict[str, float | int] | None:
     return None if state is None else dict(state)
 
 
+def terrain_curriculum_state(env: object) -> dict[str, float | int] | None:
+    """Summarize the per-environment terrain levels for progress logging."""
+
+    scene = getattr(env, "scene", None)
+    terrain = getattr(scene, "terrain", None)
+    levels = getattr(terrain, "terrain_levels", None)
+    if not isinstance(levels, torch.Tensor) or levels.numel() == 0:
+        return None
+    max_terrain_level = getattr(terrain, "max_terrain_level", None)
+    level_cap = (
+        max(0, int(max_terrain_level) - 1)
+        if max_terrain_level is not None
+        else int(levels.max().item())
+    )
+    return {
+        "level_mean": float(levels.float().mean().item()),
+        "level_min": int(levels.min().item()),
+        "level_max": int(levels.max().item()),
+        "level_cap": level_cap,
+    }
+
+
 @configclass
 class FastWMRCurriculumCfg:
     """Terrain progression plus the shared FastSAC penalty curriculum."""

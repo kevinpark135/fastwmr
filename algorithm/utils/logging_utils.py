@@ -12,6 +12,23 @@ from pathlib import Path
 import torch
 
 
+_CONSOLE_HEADERS = (
+    "Step",
+    "Reward",
+    "Replay",
+    "Updates",
+    "Critic",
+    "Actor",
+    "Alpha",
+    "Estimator",
+    "Terr avg/max",
+    "Pen lvl/x",
+    "Elapsed",
+    "Ckpt",
+)
+_CONSOLE_WIDTHS = (8, 9, 9, 9, 8, 8, 9, 9, 12, 9, 8, 4)
+
+
 @dataclass(frozen=True)
 class CompletedEpisodeStatistics:
     """Episode aggregates completed during one vector-environment step."""
@@ -184,23 +201,93 @@ def fastwmr_agent_metrics_dict(update: object) -> dict[str, float | int]:
     return output
 
 
-def format_console_metrics(record: Mapping[str, int | float | str]) -> str:
-    """Return one compact progress line from a structured log record."""
+def format_console_metrics_header(mode: str) -> str:
+    """Return the title and fixed-width header for the training progress table."""
 
-    parts = [f"[{record['mode']}]", f"step={record['step']}"]
-    preferred = (
-        ("rollout/reward_mean", "reward", ".4f"),
-        ("replay/size", "replay", ".0f"),
-        ("learner/gradient_steps", "updates", ".0f"),
-        ("sac/critic_loss", "critic", ".4f"),
-        ("sac/actor_loss", "actor", ".4f"),
-        ("sac/temperature", "alpha", ".6f"),
-        ("estimator/total_loss", "estimator", ".4f"),
+    if not mode:
+        raise ValueError("Console metrics mode must not be empty.")
+    separator = _console_separator()
+    return "\n".join(
+        (
+            f"[{mode}] Training progress",
+            separator,
+            _console_row(_CONSOLE_HEADERS),
+            separator,
+        )
     )
-    for key, label, format_spec in preferred:
-        if key in record:
-            parts.append(f"{label}={format(float(record[key]), format_spec)}")
-    return " ".join(parts)
+
+
+def format_console_metrics(record: Mapping[str, int | float | str]) -> str:
+    """Return one fixed-width progress row followed by a visual separator."""
+
+    values = (
+        _format_count(record.get("step")),
+        _format_float(record.get("rollout/reward_mean"), ".4f"),
+        _format_count(record.get("replay/size")),
+        _format_count(record.get("learner/gradient_steps")),
+        _format_float(record.get("sac/critic_loss"), ".4f"),
+        _format_float(record.get("sac/actor_loss"), ".4f"),
+        _format_float(record.get("sac/temperature"), ".6f"),
+        _format_float(record.get("estimator/total_loss"), ".4f"),
+        _format_terrain_curriculum(record),
+        _format_penalty_curriculum(record),
+        _format_duration(record.get("learner/wallclock_seconds")),
+        "yes" if int(record.get("checkpoint/saved", 0)) else "",
+    )
+    return f"{_console_row(values)}\n{_console_separator()}"
+
+
+def _console_separator() -> str:
+    return "+" + "+".join("-" * (width + 2) for width in _CONSOLE_WIDTHS) + "+"
+
+
+def _console_row(values: tuple[str, ...]) -> str:
+    if len(values) != len(_CONSOLE_WIDTHS):
+        raise ValueError("Console table row does not match its configured columns.")
+    cells = (
+        f" {value:>{width}} "
+        for value, width in zip(values, _CONSOLE_WIDTHS, strict=True)
+    )
+    return "|" + "|".join(cells) + "|"
+
+
+def _format_count(value: object) -> str:
+    if value is None:
+        return "-"
+    return f"{int(value):,}"
+
+
+def _format_float(value: object, format_spec: str) -> str:
+    if value is None:
+        return "-"
+    return format(float(value), format_spec)
+
+
+def _format_terrain_curriculum(record: Mapping[str, int | float | str]) -> str:
+    mean = record.get("curriculum/terrain_level_mean")
+    maximum = record.get("curriculum/terrain_level_max")
+    if mean is None or maximum is None:
+        return "-"
+    return f"{float(mean):.2f}/{int(maximum)}"
+
+
+def _format_penalty_curriculum(record: Mapping[str, int | float | str]) -> str:
+    level = record.get("curriculum/penalty_level")
+    scale = record.get("curriculum/penalty_scale")
+    if level is None or scale is None:
+        return "-"
+    return f"{int(level)}/{float(scale):.2f}"
+
+
+def _format_duration(value: object) -> str:
+    if value is None:
+        return "-"
+    total_seconds = max(0, int(float(value)))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
 
 
 def _finite_scalars(metrics: Mapping[str, int | float]) -> dict[str, int | float]:

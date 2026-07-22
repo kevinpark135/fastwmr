@@ -13,6 +13,7 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.u
     TrainingMetricsLogger,
     fastwmr_agent_metrics_dict,
     format_console_metrics,
+    format_console_metrics_header,
 )
 
 
@@ -46,7 +47,18 @@ def test_episode_statistics_track_asynchronous_vector_resets() -> None:
 
 def test_training_logger_writes_flat_finite_jsonl_and_appends(tmp_path) -> None:
     with TrainingMetricsLogger(tmp_path, mode="fastwmr") as logger:
-        record = logger.log(7, {"replay/size": 32, "rollout/reward_mean": 1.25})
+        record = logger.log(
+            7,
+            {
+                "replay/size": 32,
+                "rollout/reward_mean": 1.25,
+                "curriculum/terrain_level_mean": 0.5,
+                "curriculum/terrain_level_max": 2,
+                "curriculum/penalty_level": 1,
+                "curriculum/penalty_scale": 0.3,
+                "checkpoint/saved": 1,
+            },
+        )
         with pytest.raises(ValueError, match="finite"):
             logger.log(8, {"sac/critic_loss": float("nan")})
 
@@ -57,7 +69,15 @@ def test_training_logger_writes_flat_finite_jsonl_and_appends(tmp_path) -> None:
     assert [item["step"] for item in records] == [7, 9]
     assert record["mode"] == "fastwmr"
     assert record["replay/size"] == 32
-    assert "reward=1.2500" in format_console_metrics(record)
+    header = format_console_metrics_header("fastwmr")
+    row = format_console_metrics(record)
+    assert "Terr avg/max" in header
+    assert "Pen lvl/x" in header
+    assert "1.2500" in row
+    assert "0.50/2" in row
+    assert "1/0.30" in row
+    assert "yes" in row
+    assert len(header.splitlines()[-1]) == len(row.splitlines()[0])
 
 
 def test_fastwmr_metrics_include_estimator_and_gradient_boundary_fields() -> None:

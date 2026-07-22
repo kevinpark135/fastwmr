@@ -83,10 +83,12 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.u
     TrainingMetricsLogger,
     fastwmr_agent_metrics_dict,
     format_console_metrics,
+    format_console_metrics_header,
     sac_metrics_dict,
 )
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.curriculum import (
     penalty_curriculum_state,
+    terrain_curriculum_state,
 )
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
@@ -457,6 +459,17 @@ def run() -> None:
             mode=components.mode.value,
             append=ARGS.resume is not None,
         )
+        checkpoint_schedule = (
+            f"every {ARGS.checkpoint_interval} steps"
+            if ARGS.checkpoint_interval > 0
+            else "periodic saving disabled"
+        )
+        print(f"[{components.mode.value}] metrics={logger.path}")
+        print(
+            f"[{components.mode.value}] checkpoints={checkpoints_directory} "
+            f"({checkpoint_schedule})"
+        )
+        print(format_console_metrics_header(components.mode.value))
 
         components.collector.reset(seed=ARGS.seed)
         episode_tracker = EpisodeStatisticsTracker(env.num_envs, device=env.device)
@@ -499,15 +512,19 @@ def run() -> None:
                 ARGS.wallclock_limit_s is not None
                 and training_elapsed >= ARGS.wallclock_limit_s
             )
-            if ARGS.checkpoint_interval > 0 and global_step % ARGS.checkpoint_interval == 0:
+            checkpoint_saved = (
+                ARGS.checkpoint_interval > 0
+                and global_step % ARGS.checkpoint_interval == 0
+            )
+            if checkpoint_saved:
                 checkpoint_path = checkpoints_directory / f"step_{global_step:09d}.pt"
                 _save_checkpoint(checkpoint_path, components, config)
-                print(f"[{components.mode.value}] checkpoint={checkpoint_path}")
 
             if (
                 global_step % ARGS.log_interval == 0
                 or local_step + 1 == ARGS.steps
                 or wallclock_limit_reached
+                or checkpoint_saved
             ):
                 metrics: dict[str, int | float] = {
                     "rollout/reward_mean": interval_reward_sum / interval_steps,
@@ -521,6 +538,7 @@ def run() -> None:
                     "learner/environment_steps": global_step,
                     "learner/gradient_steps": components.update_loop.gradient_steps,
                     "learner/wallclock_seconds": training_elapsed,
+                    "checkpoint/saved": int(checkpoint_saved),
                     "ablation/gradient_cutoff": int(not ARGS.disable_gradient_cutoff),
                     "ablation/estimator_frozen": int(ARGS.freeze_estimator),
                     "ablation/symmetry": int(ARGS.use_symmetry),
@@ -563,6 +581,15 @@ def run() -> None:
                     )
                 if components.rollout_cache is not None:
                     metrics["estimator_cache/steps"] = len(components.rollout_cache)
+                if getattr(cfg.curriculum, "terrain_levels", None) is not None:
+                    terrain_state = terrain_curriculum_state(raw_env.unwrapped)
+                    if terrain_state is not None:
+                        metrics.update(
+                            {
+                                f"curriculum/terrain_{name}": value
+                                for name, value in terrain_state.items()
+                            }
+                        )
                 curriculum_state = penalty_curriculum_state(raw_env.unwrapped)
                 if curriculum_state is not None:
                     metrics.update(
