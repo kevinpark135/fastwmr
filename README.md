@@ -106,9 +106,9 @@ Each run writes its resolved configuration, metrics, and checkpoints beneath:
 
 ```text
 logs/fastwmr/<run-name>/
-|-- config_snapshot.json
-|-- metrics.jsonl
-`-- checkpoints/
+├── config_snapshot.json
+├── metrics.jsonl
+└── checkpoints/
 ```
 
 ### Resume Training
@@ -144,18 +144,28 @@ The evaluator infers FastWMR or FastSAC mode from the checkpoint. Available
 conditions are `nominal_rough`, `friction_low`, `friction_high`, `payload_heavy`,
 `strong_push`, `observation_noise`, and `observation_masking`.
 
-Run the reproducible robustness matrix with at least three seeds:
+Run the reproducible robustness matrix with at least three independently trained
+checkpoints per variant. Repeat `--checkpoint` and `--variant` as a pair; checkpoints
+that belong to the same comparison group use the same variant name:
 
 ```bash
 python script/evaluate_suite.py \
-  --checkpoint logs/fastwmr/g1_fastwmr/checkpoints/final_step_000001000.pt \
-  --variant default \
-  --seed 42 43 44 \
+  --checkpoint logs/fastwmr/g1_fastwmr_seed42/checkpoints/final_step_000001000.pt \
+  --variant primary \
+  --checkpoint logs/fastwmr/g1_fastwmr_seed43/checkpoints/final_step_000001000.pt \
+  --variant primary \
+  --checkpoint logs/fastwmr/g1_fastwmr_seed44/checkpoints/final_step_000001000.pt \
+  --variant primary \
+  --evaluation-seed 100 101 102 \
   --device cuda:0
 ```
 
-The suite stores individual JSON records and aggregated JSON, CSV, and Markdown
-summaries under `evaluations/suite/` by default.
+The training seed is read from each checkpoint. Individual records are written to
+`<condition>/train_seed_<N>/eval_seed_<N>.json`, so checkpoints from the same
+variant cannot overwrite one another. Metrics are averaged across evaluation seeds
+within each training seed first; the reported mean and standard deviation are then
+computed across independent training seeds. Aggregated JSON, CSV, and Markdown
+summaries are written under `evaluations/suite/` by default.
 
 ### Ablations
 

@@ -57,6 +57,7 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.u
     IsaacLabEnvAdapter,
     RunningObservationNormalizer,
     build_control_feature,
+    training_seed_from_config,
     write_evaluation_record,
 )
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.randomization import (
@@ -159,19 +160,25 @@ def _perturb_observation(
     return observation
 
 
-def _default_output(mode: TrainingMode, condition: EvaluationCondition) -> Path:
+def _default_output(
+    mode: TrainingMode,
+    condition: EvaluationCondition,
+    training_seed: int,
+) -> Path:
     return (
         Path("evaluations")
         / mode.value
         / ARGS.variant
         / condition.value
-        / f"seed_{ARGS.seed}.json"
+        / f"train_seed_{training_seed}"
+        / f"eval_seed_{ARGS.seed}.json"
     )
 
 
 def run() -> Path:
     metadata = inspect_training_checkpoint(ARGS.checkpoint, map_location="cpu")
     arguments = _training_arguments(metadata.config)
+    training_seed = training_seed_from_config(metadata.config)
     expected_task = (
         FASTWMR_PLAY_TASK
         if metadata.mode is TrainingMode.FASTWMR
@@ -360,7 +367,8 @@ def run() -> Path:
             mode=metadata.mode.value,
             variant=ARGS.variant,
             condition=condition.value,
-            seed=ARGS.seed,
+            training_seed=training_seed,
+            evaluation_seed=ARGS.seed,
             checkpoint=str(metadata.path),
             checkpoint_environment_steps=metadata.counters.environment_steps,
             evaluation_steps=ARGS.steps,
@@ -376,10 +384,13 @@ def run() -> Path:
                 "deterministic": not ARGS.stochastic,
             },
         )
-        output = (ARGS.output or _default_output(metadata.mode, condition)).expanduser()
+        output = (
+            ARGS.output or _default_output(metadata.mode, condition, training_seed)
+        ).expanduser()
         path = write_evaluation_record(output, record)
         print(
-            f"[{metadata.mode.value}/{condition.value}] output={path} "
+            f"[{metadata.mode.value}/{condition.value}] train_seed={training_seed} "
+            f"eval_seed={ARGS.seed} output={path} "
             f"return={return_mean:.4f} fall_rate={metrics['fall_rate']:.4f} "
             f"tracking_error={metrics['linear_tracking_error']:.4f} "
             f"wallclock={wallclock:.3f}s"

@@ -35,7 +35,12 @@ def build_train_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional learner wall-clock budget shared by FastSAC/FastWMR comparisons.",
     )
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Training seed stored in checkpoints and evaluation metadata.",
+    )
     parser.add_argument("--replay-capacity", type=int, default=1_000_000)
     parser.add_argument("--replay-storage-device", default="cpu")
     parser.add_argument("--random-action-steps", type=int, default=10)
@@ -65,7 +70,7 @@ def build_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-interval", type=int, default=25)
     parser.add_argument("--log-dir", default="logs/fastwmr")
     parser.add_argument("--run-name", default=None)
-    parser.add_argument("--checkpoint-interval", type=int, default=1000)
+    parser.add_argument("--checkpoint-interval", type=int, default=100)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--disable-final-checkpoint", action="store_true")
     parser.add_argument("--estimator-hidden-dim", type=int, default=256)
@@ -222,7 +227,12 @@ def build_play_parser() -> argparse.ArgumentParser:
     parser.add_argument("--condition", choices=EVALUATION_CONDITIONS, default="nominal_rough")
     parser.add_argument("--num-envs", type=int, default=64)
     parser.add_argument("--steps", type=int, default=1000)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Evaluation rollout seed; the training seed is read from the checkpoint.",
+    )
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--variant", default="default")
     parser.add_argument("--observation-noise-std", type=float, default=0.2)

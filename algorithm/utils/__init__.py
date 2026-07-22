@@ -8,6 +8,7 @@ from .evaluation_utils import (
     EvaluationRecord,
     aggregate_evaluation_records,
     load_evaluation_record,
+    training_seed_from_config,
     write_evaluation_record,
     write_evaluation_summary,
 )
@@ -51,6 +52,7 @@ __all__ = [
     "load_evaluation_record",
     "sac_metrics_dict",
     "symmetric_joint_limit_action_bounds",
+    "training_seed_from_config",
     "write_evaluation_record",
     "write_evaluation_summary",
 ]
