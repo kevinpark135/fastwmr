@@ -124,6 +124,9 @@ def _integrated_pipeline(
     interface: FastWMRInterfaceCfg = DEFAULT_INTERFACE_CFG,
     gradient_cutoff: bool = True,
     estimator_frozen: bool = False,
+    num_updates: int = 1,
+    validation_interval: int = 1,
+    initial_validation_updates: int = 0,
 ) -> tuple[
     IsaacLabEnvAdapter,
     TransitionReplayBuffer,
@@ -198,12 +201,14 @@ def _integrated_pipeline(
             random_action_steps=0,
             minimum_replay_size=4,
             batch_size=4,
-            num_updates=1,
+            num_updates=num_updates,
         ),
         SequenceReplayCfg(batch_size=1, burn_in_length=1, learning_length=2),
         processor,
         learner_device="cpu",
         verify_gradient_boundaries=gradient_cutoff,
+        validation_interval=validation_interval,
+        initial_validation_updates=initial_validation_updates,
     )
     collector = FastWMRRolloutCollector(env, replay, update_loop, interface=interface)
     return (
@@ -270,6 +275,35 @@ def test_integrated_collection_updates_estimator_runtime_and_c51_sac() -> None:
         and update.gradient_boundary.checks == 7
         for update in update_loop.last_agent_updates
     )
+    env.close()
+
+
+def test_update_bundle_rebuilds_runtime_once_and_periodicizes_validation() -> None:
+    (
+        env,
+        _replay,
+        _normalizer,
+        _estimator,
+        estimator_updater,
+        runtime,
+        _processor,
+        update_loop,
+        collector,
+    ) = _integrated_pipeline(
+        num_updates=4,
+        validation_interval=3,
+        initial_validation_updates=2,
+    )
+    collector.reset(seed=41)
+    results = [collector.collect_step() for _ in range(3)]
+
+    assert len(results[-1].updates) == 4
+    assert estimator_updater.version == 4
+    assert runtime.estimator_version == 4
+    assert runtime.rebuilds == 1
+    assert [
+        update.gradient_boundary.enabled for update in update_loop.last_agent_updates
+    ] == [True, True, False, True]
     env.close()
 
 
@@ -347,9 +381,9 @@ def test_agent_executes_optimizer_phases_in_declared_order() -> None:
     original_temperature = update_loop.updater.update_temperature
     original_target = update_loop.updater.update_target
 
-    def update_estimator(sample):
+    def update_estimator(sample, **kwargs):
         events.append("estimator")
-        return original_estimator(sample)
+        return original_estimator(sample, **kwargs)
 
     def update_critic(batch):
         events.append("critic")

@@ -84,6 +84,18 @@ def build_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--require-episode-start", action="store_true")
     parser.add_argument("--disable-gradient-boundary-checks", action="store_true")
     parser.add_argument(
+        "--validation-interval",
+        type=int,
+        default=500,
+        help="Run synchronized value and gradient checks every N learner updates.",
+    )
+    parser.add_argument(
+        "--initial-validation-updates",
+        type=int,
+        default=16,
+        help="Validate every learner update during this initial window.",
+    )
+    parser.add_argument(
         "--control-feature-mode",
         choices=("obs_and_reconstruction", "reconstruction_only"),
         default="obs_and_reconstruction",
@@ -141,6 +153,7 @@ def validate_train_args(args: argparse.Namespace) -> None:
         "estimator_cache_steps",
         "sequence_batch_size",
         "learning_length",
+        "validation_interval",
         "penalty_min_completed_episodes",
     )
     for name in positive_fields:
@@ -152,6 +165,8 @@ def validate_train_args(args: argparse.Namespace) -> None:
         raise ValueError("--wallclock-limit-s must be positive when provided.")
     if args.burn_in_length < 0:
         raise ValueError("--burn-in-length must be non-negative.")
+    if args.initial_validation_updates < 0:
+        raise ValueError("--initial-validation-updates must be non-negative.")
     if args.checkpoint_interval < 0:
         raise ValueError("--checkpoint-interval must be non-negative.")
     if args.recent_replay_horizon is not None and args.recent_replay_horizon <= 0:

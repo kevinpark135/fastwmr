@@ -47,6 +47,20 @@ def test_cache_returns_vector_rollout_in_chronological_order() -> None:
     assert torch.equal(batch.context_is_exact, torch.tensor([False, False]))
 
 
+def test_public_cache_reads_remain_isolated_from_zero_copy_runtime_views() -> None:
+    cache = _cache(capacity_steps=3)
+    for timestep in range(4):
+        _add_step(cache, timestep)
+
+    copied = cache.chronological()
+    copied.observations.zero_()
+    copied.privileged_states.zero_()
+
+    reread = cache.chronological()
+    assert torch.equal(reread.observations[0, :, 0], torch.tensor([1.0, 2.0, 3.0]))
+    assert torch.equal(reread.privileged_states[1, :, 0], torch.tensor([101.0, 102.0, 103.0]))
+
+
 def test_drain_clears_samples_but_preserves_monotonic_counter() -> None:
     cache = _cache()
     _add_step(cache, 0)

@@ -263,6 +263,7 @@ class FastWMREstimatorRuntime:
         *,
         estimator_version: int,
         final_reset_mask: torch.Tensor | None = None,
+        decode_full_sequence: bool = True,
     ) -> EstimatorRuntimeRebuild:
         """Re-infer runtime context from raw observations with current parameters."""
 
@@ -276,21 +277,30 @@ class FastWMREstimatorRuntime:
             dtype=self._dtype,
         )
         encoded_steps: list[torch.Tensor] = []
+        final_encoded: torch.Tensor | None = None
         for timestep in range(batch.sequence_length):
             state = state.reset(batch.reset_boundaries[:, timestep])
             encoded, state = self.estimator.encoder.forward_rollout(
                 transformed[:, timestep],
                 state,
             )
-            encoded_steps.append(encoded)
+            final_encoded = encoded
+            if decode_full_sequence:
+                encoded_steps.append(encoded)
         if final_reset_mask is not None:
             self._validate_reset_mask(final_reset_mask)
             state = state.reset(final_reset_mask)
-        encoded_history = torch.stack(encoded_steps, dim=1)
+        if final_encoded is None:
+            raise RuntimeError("Runtime rebuild requires at least one cached timestep.")
+        encoded_history = (
+            torch.stack(encoded_steps, dim=1)
+            if decode_full_sequence
+            else final_encoded.unsqueeze(1)
+        )
         reconstructions = self.estimator.decoder(encoded_history).reconstruction.detach()
         self._validate_reconstruction(
             reconstructions,
-            expected_time=batch.sequence_length,
+            expected_time=encoded_history.shape[1],
         )
         final_state = self._state.replace(state)
         self._last_reconstruction = reconstructions[:, -1]
@@ -311,11 +321,13 @@ class FastWMREstimatorRuntime:
         *,
         estimator_version: int,
         final_reset_mask: torch.Tensor | None = None,
+        decode_full_sequence: bool = True,
     ) -> EstimatorRuntimeRebuild:
         return self.rebuild_from_batch(
-            cache.chronological(),
+            cache.chronological(copy=False),
             estimator_version=estimator_version,
             final_reset_mask=final_reset_mask,
+            decode_full_sequence=decode_full_sequence,
         )
 
     def update_from_cache(

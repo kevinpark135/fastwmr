@@ -105,6 +105,8 @@ def test_play_cli_validates_fixed_budget(tmp_path) -> None:
     (
         ("--checkpoint-interval", "-1", "--checkpoint-interval"),
         ("--burn-in-length", "-1", "--burn-in-length"),
+        ("--validation-interval", "0", "--validation-interval"),
+        ("--initial-validation-updates", "-1", "--initial-validation-updates"),
         ("--estimator-cache-steps", "0", "--estimator-cache-steps"),
         ("--run-name", "nested/run", "--run-name"),
     ),

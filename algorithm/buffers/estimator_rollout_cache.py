@@ -136,17 +136,17 @@ class EstimatorRolloutCache:
         self._size = 0
         self._total_steps = 0
         self._observations = torch.empty(
-            (spec.capacity_steps, spec.num_envs, spec.observation_dim),
+            (2 * spec.capacity_steps, spec.num_envs, spec.observation_dim),
             device=self.storage_device,
             dtype=dtype,
         )
         self._privileged_states = torch.empty(
-            (spec.capacity_steps, spec.num_envs, spec.privileged_state_dim),
+            (2 * spec.capacity_steps, spec.num_envs, spec.privileged_state_dim),
             device=self.storage_device,
             dtype=dtype,
         )
         self._reset_boundaries = torch.empty(
-            (spec.capacity_steps, spec.num_envs),
+            (2 * spec.capacity_steps, spec.num_envs),
             device=self.storage_device,
             dtype=torch.bool,
         )
@@ -177,41 +177,39 @@ class EstimatorRolloutCache:
         """Append one synchronized vector-environment timestep."""
 
         self._validate_step(observations, privileged_states, reset_boundaries)
-        self._observations[self._position].copy_(
-            observations.to(device=self.storage_device, dtype=self.dtype)
+        positions = (self._position, self._position + self.capacity_steps)
+        cached_observations = observations.to(device=self.storage_device, dtype=self.dtype)
+        cached_privileged_states = privileged_states.to(
+            device=self.storage_device,
+            dtype=self.dtype,
         )
-        self._privileged_states[self._position].copy_(
-            privileged_states.to(device=self.storage_device, dtype=self.dtype)
-        )
-        self._reset_boundaries[self._position].copy_(
-            reset_boundaries.to(device=self.storage_device)
-        )
+        cached_reset_boundaries = reset_boundaries.to(device=self.storage_device)
+        for position in positions:
+            self._observations[position].copy_(cached_observations)
+            self._privileged_states[position].copy_(cached_privileged_states)
+            self._reset_boundaries[position].copy_(cached_reset_boundaries)
         self._position = (self._position + 1) % self.capacity_steps
         self._size = min(self._size + 1, self.capacity_steps)
         self._total_steps += 1
 
-    def chronological(self) -> EstimatorRolloutBatch:
-        """Return a detached copy ordered from oldest to newest timestep."""
+    def chronological(self, *, copy: bool = True) -> EstimatorRolloutBatch:
+        """Return an ordered batch, optionally as zero-copy ring-buffer views."""
 
         if self._size == 0:
             raise RuntimeError("Cannot read an empty estimator rollout cache.")
-        if self._size < self.capacity_steps:
-            indices = torch.arange(self._size, device=self.storage_device)
-        else:
-            indices = torch.cat(
-                (
-                    torch.arange(self._position, self.capacity_steps, device=self.storage_device),
-                    torch.arange(0, self._position, device=self.storage_device),
-                )
-            )
+        start = 0 if self._size < self.capacity_steps else self._position
+        stop = start + self._size
+        observations = self._observations[start:stop].transpose(0, 1)
+        privileged_states = self._privileged_states[start:stop].transpose(0, 1)
+        reset_boundaries = self._reset_boundaries[start:stop].transpose(0, 1)
+        if copy:
+            observations = observations.clone()
+            privileged_states = privileged_states.clone()
+            reset_boundaries = reset_boundaries.clone()
         return EstimatorRolloutBatch(
-            observations=self._observations.index_select(0, indices).transpose(0, 1).clone(),
-            privileged_states=self._privileged_states.index_select(0, indices)
-            .transpose(0, 1)
-            .clone(),
-            reset_boundaries=self._reset_boundaries.index_select(0, indices)
-            .transpose(0, 1)
-            .clone(),
+            observations=observations,
+            privileged_states=privileged_states,
+            reset_boundaries=reset_boundaries,
         )
 
     def drain(self) -> EstimatorRolloutBatch:

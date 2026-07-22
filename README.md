@@ -108,7 +108,15 @@ Each run writes its resolved configuration, metrics, and checkpoints beneath:
 logs/fastwmr/<run-name>/
 ├── config_snapshot.json
 ├── metrics.jsonl
+├── tensorboard/
+│   └── events.out.tfevents...
 └── checkpoints/
+```
+
+Monitor all runs from the repository root:
+
+```bash
+tensorboard --logdir logs/fastwmr --port 6006
 ```
 
 ### Resume Training

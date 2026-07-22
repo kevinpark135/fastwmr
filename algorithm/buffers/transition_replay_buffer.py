@@ -16,9 +16,6 @@ import torch
 from ..config import DEFAULT_INTERFACE_CFG, FastWMRInterfaceCfg
 
 
-TemporalKey = tuple[int, int, int]
-
-
 @dataclass(frozen=True)
 class ReplayBufferSpec:
     """Fixed storage dimensions and validation policy for transition replay."""
@@ -345,9 +342,28 @@ class TransitionReplayBuffer:
         self._final_control_features = vector(spec.control_feature_dim)
         self._final_observation_mask = scalar(torch.bool)
         self._insertion_ids = scalar(torch.int64)
-        self._slot_temporal_keys: list[TemporalKey | None] = [None] * spec.capacity
-        self._temporal_index: dict[TemporalKey, int] = {}
-        self._valid_sequence_starts: dict[int, set[TemporalKey]] = {}
+        temporal_capacity = spec.capacity if spec.require_temporal_metadata else 0
+        self._temporal_predecessors = torch.full(
+            (temporal_capacity,),
+            -1,
+            dtype=torch.int64,
+            device=self.storage_device,
+        )
+        self._temporal_successors = torch.full_like(self._temporal_predecessors, -1)
+        self._temporal_occupied = torch.zeros(
+            temporal_capacity,
+            dtype=torch.bool,
+            device=self.storage_device,
+        )
+        self._last_temporal_slot_by_env = torch.empty(
+            0,
+            dtype=torch.int64,
+            device=self.storage_device,
+        )
+        self._valid_sequence_masks: dict[int, torch.Tensor] = {}
+        self._sequence_candidate_cache: dict[
+            tuple[int, bool, int | None], torch.Tensor
+        ] = {}
 
     def __len__(self) -> int:
         return self._size
@@ -581,8 +597,8 @@ class TransitionReplayBuffer:
             final_observation_mask = final_observation_mask[start:]
             insertion_ids = insertion_ids[start:]
         indices = (torch.arange(batch_size, device=self.storage_device) + self._position) % self.capacity
-        temporal_keys = self._make_temporal_keys(env_ids, episode_ids, timesteps)
-        self._validate_temporal_replacements(indices, temporal_keys)
+        if metadata_required:
+            self._remove_temporal_links(indices)
 
         values = {
             "observations": observations,
@@ -609,7 +625,8 @@ class TransitionReplayBuffer:
         for name, value in values.items():
             storage = getattr(self, f"_{name}")
             storage[indices] = value.detach().to(device=self.storage_device, dtype=storage.dtype)
-        self._commit_temporal_replacements(indices, temporal_keys)
+        if metadata_required:
+            self._commit_temporal_links(indices)
 
         self._position = (self._position + batch_size) % self.capacity
         self._size = min(self._size + batch_size, self.capacity)
@@ -644,12 +661,12 @@ class TransitionReplayBuffer:
         """Return whether enough distinct boundary-safe windows are retained."""
 
         self._validate_sequence_request(batch_size, burn_in_length, learning_length)
-        starts = self._sequence_starts(
+        starts = self._sequence_candidates(
             burn_in_length + learning_length,
             require_episode_start=require_episode_start,
             minimum_insertion_id=minimum_insertion_id,
         )
-        return len(starts) >= batch_size
+        return starts.numel() >= batch_size
 
     def sample_sequences(
         self,
@@ -666,23 +683,27 @@ class TransitionReplayBuffer:
 
         self._validate_sequence_request(batch_size, burn_in_length, learning_length)
         transition_length = burn_in_length + learning_length
-        starts = self._sequence_starts(
+        starts = self._sequence_candidates(
             transition_length,
             require_episode_start=require_episode_start,
             minimum_insertion_id=minimum_insertion_id,
         )
-        if len(starts) < batch_size:
+        if starts.numel() < batch_size:
             raise RuntimeError(
-                f"Need {batch_size} valid sequences of length {transition_length}, found {len(starts)}."
+                f"Need {batch_size} valid sequences of length {transition_length}, "
+                f"found {starts.numel()}."
             )
 
-        choices = torch.randperm(len(starts), generator=generator)[:batch_size].tolist()
-        selected_starts = [starts[index] for index in choices]
-        physical_indices = [
-            [self._temporal_index[(env_id, episode_id, timestep + offset)] for offset in range(transition_length)]
-            for env_id, episode_id, timestep in selected_starts
-        ]
-        indices = torch.tensor(physical_indices, dtype=torch.int64, device=self.storage_device)
+        choices = torch.randperm(starts.numel(), generator=generator)[:batch_size]
+        selected_starts = starts[choices.to(starts.device)]
+        indices = torch.empty(
+            (batch_size, transition_length),
+            dtype=torch.int64,
+            device=self.storage_device,
+        )
+        indices[:, 0] = selected_starts
+        for offset in range(1, transition_length):
+            indices[:, offset] = self._temporal_successors[indices[:, offset - 1]]
         transitions = self._batch_at(indices)
         final_transitions = self._batch_at(indices[:, -1])
 
@@ -735,9 +756,13 @@ class TransitionReplayBuffer:
 
         self._position = 0
         self._size = 0
-        self._slot_temporal_keys = [None] * self.capacity
-        self._temporal_index.clear()
-        self._valid_sequence_starts.clear()
+        self._temporal_predecessors.fill_(-1)
+        self._temporal_successors.fill_(-1)
+        self._temporal_occupied.zero_()
+        self._last_temporal_slot_by_env.fill_(-1)
+        for mask in self._valid_sequence_masks.values():
+            mask.zero_()
+        self._sequence_candidate_cache.clear()
 
     def reset(self) -> None:
         """Drop replay contents and restart insertion IDs for a fresh run."""
@@ -779,112 +804,142 @@ class TransitionReplayBuffer:
             insertion_ids=self._insertion_ids[indices],
         )
 
-    @staticmethod
-    def _make_temporal_keys(
-        env_ids: torch.Tensor,
-        episode_ids: torch.Tensor,
-        timesteps: torch.Tensor,
-    ) -> list[TemporalKey | None]:
-        values = zip(
-            env_ids.detach().cpu().tolist(),
-            episode_ids.detach().cpu().tolist(),
-            timesteps.detach().cpu().tolist(),
-            strict=True,
+    def _remove_temporal_links(self, indices: torch.Tensor) -> None:
+        """Unlink overwritten replay slots without scanning temporal keys."""
+
+        occupied = self._temporal_occupied[indices]
+        slots = indices[occupied]
+        if slots.numel() == 0:
+            return
+        predecessors = self._temporal_predecessors[slots]
+        successors = self._temporal_successors[slots]
+
+        has_predecessor = predecessors >= 0
+        self._temporal_successors[predecessors[has_predecessor]] = -1
+        has_successor = successors >= 0
+        self._temporal_predecessors[successors[has_successor]] = -1
+
+        old_env_ids = self._env_ids[slots]
+        tracked = old_env_ids < self._last_temporal_slot_by_env.numel()
+        tracked_env_ids = old_env_ids[tracked]
+        tracked_slots = slots[tracked]
+        tracked_predecessors = predecessors[tracked]
+        current_last = self._last_temporal_slot_by_env[tracked_env_ids]
+        self._last_temporal_slot_by_env[tracked_env_ids] = torch.where(
+            current_last == tracked_slots,
+            tracked_predecessors,
+            current_last,
         )
-        return [
-            (int(env_id), int(episode_id), int(timestep))
-            if env_id >= 0 and episode_id >= 0 and timestep >= 0
-            else None
-            for env_id, episode_id, timestep in values
-        ]
 
-    def _validate_temporal_replacements(
+        self._temporal_predecessors[slots] = -1
+        self._temporal_successors[slots] = -1
+        self._temporal_occupied[slots] = False
+        for mask in self._valid_sequence_masks.values():
+            mask[slots] = False
+        self._sequence_candidate_cache.clear()
+
+    def _commit_temporal_links(self, indices: torch.Tensor) -> None:
+        """Link a vector-environment insertion batch using tensor slot metadata."""
+
+        env_ids = self._env_ids[indices]
+        if torch.unique(env_ids).numel() != env_ids.numel():
+            raise ValueError("FastWMR replay add batches require unique env_ids.")
+        self._ensure_temporal_env_capacity(env_ids)
+        predecessors = self._last_temporal_slot_by_env[env_ids]
+        continuous = predecessors >= 0
+        safe_predecessors = predecessors.clamp_min(0)
+        continuous &= self._episode_ids[safe_predecessors] == self._episode_ids[indices]
+        continuous &= self._timesteps[safe_predecessors] + 1 == self._timesteps[indices]
+        continuous &= ~self._terminated[safe_predecessors]
+        continuous &= ~self._truncated[safe_predecessors]
+        continuous &= ~self._reset_boundaries[indices]
+        linked_predecessors = torch.where(
+            continuous,
+            predecessors,
+            torch.full_like(predecessors, -1),
+        )
+
+        self._temporal_predecessors[indices] = linked_predecessors
+        linked_indices = indices[continuous]
+        self._temporal_successors[predecessors[continuous]] = linked_indices
+        self._temporal_occupied[indices] = True
+        self._last_temporal_slot_by_env[env_ids] = indices
+
+        for transition_length, mask in self._valid_sequence_masks.items():
+            self._mark_new_valid_sequence_starts(indices, transition_length, mask)
+        self._sequence_candidate_cache.clear()
+
+    def _ensure_temporal_env_capacity(self, env_ids: torch.Tensor) -> None:
+        required = int(env_ids.max().item()) + 1
+        current = self._last_temporal_slot_by_env.numel()
+        if required <= current:
+            return
+        expanded = torch.full(
+            (required,),
+            -1,
+            dtype=torch.int64,
+            device=self.storage_device,
+        )
+        expanded[:current] = self._last_temporal_slot_by_env
+        self._last_temporal_slot_by_env = expanded
+
+    def _mark_new_valid_sequence_starts(
         self,
-        indices: torch.Tensor,
-        new_keys: list[TemporalKey | None],
+        endpoints: torch.Tensor,
+        transition_length: int,
+        mask: torch.Tensor,
     ) -> None:
-        slots = indices.detach().cpu().tolist()
-        non_null_keys = [key for key in new_keys if key is not None]
-        if len(non_null_keys) != len(set(non_null_keys)):
-            raise ValueError("A replay add batch contains duplicate temporal keys.")
-        replaced_slots = set(slots)
-        for key in non_null_keys:
-            existing_slot = self._temporal_index.get(key)
-            if existing_slot is not None and existing_slot not in replaced_slots:
-                raise ValueError(f"Temporal key {key} is already retained in replay.")
+        ancestors = endpoints
+        valid = torch.ones_like(endpoints, dtype=torch.bool)
+        for _ in range(transition_length - 1):
+            predecessors = self._temporal_predecessors[ancestors.clamp_min(0)]
+            valid &= predecessors >= 0
+            ancestors = torch.where(valid, predecessors, torch.zeros_like(predecessors))
+        mask[ancestors[valid]] = True
 
-    def _commit_temporal_replacements(
-        self,
-        indices: torch.Tensor,
-        new_keys: list[TemporalKey | None],
-    ) -> None:
-        slots = [int(slot) for slot in indices.detach().cpu().tolist()]
-        changed_keys: list[TemporalKey] = []
-        for slot in slots:
-            old_key = self._slot_temporal_keys[slot]
-            if old_key is not None:
-                if self._temporal_index.get(old_key) == slot:
-                    del self._temporal_index[old_key]
-                changed_keys.append(old_key)
-        for slot, key in zip(slots, new_keys, strict=True):
-            self._slot_temporal_keys[slot] = key
-            if key is not None:
-                self._temporal_index[key] = slot
-                changed_keys.append(key)
+    def _initialize_valid_sequence_mask(self, transition_length: int) -> torch.Tensor:
+        mask = torch.zeros(
+            self.capacity,
+            dtype=torch.bool,
+            device=self.storage_device,
+        )
+        endpoints = torch.nonzero(self._temporal_occupied, as_tuple=False).squeeze(-1)
+        if endpoints.numel() > 0:
+            self._mark_new_valid_sequence_starts(endpoints, transition_length, mask)
+        self._valid_sequence_masks[transition_length] = mask
+        return mask
 
-        for transition_length, valid_starts in self._valid_sequence_starts.items():
-            affected_starts: set[TemporalKey] = set()
-            for env_id, episode_id, timestep in changed_keys:
-                for offset in range(transition_length):
-                    start_timestep = timestep - offset
-                    if start_timestep >= 0:
-                        affected_starts.add((env_id, episode_id, start_timestep))
-            for start in affected_starts:
-                if self._is_valid_sequence_start(start, transition_length):
-                    valid_starts.add(start)
-                else:
-                    valid_starts.discard(start)
-
-    def _sequence_starts(
+    def _sequence_candidates(
         self,
         transition_length: int,
         *,
         require_episode_start: bool,
         minimum_insertion_id: int | None = None,
-    ) -> list[TemporalKey]:
+    ) -> torch.Tensor:
         if transition_length <= 0:
             raise ValueError("Sequence transition length must be positive.")
         if not self.spec.require_temporal_metadata:
             raise RuntimeError("Sequence sampling requires a FastWMR replay specification.")
-        if transition_length not in self._valid_sequence_starts:
-            self._valid_sequence_starts[transition_length] = {
-                key for key in self._temporal_index if self._is_valid_sequence_start(key, transition_length)
-            }
-        starts = self._valid_sequence_starts[transition_length]
-        if require_episode_start:
-            starts = {key for key in starts if key[2] == 0}
-        if minimum_insertion_id is not None:
-            if minimum_insertion_id < 0:
-                raise ValueError("minimum_insertion_id must be non-negative.")
-            starts = {
-                key
-                for key in starts
-                if int(self._insertion_ids[self._temporal_index[key]].item())
-                >= minimum_insertion_id
-            }
-        return sorted(starts)
+        if minimum_insertion_id is not None and minimum_insertion_id < 0:
+            raise ValueError("minimum_insertion_id must be non-negative.")
+        cache_key = (transition_length, require_episode_start, minimum_insertion_id)
+        cached = self._sequence_candidate_cache.get(cache_key)
+        if cached is not None:
+            return cached
 
-    def _is_valid_sequence_start(self, start: TemporalKey, transition_length: int) -> bool:
-        env_id, episode_id, start_timestep = start
-        for offset in range(transition_length):
-            slot = self._temporal_index.get((env_id, episode_id, start_timestep + offset))
-            if slot is None:
-                return False
-            if offset > 0 and bool(self._reset_boundaries[slot].item()):
-                return False
-            if offset < transition_length - 1 and bool((self._terminated[slot] | self._truncated[slot]).item()):
-                return False
-        return True
+        mask = self._valid_sequence_masks.get(transition_length)
+        if mask is None:
+            mask = self._initialize_valid_sequence_mask(transition_length)
+        candidate_mask = mask
+        if require_episode_start:
+            candidate_mask = candidate_mask & self._reset_boundaries
+        if minimum_insertion_id is not None:
+            candidate_mask = candidate_mask & (
+                self._insertion_ids >= minimum_insertion_id
+            )
+        candidates = torch.nonzero(candidate_mask, as_tuple=False).squeeze(-1)
+        self._sequence_candidate_cache[cache_key] = candidates
+        return candidates
 
     @staticmethod
     def _validate_sequence_request(batch_size: int, burn_in_length: int, learning_length: int) -> None:

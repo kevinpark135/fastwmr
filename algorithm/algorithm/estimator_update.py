@@ -206,6 +206,7 @@ def compute_estimator_loss(
     *,
     interface: FastWMRInterfaceCfg = DEFAULT_INTERFACE_CFG,
     cfg: EstimatorLossCfg = DEFAULT_ESTIMATOR_LOSS_CFG,
+    validate_values: bool = True,
 ) -> EstimatorLossOutput:
     """Compute WMR's weighted MSE, BCE-with-logits, and latent L1 loss."""
 
@@ -219,7 +220,7 @@ def compute_estimator_loss(
             f"privileged_targets must have shape {expected_shape}, "
             f"got {tuple(privileged_targets.shape)}."
         )
-    if not torch.isfinite(privileged_targets).all():
+    if validate_values and not torch.isfinite(privileged_targets).all():
         raise ValueError("privileged_targets must be finite.")
     if prediction.decoded_state.continuous.shape[-1] != interface.continuous_target_dim:
         raise ValueError("Continuous decoder width does not match the reconstruction contract.")
@@ -228,7 +229,7 @@ def compute_estimator_loss(
 
     continuous_targets = _select_target_kind(privileged_targets, interface, TargetKind.CONTINUOUS)
     discrete_targets = _select_target_kind(privileged_targets, interface, TargetKind.DISCRETE)
-    if torch.any((discrete_targets < 0.0) | (discrete_targets > 1.0)):
+    if validate_values and torch.any((discrete_targets < 0.0) | (discrete_targets > 1.0)):
         raise ValueError("Discrete reconstruction targets must lie in [0, 1].")
 
     continuous_mse = F.mse_loss(prediction.decoded_state.continuous, continuous_targets)
@@ -260,13 +261,13 @@ def compute_estimator_loss(
 class EstimatorUpdateMetrics:
     """Detached scalar diagnostics from one estimator optimizer step."""
 
-    total_loss: float
-    continuous_mse: float
-    discrete_bce: float
-    latent_l1: float
-    gradient_norm: float
-    context_exact_fraction: float
-    field_losses: Mapping[str, float]
+    total_loss: torch.Tensor
+    continuous_mse: torch.Tensor
+    discrete_bce: torch.Tensor
+    latent_l1: torch.Tensor
+    gradient_norm: torch.Tensor
+    context_exact_fraction: torch.Tensor
+    field_losses: Mapping[str, torch.Tensor]
     estimator_version: int
 
 
@@ -304,7 +305,12 @@ class EstimatorUpdater:
         self.observation_transform = observation_transform
         self.version = 0
 
-    def update_sequence(self, sequence: SequenceReplayBatch) -> EstimatorUpdateResult:
+    def update_sequence(
+        self,
+        sequence: SequenceReplayBatch,
+        *,
+        validate_values: bool = True,
+    ) -> EstimatorUpdateResult:
         """Run no-grad burn-in and update on the complete ``L + 1`` window."""
 
         observations = sequence.observations
@@ -314,16 +320,23 @@ class EstimatorUpdater:
             dtype=observations.dtype,
         )
         if sequence.burn_in_length > 0:
-            burn_in_observations = self._transform(sequence.burn_in_observations)
+            burn_in_observations = self._transform(
+                sequence.burn_in_observations,
+                validate_values=validate_values,
+            )
             with torch.no_grad():
                 _, state = self.estimator.encoder.forward_sequence(burn_in_observations, state)
         state = state.detach()
-        learning_observations = self._transform(sequence.learning_observations)
+        learning_observations = self._transform(
+            sequence.learning_observations,
+            validate_values=validate_values,
+        )
         prediction = self.estimator.predict_sequence(learning_observations, state)
         return self._apply_update(
             prediction,
             sequence.learning_privileged_states,
             sequence.context_is_exact,
+            validate_values=validate_values,
         )
 
     def reconstruct_sequence(
@@ -331,6 +344,7 @@ class EstimatorUpdater:
         sequence: SequenceReplayBatch,
         *,
         detach: bool = True,
+        validate_values: bool = True,
     ) -> torch.Tensor:
         """Re-infer a learning window with the estimator's current parameters.
 
@@ -349,10 +363,16 @@ class EstimatorUpdater:
                 dtype=observations.dtype,
             )
             if sequence.burn_in_length > 0:
-                burn_in_observations = self._transform(sequence.burn_in_observations)
+                burn_in_observations = self._transform(
+                    sequence.burn_in_observations,
+                    validate_values=validate_values,
+                )
                 with torch.no_grad():
                     _, state = self.estimator.encoder.forward_sequence(burn_in_observations, state)
-            learning_observations = self._transform(sequence.learning_observations)
+            learning_observations = self._transform(
+                sequence.learning_observations,
+                validate_values=validate_values,
+            )
             reconstruction, _ = self.estimator.forward_sequence(
                 learning_observations,
                 state.detach(),
@@ -369,12 +389,17 @@ class EstimatorUpdater:
                 f"Current-estimator reconstruction must have shape {expected_shape}, "
                 f"got {tuple(reconstruction.shape)}."
             )
-        if not torch.isfinite(reconstruction).all():
+        if validate_values and not torch.isfinite(reconstruction).all():
             raise FloatingPointError("Current-estimator reconstruction must remain finite.")
         return reconstruction
 
     @torch.no_grad()
-    def evaluate_sequence(self, sequence: SequenceReplayBatch) -> EstimatorUpdateResult:
+    def evaluate_sequence(
+        self,
+        sequence: SequenceReplayBatch,
+        *,
+        validate_values: bool = True,
+    ) -> EstimatorUpdateResult:
         """Evaluate reconstruction losses without changing estimator parameters."""
 
         observations = sequence.observations
@@ -385,11 +410,17 @@ class EstimatorUpdater:
         )
         if sequence.burn_in_length > 0:
             _, state = self.estimator.encoder.forward_sequence(
-                self._transform(sequence.burn_in_observations),
+                self._transform(
+                    sequence.burn_in_observations,
+                    validate_values=validate_values,
+                ),
                 state,
             )
         prediction = self.estimator.predict_sequence(
-            self._transform(sequence.learning_observations),
+            self._transform(
+                sequence.learning_observations,
+                validate_values=validate_values,
+            ),
             state.detach(),
         )
         losses = compute_estimator_loss(
@@ -397,15 +428,16 @@ class EstimatorUpdater:
             sequence.learning_privileged_states,
             interface=self.interface,
             cfg=self.loss_cfg,
+            validate_values=validate_values,
         )
         metrics = EstimatorUpdateMetrics(
-            total_loss=float(losses.total_loss),
-            continuous_mse=float(losses.continuous_mse),
-            discrete_bce=float(losses.discrete_bce),
-            latent_l1=float(losses.latent_l1),
-            gradient_norm=0.0,
-            context_exact_fraction=float(sequence.context_is_exact.float().mean()),
-            field_losses={name: float(value) for name, value in losses.field_losses.items()},
+            total_loss=losses.total_loss.detach(),
+            continuous_mse=losses.continuous_mse.detach(),
+            discrete_bce=losses.discrete_bce.detach(),
+            latent_l1=losses.latent_l1.detach(),
+            gradient_norm=torch.zeros_like(losses.total_loss),
+            context_exact_fraction=sequence.context_is_exact.float().mean(),
+            field_losses={name: value.detach() for name, value in losses.field_losses.items()},
             estimator_version=self.version,
         )
         return EstimatorUpdateResult(
@@ -414,10 +446,10 @@ class EstimatorUpdater:
             metrics=metrics,
         )
 
-    def step_external_gradients(self) -> float:
+    def step_external_gradients(self, *, validate_values: bool = True) -> torch.Tensor:
         """Apply gradients contributed by the no-cutoff SAC ablation."""
 
-        gradient_norm = self._gradient_norm()
+        gradient_norm = self._gradient_norm(validate_values=validate_values)
         self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
         self.version += 1
@@ -474,7 +506,12 @@ class EstimatorUpdater:
             cache.clear()
         return result
 
-    def _transform(self, observations: torch.Tensor) -> torch.Tensor:
+    def _transform(
+        self,
+        observations: torch.Tensor,
+        *,
+        validate_values: bool = True,
+    ) -> torch.Tensor:
         transformed = (
             self.observation_transform(observations)
             if self.observation_transform is not None
@@ -482,7 +519,9 @@ class EstimatorUpdater:
         )
         if transformed.shape != observations.shape:
             raise ValueError("The estimator observation transform must preserve tensor shape.")
-        if not transformed.dtype.is_floating_point or not torch.isfinite(transformed).all():
+        if not transformed.dtype.is_floating_point:
+            raise ValueError("Transformed estimator observations must be floating point.")
+        if validate_values and not torch.isfinite(transformed).all():
             raise ValueError("Transformed estimator observations must be finite and floating point.")
         return transformed
 
@@ -491,34 +530,35 @@ class EstimatorUpdater:
         prediction: EstimatorPrediction,
         privileged_targets: torch.Tensor,
         context_is_exact: torch.Tensor,
+        *,
+        validate_values: bool = True,
     ) -> EstimatorUpdateResult:
         losses = compute_estimator_loss(
             prediction,
             privileged_targets,
             interface=self.interface,
             cfg=self.loss_cfg,
+            validate_values=validate_values,
         )
-        if not torch.isfinite(losses.total_loss):
+        if validate_values and not torch.isfinite(losses.total_loss):
             raise FloatingPointError("Estimator loss is not finite.")
 
         reconstructions = prediction.reconstruction.detach()
         final_state = prediction.final_state.detach()
         self.optimizer.zero_grad(set_to_none=True)
         losses.total_loss.backward()
-        gradient_norm = self._gradient_norm()
+        gradient_norm = self._gradient_norm(validate_values=validate_values)
         self.optimizer.step()
         self.version += 1
 
         metrics = EstimatorUpdateMetrics(
-            total_loss=float(losses.total_loss.detach()),
-            continuous_mse=float(losses.continuous_mse.detach()),
-            discrete_bce=float(losses.discrete_bce.detach()),
-            latent_l1=float(losses.latent_l1.detach()),
+            total_loss=losses.total_loss.detach(),
+            continuous_mse=losses.continuous_mse.detach(),
+            discrete_bce=losses.discrete_bce.detach(),
+            latent_l1=losses.latent_l1.detach(),
             gradient_norm=gradient_norm,
-            context_exact_fraction=float(context_is_exact.float().mean()),
-            field_losses={
-                name: float(value.detach()) for name, value in losses.field_losses.items()
-            },
+            context_exact_fraction=context_is_exact.float().mean(),
+            field_losses={name: value.detach() for name, value in losses.field_losses.items()},
             estimator_version=self.version,
         )
         return EstimatorUpdateResult(
@@ -527,16 +567,16 @@ class EstimatorUpdater:
             metrics=metrics,
         )
 
-    def _gradient_norm(self) -> float:
+    def _gradient_norm(self, *, validate_values: bool = True) -> torch.Tensor:
         squared_norm = torch.zeros((), device=next(self.estimator.parameters()).device)
         for parameter in self.estimator.parameters():
             if parameter.grad is None:
                 continue
-            if not torch.isfinite(parameter.grad).all():
+            if validate_values and not torch.isfinite(parameter.grad).all():
                 self.optimizer.zero_grad(set_to_none=True)
                 raise FloatingPointError("Estimator gradient is not finite.")
             squared_norm = squared_norm + parameter.grad.detach().square().sum()
-        return float(torch.sqrt(squared_norm))
+        return torch.sqrt(squared_norm)
 
 
 def _select_target_kind(

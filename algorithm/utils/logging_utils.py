@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 
 _CONSOLE_HEADERS = (
@@ -93,7 +94,7 @@ class EpisodeStatisticsTracker:
 
 
 class TrainingMetricsLogger:
-    """Append finite scalar records to a machine-readable JSONL run log."""
+    """Write finite scalar records to JSONL and TensorBoard together."""
 
     def __init__(
         self,
@@ -101,15 +102,25 @@ class TrainingMetricsLogger:
         *,
         mode: str,
         append: bool = False,
+        tensorboard_purge_step: int | None = None,
     ) -> None:
         if not mode:
             raise ValueError("Logging mode must not be empty.")
+        if tensorboard_purge_step is not None and tensorboard_purge_step < 0:
+            raise ValueError("TensorBoard purge step must be non-negative.")
         self.run_directory = Path(run_directory).expanduser().resolve()
         self.run_directory.mkdir(parents=True, exist_ok=True)
         self.path = self.run_directory / "metrics.jsonl"
+        self.tensorboard_directory = self.run_directory / "tensorboard"
         self.mode = mode
         self._start_time = time.monotonic()
         self._file = self.path.open("a" if append else "w", encoding="utf-8")
+        self._tensorboard = SummaryWriter(
+            log_dir=str(self.tensorboard_directory),
+            purge_step=tensorboard_purge_step,
+            max_queue=100,
+            flush_secs=10,
+        )
         self.records_written = 0
 
     def log(self, step: int, metrics: Mapping[str, int | float]) -> Mapping[str, int | float | str]:
@@ -124,10 +135,14 @@ class TrainingMetricsLogger:
         }
         self._file.write(json.dumps(record, sort_keys=True) + "\n")
         self._file.flush()
+        self._tensorboard.add_scalar("elapsed_seconds", record["elapsed_seconds"], step)
+        for name, value in clean_metrics.items():
+            self._tensorboard.add_scalar(name, value, step)
         self.records_written += 1
         return record
 
     def close(self) -> None:
+        self._tensorboard.close()
         if not self._file.closed:
             self._file.close()
 

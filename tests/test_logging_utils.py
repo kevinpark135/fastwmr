@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.utils import (
     EpisodeStatisticsTracker,
@@ -69,6 +70,11 @@ def test_training_logger_writes_flat_finite_jsonl_and_appends(tmp_path) -> None:
     assert [item["step"] for item in records] == [7, 9]
     assert record["mode"] == "fastwmr"
     assert record["replay/size"] == 32
+    tensorboard = EventAccumulator(str(tmp_path / "tensorboard")).Reload()
+    replay_events = tensorboard.Scalars("replay/size")
+    assert [event.step for event in replay_events] == [7, 9]
+    assert [event.value for event in replay_events] == pytest.approx([32.0, 40.0])
+    assert "elapsed_seconds" in tensorboard.Tags()["scalars"]
     header = format_console_metrics_header("fastwmr")
     row = format_console_metrics(record)
     assert "Terr avg/max" in header

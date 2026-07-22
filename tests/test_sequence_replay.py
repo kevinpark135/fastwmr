@@ -158,6 +158,30 @@ def test_sequence_cache_tracks_ring_overwrite_without_stale_starts() -> None:
     assert not buffer.can_sample_sequences(batch_size=1, burn_in_length=1, learning_length=2)
 
 
+def test_tensor_sequence_index_handles_vector_steps_across_unaligned_wraparound() -> None:
+    buffer = _buffer(capacity=5)
+    for timestep in range(5):
+        _add_vector_step(buffer, timestep, num_envs=2)
+
+    sequence = buffer.sample_sequences(
+        batch_size=3,
+        burn_in_length=0,
+        learning_length=2,
+        generator=torch.Generator().manual_seed(12),
+    )
+
+    assert torch.all(sequence.timesteps[:, 1] - sequence.timesteps[:, 0] == 1)
+    assert torch.all(sequence.env_ids == sequence.env_ids[:, :1])
+    assert {
+        (int(env_id), int(timestep))
+        for env_id, timestep in zip(
+            sequence.env_ids[:, 0],
+            sequence.timesteps[:, 0],
+            strict=True,
+        )
+    } == {(1, 2), (0, 3), (1, 3)}
+
+
 def test_sequence_sampling_can_be_limited_to_recent_insertions() -> None:
     buffer = _buffer()
     for timestep in range(8):

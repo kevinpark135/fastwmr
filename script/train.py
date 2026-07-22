@@ -280,7 +280,7 @@ def _build_components(
             env.num_envs,
             interface,
         ),
-        storage_device=ARGS.replay_storage_device,
+        storage_device=device,
     )
     estimator = WorldStateEstimator(
         HistoryEncoder(
@@ -337,6 +337,8 @@ def _build_components(
             not ARGS.disable_gradient_boundary_checks
             and not ARGS.disable_gradient_cutoff
         ),
+        validation_interval=ARGS.validation_interval,
+        initial_validation_updates=ARGS.initial_validation_updates,
         sequence_augmentation=(
             partial(augment_sequence_batch, interface=interface)
             if ARGS.use_symmetry
@@ -426,6 +428,7 @@ def run() -> None:
         run_directory = _run_directory()
         checkpoints_directory = run_directory / "checkpoints"
         config = _checkpoint_config(components)
+        tensorboard_purge_step: int | None = None
 
         if ARGS.resume is not None:
             resumed = load_training_checkpoint(
@@ -439,6 +442,7 @@ def run() -> None:
                 rollout_cache=components.rollout_cache,
                 map_location=env.device,
             )
+            tensorboard_purge_step = resumed.counters.environment_steps + 1
             print(
                 f"[{components.mode.value}] resumed {resumed.path} at "
                 f"environment_step={resumed.counters.environment_steps} "
@@ -458,6 +462,7 @@ def run() -> None:
             run_directory,
             mode=components.mode.value,
             append=ARGS.resume is not None,
+            tensorboard_purge_step=tensorboard_purge_step,
         )
         checkpoint_schedule = (
             f"every {ARGS.checkpoint_interval} steps"
@@ -465,6 +470,7 @@ def run() -> None:
             else "periodic saving disabled"
         )
         print(f"[{components.mode.value}] metrics={logger.path}")
+        print(f"[{components.mode.value}] tensorboard={logger.tensorboard_directory}")
         print(
             f"[{components.mode.value}] checkpoints={checkpoints_directory} "
             f"({checkpoint_schedule})"
