@@ -87,7 +87,6 @@ Train FastWMR with the default C51 critic:
 python script/train.py \
   --task Isaac-Velocity-G1-FastWMR-v0 \
   --run-name g1_fastwmr \
-  --device cuda:0 \
   --viz none
 ```
 
@@ -104,7 +103,6 @@ Run the strict-current v1 reference path with:
 python script/train.py \
   --fastwmr-version v1 \
   --run-name g1_fastwmr_v1 \
-  --device cuda:0 \
   --viz none
 ```
 
@@ -115,9 +113,48 @@ randomization configuration:
 python script/train.py \
   --task Isaac-Velocity-G1-FastSAC-Baseline-v0 \
   --run-name g1_fastsac_baseline \
-  --device cuda:0 \
   --viz none
 ```
+
+#### FastWMR-specific options
+
+These options configure the estimator and sequence learner used by the FastWMR
+task. They are separate from the shared FastSAC replay, critic, and environment
+options.
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `--fastwmr-version {v1,v2}` | `v2` | Select the strict-current reference learner or the two-timescale learner. |
+| `--estimator-hidden-dim` | `256` | Set the recurrent estimator and decoder hidden width. |
+| `--estimator-num-layers` | `1` | Set the recurrent encoder depth. |
+| `--estimator-learning-rate` | `3e-4` | Set the estimator optimizer learning rate. |
+| `--estimator-weight-decay` | `1e-3` | Set estimator Adam weight decay. |
+| `--estimator-cache-steps` | `64` | Set the per-environment recurrent rollout-cache length. |
+| `--sequence-batch-size` | `256` | Set the number of replay sequences sampled per estimator update. |
+| `--burn-in-length` | `16` | Set recurrent warm-up steps excluded from estimator loss. |
+| `--learning-length` | `8` | Set sequence steps included in estimator loss. |
+| `--require-episode-start` | disabled | Restrict sampled sequences to episode starts. |
+| `--recent-replay-horizon` | unset | Restrict estimator sequence sampling to recent transitions. |
+
+FastWMR v2 adds the following two-timescale controls:
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `--estimator-update-interval` | `8` | Trigger estimator learning after this many SAC updates. |
+| `--estimator-updates-per-trigger` | `1` | Run this many sequence updates per estimator trigger. |
+| `--max-estimator-feature-age` | `100` | Reject stored control features older than this many EMA versions. |
+| `--disable-feature-age-filter` | disabled | Allow stored features regardless of estimator-version age. |
+| `--stored-feature-replay-horizon` | `200000` | Restrict SAC sampling to this many recent stored-feature transitions. |
+| `--control-estimator-tau` | `0.005` | Set the EMA update rate for the control estimator. |
+| `--reconstruction-gate-start-updates` | `0` | Delay reconstruction-feature activation until this estimator update. |
+| `--reconstruction-gate-warmup-updates` | `1000` | Linearly open the reconstruction gate over this many estimator updates. |
+
+FastWMR diagnostics and ablations are controlled with
+`--validation-interval`, `--initial-validation-updates`,
+`--disable-gradient-boundary-checks`, `--control-feature-mode`,
+`--freeze-estimator`, and `--use-symmetry`. The
+`--disable-gradient-cutoff` ablation is available only with
+`--fastwmr-version v1`.
 
 Use `--num-envs`, `--steps`, `--wallclock-limit-s`, and the replay/update options
 to set the collection and learner budgets. Run `python script/train.py --help`
@@ -150,7 +187,6 @@ python script/train.py \
   --task Isaac-Velocity-G1-FastWMR-v0 \
   --resume logs/fastwmr/g1_fastwmr/checkpoints/step_000001000.pt \
   --steps 1000 \
-  --device cuda:0 \
   --viz none
 ```
 
@@ -165,7 +201,6 @@ Run a deterministic nominal evaluation for one checkpoint:
 python script/play.py \
   --checkpoint logs/fastwmr/g1_fastwmr/checkpoints/final_step_000001000.pt \
   --condition nominal_rough \
-  --device cuda:0 \
   --viz none
 ```
 
@@ -185,8 +220,7 @@ python script/evaluate_suite.py \
   --variant primary \
   --checkpoint logs/fastwmr/g1_fastwmr_seed44/checkpoints/final_step_000001000.pt \
   --variant primary \
-  --evaluation-seed 100 101 102 \
-  --device cuda:0
+  --evaluation-seed 100 101 102
 ```
 
 The training seed is read from each checkpoint. Individual records are written to
