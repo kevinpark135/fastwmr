@@ -163,7 +163,7 @@ for the complete configuration surface.
 Each run writes its resolved configuration, metrics, and checkpoints beneath:
 
 ```text
-logs/fastwmr/<run-name>/
+<IsaacLab>/logs/fastwmr/<run-name>/
 ├── config_snapshot.json
 ├── metrics.jsonl
 ├── tensorboard/
@@ -171,10 +171,12 @@ logs/fastwmr/<run-name>/
 └── checkpoints/
 ```
 
-Monitor all runs from the repository root:
+The default checkpoint interval is 50 environment iterations. Override it with
+`--checkpoint-interval`, or use `--log-dir` to replace the IsaacLab-level log
+root. Monitor all runs with:
 
 ```bash
-tensorboard --logdir logs/fastwmr --port 6006
+tensorboard --logdir ~/IsaacLab/logs/fastwmr --port 6006
 ```
 
 ### Resume Training
@@ -185,7 +187,7 @@ normalization, estimator, and learner-counter state:
 ```bash
 python script/train.py \
   --task Isaac-Velocity-G1-FastWMR-v0 \
-  --resume logs/fastwmr/g1_fastwmr/checkpoints/step_000001000.pt \
+  --resume ~/IsaacLab/logs/fastwmr/g1_fastwmr/checkpoints/step_000001000.pt \
   --steps 1000 \
   --viz none
 ```
@@ -199,7 +201,7 @@ Run a deterministic nominal evaluation for one checkpoint:
 
 ```bash
 python script/play.py \
-  --checkpoint logs/fastwmr/g1_fastwmr/checkpoints/final_step_000001000.pt \
+  --checkpoint ~/IsaacLab/logs/fastwmr/g1_fastwmr/checkpoints/final_step_000001000.pt \
   --condition nominal_rough \
   --viz none
 ```
@@ -214,11 +216,11 @@ that belong to the same comparison group use the same variant name:
 
 ```bash
 python script/evaluate_suite.py \
-  --checkpoint logs/fastwmr/g1_fastwmr_seed42/checkpoints/final_step_000001000.pt \
+  --checkpoint ~/IsaacLab/logs/fastwmr/g1_fastwmr_seed42/checkpoints/final_step_000001000.pt \
   --variant primary \
-  --checkpoint logs/fastwmr/g1_fastwmr_seed43/checkpoints/final_step_000001000.pt \
+  --checkpoint ~/IsaacLab/logs/fastwmr/g1_fastwmr_seed43/checkpoints/final_step_000001000.pt \
   --variant primary \
-  --checkpoint logs/fastwmr/g1_fastwmr_seed44/checkpoints/final_step_000001000.pt \
+  --checkpoint ~/IsaacLab/logs/fastwmr/g1_fastwmr_seed44/checkpoints/final_step_000001000.pt \
   --variant primary \
   --evaluation-seed 100 101 102
 ```

@@ -21,7 +21,8 @@ def test_train_cli_defaults_to_fastwmr_and_validates() -> None:
     assert args.task == FASTWMR_TASK
     assert args.resume is None
     assert args.log_interval == 5
-    assert args.checkpoint_interval == 100
+    assert args.checkpoint_interval == 50
+    assert args.log_dir is None
     assert args.fastwmr_version == "v2"
     assert args.estimator_update_interval == 8
     assert args.max_estimator_feature_age == 100

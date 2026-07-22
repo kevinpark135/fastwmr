@@ -68,9 +68,13 @@ def build_train_parser() -> argparse.ArgumentParser:
         help="Derive actor scaling from IsaacLab soft limits instead of physical joint limits.",
     )
     parser.add_argument("--log-interval", type=int, default=5)
-    parser.add_argument("--log-dir", default="logs/fastwmr")
+    parser.add_argument(
+        "--log-dir",
+        default=None,
+        help="Override the default <IsaacLab>/logs/fastwmr output directory.",
+    )
     parser.add_argument("--run-name", default=None)
-    parser.add_argument("--checkpoint-interval", type=int, default=100)
+    parser.add_argument("--checkpoint-interval", type=int, default=50)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--disable-final-checkpoint", action="store_true")
     parser.add_argument("--estimator-hidden-dim", type=int, default=256)

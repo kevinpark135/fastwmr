@@ -32,6 +32,7 @@ from pathlib import Path
 import gymnasium as gym
 import torch
 
+import isaaclab
 import isaaclab_tasks  # noqa: F401
 import isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr  # noqa: F401
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.algorithm import (
@@ -411,6 +412,16 @@ def _build_components(
     )
 
 
+def _default_log_root() -> Path:
+    """Return the IsaacLab-level log directory used by its training scripts."""
+
+    isaaclab_package = Path(isaaclab.__file__).resolve()
+    for parent in isaaclab_package.parents:
+        if (parent / "source" / "isaaclab").is_dir():
+            return parent / "logs" / "fastwmr"
+    raise RuntimeError(f"Could not locate the IsaacLab root from {isaaclab_package}.")
+
+
 def _run_directory() -> Path:
     if ARGS.resume is not None:
         checkpoint_path = ARGS.resume.expanduser().resolve()
@@ -422,7 +433,12 @@ def _run_directory() -> Path:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         mode = TrainingMode.FASTWMR if ARGS.task == FASTWMR_TASK else TrainingMode.FASTSAC
         run_name = f"{timestamp}_{mode.value}"
-    return Path(ARGS.log_dir).expanduser().resolve() / run_name
+    log_root = (
+        _default_log_root()
+        if ARGS.log_dir is None
+        else Path(ARGS.log_dir).expanduser().resolve()
+    )
+    return log_root / run_name
 
 
 def _checkpoint_config(components: TrainingComponents) -> dict[str, object]:
@@ -518,7 +534,7 @@ def run() -> None:
             tensorboard_purge_step=tensorboard_purge_step,
         )
         checkpoint_schedule = (
-            f"every {ARGS.checkpoint_interval} steps"
+            f"every {ARGS.checkpoint_interval} iterations"
             if ARGS.checkpoint_interval > 0
             else "periodic saving disabled"
         )
