@@ -143,6 +143,75 @@ class WorldStateEstimator(nn.Module):
         return prediction.reconstruction, prediction.final_state
 
 
+class EMAControlEstimator:
+    """Maintain a frozen, slowly moving estimator for rollout control features."""
+
+    def __init__(
+        self,
+        online_estimator: WorldStateEstimator,
+        control_estimator: WorldStateEstimator,
+        *,
+        tau: float = 0.005,
+        version: int = 0,
+        initialize_from_online: bool = True,
+    ) -> None:
+        if online_estimator is control_estimator:
+            raise ValueError("Online and control estimators must be distinct modules.")
+        if not 0.0 < tau <= 1.0:
+            raise ValueError("EMA tau must be in (0, 1].")
+        if version < 0:
+            raise ValueError("EMA estimator version must be non-negative.")
+        online_state = online_estimator.state_dict()
+        control_state = control_estimator.state_dict()
+        if online_state.keys() != control_state.keys() or any(
+            online_state[name].shape != control_state[name].shape for name in online_state
+        ):
+            raise ValueError("Online and control estimators must have identical state layouts.")
+
+        self.online_estimator = online_estimator
+        self.control_estimator = control_estimator
+        self.tau = tau
+        self.version = version
+        if initialize_from_online:
+            self.hard_sync()
+        self.control_estimator.requires_grad_(False)
+        self.control_estimator.eval()
+
+    @torch.no_grad()
+    def hard_sync(self) -> None:
+        """Copy the complete online state without advancing the control version."""
+
+        self.control_estimator.load_state_dict(self.online_estimator.state_dict())
+
+    @torch.no_grad()
+    def update(self) -> int:
+        """Apply one Polyak update after an estimator trigger."""
+
+        for control_parameter, online_parameter in zip(
+            self.control_estimator.parameters(),
+            self.online_estimator.parameters(),
+            strict=True,
+        ):
+            control_parameter.lerp_(online_parameter.detach(), self.tau)
+        for control_buffer, online_buffer in zip(
+            self.control_estimator.buffers(),
+            self.online_estimator.buffers(),
+            strict=True,
+        ):
+            if control_buffer.dtype.is_floating_point:
+                control_buffer.lerp_(online_buffer.detach(), self.tau)
+            else:
+                control_buffer.copy_(online_buffer)
+        self.version += 1
+        return self.version
+
+    def restart(self, *, version: int) -> None:
+        if version < 0:
+            raise ValueError("EMA estimator version must be non-negative.")
+        self.version = version
+        self.control_estimator.requires_grad_(False)
+        self.control_estimator.eval()
+
 @dataclass(frozen=True)
 class BurnInUnrollOutput:
     """Learning-window reconstructions and recurrent context diagnostics."""

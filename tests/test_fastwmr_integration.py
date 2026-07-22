@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 import torch
 
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.algorithm import (
     C51SACUpdater,
+    EMAControlEstimator,
     EntropyTemperature,
     EstimatorUpdater,
     FastWMRAgent,
@@ -14,6 +17,8 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.a
     FastWMRRolloutCollector,
     FastWMRSequenceFeatureProcessor,
     FastWMRSequenceUpdateLoop,
+    FastWMRV2EstimatorController,
+    FastWMRV2UpdateLoop,
     GradientBoundaryError,
     TrainingMode,
     WorldStateEstimator,
@@ -34,6 +39,7 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.c
     DEFAULT_INTERFACE_CFG,
     DistributionalCriticCfg,
     FastWMRInterfaceCfg,
+    FastWMRV2Cfg,
     ReplayUpdateCfg,
     SequenceReplayCfg,
     TanhGaussianActorCfg,
@@ -127,6 +133,8 @@ def _integrated_pipeline(
     num_updates: int = 1,
     validation_interval: int = 1,
     initial_validation_updates: int = 0,
+    version: str = "v1",
+    v2_cfg: FastWMRV2Cfg | None = None,
 ) -> tuple[
     IsaacLabEnvAdapter,
     TransitionReplayBuffer,
@@ -134,8 +142,8 @@ def _integrated_pipeline(
     WorldStateEstimator,
     EstimatorUpdater,
     FastWMREstimatorRuntime,
-    FastWMRSequenceFeatureProcessor,
-    FastWMRSequenceUpdateLoop,
+    FastWMRSequenceFeatureProcessor | FastWMRV2EstimatorController,
+    FastWMRSequenceUpdateLoop | FastWMRV2UpdateLoop,
     FastWMRRolloutCollector,
 ]:
     env = IsaacLabEnvAdapter(_FastWMRGymEnv())
@@ -156,17 +164,7 @@ def _integrated_pipeline(
         torch.optim.Adam(estimator.parameters(), lr=1e-3),
         interface=interface,
     )
-    runtime = FastWMREstimatorRuntime(estimator, num_envs=env.num_envs)
     normalizer = RunningObservationNormalizer(interface.policy_observation_dim)
-    processor = FastWMRSequenceFeatureProcessor(
-        estimator_updater,
-        runtime,
-        rollout_cache,
-        interface=interface,
-        observation_normalizer=normalizer,
-        gradient_cutoff=gradient_cutoff,
-        estimator_frozen=estimator_frozen,
-    )
 
     actor = TanhGaussianActor(
         interface.actor_input_dim,
@@ -194,22 +192,67 @@ def _integrated_pipeline(
         critic_optimizer=torch.optim.Adam(critic.parameters(), lr=3e-4),
         temperature_optimizer=torch.optim.Adam(temperature.parameters(), lr=3e-4),
     )
-    update_loop = FastWMRSequenceUpdateLoop(
-        replay,
-        sac_updater,
-        ReplayUpdateCfg(
-            random_action_steps=0,
-            minimum_replay_size=4,
-            batch_size=4,
-            num_updates=num_updates,
-        ),
-        SequenceReplayCfg(batch_size=1, burn_in_length=1, learning_length=2),
-        processor,
-        learner_device="cpu",
-        verify_gradient_boundaries=gradient_cutoff,
-        validation_interval=validation_interval,
-        initial_validation_updates=initial_validation_updates,
+    replay_cfg = ReplayUpdateCfg(
+        random_action_steps=0,
+        minimum_replay_size=4,
+        batch_size=4,
+        num_updates=num_updates,
     )
+    sequence_cfg = SequenceReplayCfg(batch_size=1, burn_in_length=1, learning_length=2)
+    if version == "v1":
+        runtime = FastWMREstimatorRuntime(estimator, num_envs=env.num_envs)
+        processor = FastWMRSequenceFeatureProcessor(
+            estimator_updater,
+            runtime,
+            rollout_cache,
+            interface=interface,
+            observation_normalizer=normalizer,
+            gradient_cutoff=gradient_cutoff,
+            estimator_frozen=estimator_frozen,
+        )
+        update_loop = FastWMRSequenceUpdateLoop(
+            replay,
+            sac_updater,
+            replay_cfg,
+            sequence_cfg,
+            processor,
+            learner_device="cpu",
+            verify_gradient_boundaries=gradient_cutoff,
+            validation_interval=validation_interval,
+            initial_validation_updates=initial_validation_updates,
+        )
+    elif version == "v2":
+        resolved_v2_cfg = v2_cfg or FastWMRV2Cfg()
+        control_estimator = copy.deepcopy(estimator)
+        ema_estimator = EMAControlEstimator(
+            estimator,
+            control_estimator,
+            tau=resolved_v2_cfg.control_estimator_tau,
+        )
+        runtime = FastWMREstimatorRuntime(control_estimator, num_envs=env.num_envs)
+        processor = FastWMRV2EstimatorController(
+            estimator_updater,
+            ema_estimator,
+            runtime,
+            rollout_cache,
+            cfg=resolved_v2_cfg,
+            interface=interface,
+            observation_normalizer=normalizer,
+            estimator_frozen=estimator_frozen,
+            validation_interval=validation_interval,
+            initial_validation_updates=initial_validation_updates,
+        )
+        update_loop = FastWMRV2UpdateLoop(
+            replay,
+            sac_updater,
+            replay_cfg,
+            sequence_cfg,
+            processor,
+            learner_device="cpu",
+            v2_cfg=resolved_v2_cfg,
+        )
+    else:
+        raise ValueError(f"Unknown FastWMR test version {version!r}.")
     collector = FastWMRRolloutCollector(env, replay, update_loop, interface=interface)
     return (
         env,
@@ -304,6 +347,88 @@ def test_update_bundle_rebuilds_runtime_once_and_periodicizes_validation() -> No
     assert [
         update.gradient_boundary.enabled for update in update_loop.last_agent_updates
     ] == [True, True, False, True]
+    env.close()
+
+
+def test_v2_splits_sac_and_estimator_with_ema_gate_and_one_rebuild() -> None:
+    v2_cfg = FastWMRV2Cfg(
+        estimator_update_interval=8,
+        estimator_updates_per_trigger=1,
+        max_estimator_feature_age=100,
+        stored_feature_replay_horizon=64,
+        control_estimator_tau=0.25,
+        reconstruction_gate_warmup_updates=2,
+    )
+    (
+        env,
+        replay,
+        _normalizer,
+        online_estimator,
+        estimator_updater,
+        runtime,
+        controller,
+        update_loop,
+        collector,
+    ) = _integrated_pipeline(
+        version="v2",
+        num_updates=4,
+        v2_cfg=v2_cfg,
+    )
+    assert isinstance(controller, FastWMRV2EstimatorController)
+    assert isinstance(update_loop, FastWMRV2UpdateLoop)
+    initial_control_parameters = [
+        parameter.detach().clone()
+        for parameter in controller.ema_estimator.control_estimator.parameters()
+    ]
+
+    initial_feature = collector.reset(seed=42)
+    assert torch.count_nonzero(
+        initial_feature[:, DEFAULT_INTERFACE_CFG.policy_observation_dim :]
+    ) == 0
+    results = [collector.collect_step() for _ in range(3)]
+
+    assert sum(len(result.updates) for result in results) == 8
+    assert update_loop.gradient_steps == 8
+    assert estimator_updater.version == 1
+    assert controller.estimator_updates == 1
+    assert controller.estimator_triggers == 1
+    assert controller.control_estimator_version == 1
+    assert controller.reconstruction_gate == pytest.approx(0.5)
+    assert runtime.estimator_version == 1
+    assert runtime.rebuilds == 1
+    assert len(update_loop.last_estimator_updates) == 1
+    assert update_loop.last_rejected_features == 0
+    for initial, online, control in zip(
+        initial_control_parameters,
+        online_estimator.parameters(),
+        controller.ema_estimator.control_estimator.parameters(),
+        strict=True,
+    ):
+        torch.testing.assert_close(
+            control,
+            initial.lerp(online.detach(), v2_cfg.control_estimator_tau),
+        )
+
+    online_after_trigger = [
+        parameter.detach().clone() for parameter in online_estimator.parameters()
+    ]
+    collector.collect_step()
+    assert all(
+        torch.equal(before, after)
+        for before, after in zip(
+            online_after_trigger,
+            online_estimator.parameters(),
+            strict=True,
+        )
+    )
+    assert all(
+        not parameter.requires_grad and parameter.grad is None
+        for parameter in controller.ema_estimator.control_estimator.parameters()
+    )
+    newest = replay.chronological().control_features[-env.num_envs :]
+    assert torch.count_nonzero(
+        newest[:, DEFAULT_INTERFACE_CFG.policy_observation_dim :]
+    ) > 0
     env.close()
 
 
@@ -615,6 +740,93 @@ def test_checkpoint_resume_restores_models_optimizers_normalizer_and_counters(tm
     )
     assert source_update.estimator_update.metrics.total_loss == pytest.approx(
         target_update.estimator_update.metrics.total_loss
+    )
+    source_env.close()
+    target_env.close()
+
+
+def test_v2_checkpoint_restores_online_ema_scheduler_gate_and_policy_state(tmp_path) -> None:
+    v2_cfg = FastWMRV2Cfg(
+        estimator_update_interval=4,
+        estimator_updates_per_trigger=1,
+        stored_feature_replay_horizon=64,
+        reconstruction_gate_warmup_updates=2,
+    )
+    source = _integrated_pipeline(
+        version="v2",
+        num_updates=4,
+        v2_cfg=v2_cfg,
+    )
+    source_env = source[0]
+    source_estimator_updater = source[4]
+    source_runtime = source[5]
+    source_controller = source[6]
+    source_loop = source[7]
+    source_collector = source[8]
+    assert isinstance(source_controller, FastWMRV2EstimatorController)
+    assert isinstance(source_loop, FastWMRV2UpdateLoop)
+    source_collector.reset(seed=43)
+    for _ in range(3):
+        source_collector.collect_step()
+
+    checkpoint = save_training_checkpoint(
+        tmp_path / "v2.pt",
+        mode=TrainingMode.FASTWMR,
+        sac_updater=source_loop.updater,
+        update_loop=source_loop,
+        normalizer=source[2],
+        estimator_updater=source_estimator_updater,
+        config={"arguments": {"fastwmr_version": "v2"}},
+    )
+    target = _integrated_pipeline(
+        version="v2",
+        num_updates=4,
+        v2_cfg=v2_cfg,
+    )
+    target_env = target[0]
+    target_controller = target[6]
+    target_loop = target[7]
+    assert isinstance(target_controller, FastWMRV2EstimatorController)
+    assert isinstance(target_loop, FastWMRV2UpdateLoop)
+    loaded = load_training_checkpoint(
+        checkpoint,
+        mode=TrainingMode.FASTWMR,
+        sac_updater=target_loop.updater,
+        update_loop=target_loop,
+        normalizer=target[2],
+        estimator_updater=target[4],
+        runtime=target[5],
+        rollout_cache=target_controller.rollout_cache,
+        map_location="cpu",
+    )
+
+    assert loaded.counters.estimator_updates == source_controller.estimator_updates
+    assert loaded.counters.estimator_triggers == source_controller.estimator_triggers
+    assert loaded.counters.control_estimator_version == source_runtime.estimator_version
+    assert target_loop.state_dict() == source_loop.state_dict()
+    assert target_controller.reconstruction_gate == source_controller.reconstruction_gate
+    assert target[5].estimator_version == source_runtime.estimator_version
+    assert target[5].rebuilds == 0
+    assert len(target[1]) == 0
+    assert len(target_controller.rollout_cache) == 0
+    _assert_module_equal(source[3], target[3])
+    _assert_module_equal(
+        source_controller.ema_estimator.control_estimator,
+        target_controller.ema_estimator.control_estimator,
+    )
+
+    deployment_estimator = copy.deepcopy(target[3])
+    load_policy_checkpoint(
+        checkpoint,
+        mode=TrainingMode.FASTWMR,
+        actor=target_loop.updater.actor,
+        estimator=deployment_estimator,
+        normalizer=target[2],
+        map_location="cpu",
+    )
+    _assert_module_equal(
+        source_controller.ema_estimator.control_estimator,
+        deployment_estimator,
     )
     source_env.close()
     target_env.close()

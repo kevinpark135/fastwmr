@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ..buffers import TransitionReplayBatch
+from ..buffers import StoredControlReplayBatch, TransitionReplayBatch
 from ..networks import (
     TargetTwinC51Critic,
     TargetTwinScalarCritic,
@@ -107,6 +107,22 @@ class SACTransitionBatch:
             actions=replay.actions.detach(),
             rewards=replay.rewards.detach(),
             next_states=next_states.detach(),
+            terminated=replay.terminated.detach(),
+            truncated=replay.truncated.detach(),
+        )
+
+    @classmethod
+    def from_stored_control_replay(
+        cls,
+        replay: StoredControlReplayBatch,
+    ) -> "SACTransitionBatch":
+        """Build the v2 SAC batch without transferring estimator-only fields."""
+
+        return cls(
+            states=replay.control_features.detach(),
+            actions=replay.actions.detach(),
+            rewards=replay.rewards.detach(),
+            next_states=replay.bootstrap_control_features.detach(),
             terminated=replay.terminated.detach(),
             truncated=replay.truncated.detach(),
         )

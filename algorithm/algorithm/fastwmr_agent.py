@@ -11,14 +11,17 @@ from torch import nn
 
 from ..buffers import EstimatorRolloutCache, SequenceReplayBatch, TransitionReplayBuffer
 from ..config import (
+    DEFAULT_FASTWMR_V2_CFG,
     DEFAULT_INTERFACE_CFG,
     FastWMRInterfaceCfg,
+    FastWMRV2Cfg,
     ReplayUpdateCfg,
     SequenceReplayCfg,
 )
 from ..utils.feature_builder import build_control_feature
 from ..utils.normalization import RunningObservationNormalizer
-from .estimator_update import EstimatorUpdateResult, EstimatorUpdater
+from ..utils.profiling import StageProfiler
+from .estimator_update import EMAControlEstimator, EstimatorUpdateResult, EstimatorUpdater
 from .sac_update import SACFeatureSource, SACTransitionBatch, SACUpdateMetrics, SACUpdater
 
 if TYPE_CHECKING:
@@ -415,6 +418,120 @@ class FastWMRSequenceFeatureProcessor:
         return None
 
 
+class FastWMRV2EstimatorController:
+    """Own the slow online estimator and the EMA estimator used for control."""
+
+    def __init__(
+        self,
+        estimator_updater: EstimatorUpdater,
+        ema_estimator: EMAControlEstimator,
+        runtime: "FastWMREstimatorRuntime",
+        rollout_cache: EstimatorRolloutCache,
+        *,
+        cfg: FastWMRV2Cfg = DEFAULT_FASTWMR_V2_CFG,
+        interface: FastWMRInterfaceCfg = DEFAULT_INTERFACE_CFG,
+        observation_normalizer: RunningObservationNormalizer | None = None,
+        estimator_frozen: bool = False,
+        validation_interval: int = 1,
+        initial_validation_updates: int = 0,
+    ) -> None:
+        if estimator_updater.estimator is not ema_estimator.online_estimator:
+            raise ValueError("Estimator updater must own the EMA online estimator.")
+        if runtime.estimator is not ema_estimator.control_estimator:
+            raise ValueError("Runtime must use the EMA control estimator.")
+        if runtime.estimator_version != ema_estimator.version:
+            raise ValueError("Runtime and EMA control-estimator versions must match.")
+        if rollout_cache.spec.num_envs != runtime.num_envs:
+            raise ValueError("Rollout cache and runtime environment counts must match.")
+        if validation_interval <= 0 or initial_validation_updates < 0:
+            raise ValueError("Estimator validation schedule is invalid.")
+        self.estimator_updater = estimator_updater
+        self.ema_estimator = ema_estimator
+        self.runtime = runtime
+        self.rollout_cache = rollout_cache
+        self.cfg = cfg
+        self.interface = interface
+        self.observation_normalizer = observation_normalizer
+        self.estimator_frozen = estimator_frozen
+        self.validation_interval = validation_interval
+        self.initial_validation_updates = initial_validation_updates
+        self.estimator_updates = 0
+        self.estimator_attempts = 0
+        self.estimator_triggers = 0
+        self.last_estimator_update: EstimatorUpdateResult | None = None
+        self.last_runtime_rebuild: EstimatorRuntimeRebuild | None = None
+
+    @property
+    def updates(self) -> int:
+        return self.estimator_updates
+
+    @property
+    def control_estimator_version(self) -> int:
+        return self.ema_estimator.version
+
+    @property
+    def reconstruction_gate(self) -> float:
+        start = self.cfg.reconstruction_gate_start_updates
+        warmup = self.cfg.reconstruction_gate_warmup_updates
+        if self.estimator_updates < start:
+            return 0.0
+        if warmup == 0:
+            return 1.0
+        progress = self.estimator_updates - start
+        return min(1.0, max(0.0, progress / warmup))
+
+    def update_sequence(self, sequence: SequenceReplayBatch) -> EstimatorUpdateResult:
+        """Run one slow estimator step without re-inferring SAC features."""
+
+        validate_values = self._should_validate_attempt()
+        result = (
+            self.estimator_updater.evaluate_sequence(
+                sequence,
+                validate_values=validate_values,
+            )
+            if self.estimator_frozen
+            else self.estimator_updater.update_sequence(
+                sequence,
+                validate_values=validate_values,
+            )
+        )
+        self.estimator_attempts += 1
+        if not self.estimator_frozen:
+            self.estimator_updates += 1
+        self.last_estimator_update = result
+        return result
+
+    def synchronize_control_estimator(self) -> "EstimatorRuntimeRebuild | None":
+        """EMA-sync once and rebuild rollout memory once after one trigger."""
+
+        self.estimator_triggers += 1
+        if self.estimator_frozen:
+            self.last_runtime_rebuild = None
+            return None
+        version = self.ema_estimator.update()
+        if len(self.rollout_cache) > 0:
+            rebuild = self.runtime.rebuild_from_cache(
+                self.rollout_cache,
+                estimator_version=version,
+                decode_full_sequence=False,
+            )
+        else:
+            self.runtime.reset_all(estimator_version=version)
+            rebuild = None
+        self.last_runtime_rebuild = rebuild
+        return rebuild
+
+    def clear_transient_state(self) -> None:
+        self.last_estimator_update = None
+        self.last_runtime_rebuild = None
+
+    def _should_validate_attempt(self) -> bool:
+        return (
+            self.estimator_attempts < self.initial_validation_updates
+            or self.estimator_attempts % self.validation_interval == 0
+        )
+
+
 class FastWMRAgent:
     """Own the ordered estimator and FastSAC optimizer lifecycle."""
 
@@ -621,6 +738,7 @@ class FastSACReplayUpdateLoop:
                 raise ValueError("Observation normalizer must be on learner_device.")
         self.environment_steps = 0
         self.gradient_steps = 0
+        self.profiler = StageProfiler(self.learner_device)
 
     @property
     def warming_up(self) -> bool:
@@ -669,15 +787,21 @@ class FastSACReplayUpdateLoop:
             return []
         metrics: list[SACUpdateMetrics] = []
         for _ in range(self.cfg.num_updates):
-            replay_batch = self.replay.sample(self.cfg.batch_size, generator=generator)
-            batch = SACTransitionBatch.from_replay(
-                replay_batch,
-                feature_source=SACFeatureSource.POLICY_OBSERVATION,
-            ).to(self.learner_device)
+            with self.profiler.measure("replay_sample"):
+                replay_batch = self.replay.sample(self.cfg.batch_size, generator=generator)
+            with self.profiler.measure("transfer"):
+                batch = SACTransitionBatch.from_replay(
+                    replay_batch,
+                    feature_source=SACFeatureSource.POLICY_OBSERVATION,
+                ).to(self.learner_device)
             batch = self._normalize_transition_batch(batch)
-            metrics.append(self.updater.update(batch))
+            with self.profiler.measure("sac_update"):
+                metrics.append(self.updater.update(batch))
             self.gradient_steps += 1
         return metrics
+
+    def drain_profile_metrics(self) -> dict[str, int | float]:
+        return self.profiler.drain_metrics()
 
     def _normalize_transition_batch(self, batch: SACTransitionBatch) -> SACTransitionBatch:
         if self.observation_normalizer is None:
@@ -754,22 +878,24 @@ class FastWMRSequenceUpdateLoop(FastSACReplayUpdateLoop):
         agent_updates: list[FastWMRAgentUpdateResult] = []
         minimum_insertion_id = self._minimum_sequence_insertion_id()
         for _ in range(self.cfg.num_updates):
-            sequence = self.replay.sample_sequences(
-                self.sequence_cfg.batch_size,
-                self.sequence_cfg.burn_in_length,
-                self.sequence_cfg.learning_length,
-                require_episode_start=self.sequence_cfg.require_episode_start,
-                minimum_insertion_id=minimum_insertion_id,
-                device=self.learner_device,
-                generator=generator,
-            )
+            with self.profiler.measure("sequence_sample_transfer"):
+                sequence = self.replay.sample_sequences(
+                    self.sequence_cfg.batch_size,
+                    self.sequence_cfg.burn_in_length,
+                    self.sequence_cfg.learning_length,
+                    require_episode_start=self.sequence_cfg.require_episode_start,
+                    minimum_insertion_id=minimum_insertion_id,
+                    device=self.learner_device,
+                    generator=generator,
+                )
             if self.sequence_augmentation is not None:
                 sequence = self.sequence_augmentation(sequence)
             if self.agent is not None:
-                agent_update = self.agent.update(
-                    sequence,
-                    synchronize_runtime=False,
-                )
+                with self.profiler.measure("integrated_estimator_sac_update"):
+                    agent_update = self.agent.update(
+                        sequence,
+                        synchronize_runtime=False,
+                    )
                 agent_updates.append(agent_update)
                 metrics.append(agent_update.sac_update)
             else:
@@ -778,7 +904,8 @@ class FastWMRSequenceUpdateLoop(FastSACReplayUpdateLoop):
                 metrics.append(self.updater.update(batch))
             self.gradient_steps += 1
         if agent_updates:
-            self.sequence_feature_processor.synchronize_runtime()
+            with self.profiler.measure("runtime_rebuild"):
+                self.sequence_feature_processor.synchronize_runtime()
         self.last_agent_updates = tuple(agent_updates)
         return metrics
 
@@ -798,3 +925,165 @@ class FastWMRSequenceUpdateLoop(FastSACReplayUpdateLoop):
             learning_features,
             actor_input_dim=self.updater.actor.input_dim,
         )
+
+
+class FastWMRV2UpdateLoop(FastSACReplayUpdateLoop):
+    """FastSAC transition updates plus a low-frequency sequence estimator."""
+
+    def __init__(
+        self,
+        replay: TransitionReplayBuffer,
+        updater: SACUpdater,
+        cfg: ReplayUpdateCfg,
+        sequence_cfg: SequenceReplayCfg,
+        estimator_controller: FastWMRV2EstimatorController,
+        *,
+        learner_device: torch.device | str,
+        v2_cfg: FastWMRV2Cfg = DEFAULT_FASTWMR_V2_CFG,
+        sequence_augmentation: SequenceAugmentation | None = None,
+    ) -> None:
+        super().__init__(replay, updater, cfg, learner_device=learner_device)
+        if estimator_controller.cfg != v2_cfg:
+            raise ValueError("V2 update loop and estimator controller configs must match.")
+        if replay.spec.control_feature_dim != updater.actor.input_dim:
+            raise ValueError("Stored control-feature width must match the actor input.")
+        self.sequence_cfg = sequence_cfg
+        self.estimator_controller = estimator_controller
+        self.sequence_feature_processor = estimator_controller
+        self.v2_cfg = v2_cfg
+        self.sequence_augmentation = sequence_augmentation
+        self.sac_updates_since_estimator = 0
+        self.last_estimator_updates: tuple[EstimatorUpdateResult, ...] = ()
+        self.last_feature_age_mean: torch.Tensor | None = None
+        self.last_feature_age_max: torch.Tensor | None = None
+        self.last_eligible_features = 0
+        self.last_rejected_features = 0
+
+    @property
+    def ready(self) -> bool:
+        if self.warming_up or len(self.replay) < self.cfg.minimum_replay_size:
+            return False
+        return self.replay.can_sample_control_features(
+            self.cfg.batch_size,
+            current_estimator_version=self.estimator_controller.control_estimator_version,
+            max_estimator_feature_age=self.v2_cfg.max_estimator_feature_age,
+            recent_transition_horizon=self.v2_cfg.stored_feature_replay_horizon,
+        )
+
+    @property
+    def estimator_ready(self) -> bool:
+        return self.replay.can_sample_sequences(
+            self.sequence_cfg.batch_size,
+            self.sequence_cfg.burn_in_length,
+            self.sequence_cfg.learning_length,
+            require_episode_start=self.sequence_cfg.require_episode_start,
+            minimum_insertion_id=self._minimum_sequence_insertion_id(),
+        )
+
+    def run_updates(self, *, generator: torch.Generator | None = None) -> list[SACUpdateMetrics]:
+        self.last_estimator_updates = ()
+        if not self.ready:
+            return []
+        metrics: list[SACUpdateMetrics] = []
+        estimator_updates: list[EstimatorUpdateResult] = []
+        for _ in range(self.cfg.num_updates):
+            current_version = self.estimator_controller.control_estimator_version
+            with self.profiler.measure("stored_feature_sample"):
+                replay_batch = self.replay.sample_control_features(
+                    self.cfg.batch_size,
+                    current_estimator_version=current_version,
+                    max_estimator_feature_age=self.v2_cfg.max_estimator_feature_age,
+                    recent_transition_horizon=self.v2_cfg.stored_feature_replay_horizon,
+                    generator=generator,
+                )
+                feature_ages = replay_batch.feature_ages(current_version)
+            with self.profiler.measure("transfer"):
+                batch = SACTransitionBatch.from_stored_control_replay(replay_batch).to(
+                    self.learner_device
+                )
+            with self.profiler.measure("sac_update"):
+                metrics.append(self.updater.update(batch))
+            self.gradient_steps += 1
+            self.sac_updates_since_estimator += 1
+            self.last_feature_age_mean = feature_ages.float().mean()
+            self.last_feature_age_max = feature_ages.max()
+
+            if (
+                self.sac_updates_since_estimator >= self.v2_cfg.estimator_update_interval
+                and self.estimator_ready
+            ):
+                estimator_updates.extend(self._run_estimator_trigger(generator=generator))
+                self.sac_updates_since_estimator = 0
+
+        self.last_eligible_features = self.replay.eligible_control_feature_count(
+            current_estimator_version=self.estimator_controller.control_estimator_version,
+            max_estimator_feature_age=self.v2_cfg.max_estimator_feature_age,
+            recent_transition_horizon=self.v2_cfg.stored_feature_replay_horizon,
+        )
+        self.last_rejected_features = len(self.replay) - self.last_eligible_features
+        self.last_estimator_updates = tuple(estimator_updates)
+        return metrics
+
+    def state_dict(self) -> dict[str, int]:
+        return {
+            "sac_updates_since_estimator": self.sac_updates_since_estimator,
+            "estimator_updates": self.estimator_controller.estimator_updates,
+            "estimator_attempts": self.estimator_controller.estimator_attempts,
+            "estimator_triggers": self.estimator_controller.estimator_triggers,
+            "control_estimator_version": (
+                self.estimator_controller.control_estimator_version
+            ),
+        }
+
+    def load_state_dict(self, state: dict[str, int]) -> None:
+        values = {name: int(value) for name, value in state.items()}
+        required = {
+            "sac_updates_since_estimator",
+            "estimator_updates",
+            "estimator_attempts",
+            "estimator_triggers",
+            "control_estimator_version",
+        }
+        if values.keys() != required or any(value < 0 for value in values.values()):
+            raise ValueError("FastWMR v2 scheduler state is incomplete or invalid.")
+        self.sac_updates_since_estimator = values["sac_updates_since_estimator"]
+        self.estimator_controller.estimator_updates = values["estimator_updates"]
+        self.estimator_controller.estimator_attempts = values["estimator_attempts"]
+        self.estimator_controller.estimator_triggers = values["estimator_triggers"]
+        self.estimator_controller.ema_estimator.restart(
+            version=values["control_estimator_version"]
+        )
+        self.estimator_controller.clear_transient_state()
+        self.last_estimator_updates = ()
+
+    def _run_estimator_trigger(
+        self,
+        *,
+        generator: torch.Generator | None,
+    ) -> list[EstimatorUpdateResult]:
+        updates: list[EstimatorUpdateResult] = []
+        minimum_insertion_id = self._minimum_sequence_insertion_id()
+        for _ in range(self.v2_cfg.estimator_updates_per_trigger):
+            with self.profiler.measure("estimator_sequence_sample_transfer"):
+                sequence = self.replay.sample_sequences(
+                    self.sequence_cfg.batch_size,
+                    self.sequence_cfg.burn_in_length,
+                    self.sequence_cfg.learning_length,
+                    require_episode_start=self.sequence_cfg.require_episode_start,
+                    minimum_insertion_id=minimum_insertion_id,
+                    device=self.learner_device,
+                    generator=generator,
+                )
+                if self.sequence_augmentation is not None:
+                    sequence = self.sequence_augmentation(sequence)
+            with self.profiler.measure("estimator_update"):
+                updates.append(self.estimator_controller.update_sequence(sequence))
+        with self.profiler.measure("ema_sync_runtime_rebuild"):
+            self.estimator_controller.synchronize_control_estimator()
+        return updates
+
+    def _minimum_sequence_insertion_id(self) -> int | None:
+        horizon = self.sequence_cfg.recent_transition_horizon
+        if horizon is None:
+            return None
+        return max(0, self.replay.total_inserted - horizon)

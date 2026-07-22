@@ -26,6 +26,7 @@ def build_control_feature(
     cfg: FastWMRInterfaceCfg = DEFAULT_INTERFACE_CFG,
     normalizer: ObservationNormalizer | None = None,
     detach_reconstruction: bool = True,
+    reconstruction_gate: float = 1.0,
 ) -> torch.Tensor:
     """Build ``x_t`` while enforcing the estimator gradient cutoff.
 
@@ -36,6 +37,8 @@ def build_control_feature(
 
     _check_last_dim(policy_observation, cfg.policy_observation_dim, "policy_observation")
     _check_last_dim(reconstructed_state, cfg.reconstruction_target_dim, "reconstructed_state")
+    if not 0.0 <= reconstruction_gate <= 1.0:
+        raise ValueError("reconstruction_gate must be in [0, 1].")
     if policy_observation.shape[:-1] != reconstructed_state.shape[:-1]:
         raise ValueError(
             "policy_observation and reconstructed_state batch shapes must match, got "
@@ -49,6 +52,7 @@ def build_control_feature(
     routed_reconstruction = (
         reconstructed_state.detach() if detach_reconstruction else reconstructed_state
     )
+    routed_reconstruction = reconstruction_gate * routed_reconstruction
     if cfg.control_feature_mode is ControlFeatureMode.RECONSTRUCTION_ONLY:
         feature = routed_reconstruction
     else:

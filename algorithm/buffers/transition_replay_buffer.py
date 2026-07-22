@@ -142,6 +142,47 @@ class TransitionReplayBatch:
 
 
 @dataclass(frozen=True)
+class StoredControlReplayBatch:
+    """Minimal replay contract for FastWMR v2's transition SAC learner."""
+
+    control_features: torch.Tensor
+    actions: torch.Tensor
+    rewards: torch.Tensor
+    bootstrap_control_features: torch.Tensor
+    terminated: torch.Tensor
+    truncated: torch.Tensor
+    estimator_versions: torch.Tensor
+    insertion_ids: torch.Tensor
+
+    @property
+    def batch_size(self) -> int:
+        return self.control_features.shape[0]
+
+    def feature_ages(self, current_estimator_version: int) -> torch.Tensor:
+        if current_estimator_version < 0:
+            raise ValueError("current_estimator_version must be non-negative.")
+        ages = current_estimator_version - self.estimator_versions
+        if torch.any(ages < 0):
+            raise ValueError("Replay contains control features from a future estimator version.")
+        return ages
+
+    def to(
+        self,
+        device: torch.device | str,
+        non_blocking: bool = False,
+    ) -> "StoredControlReplayBatch":
+        return StoredControlReplayBatch(
+            **{
+                field.name: getattr(self, field.name).to(
+                    device=device,
+                    non_blocking=non_blocking,
+                )
+                for field in fields(self)
+            }
+        )
+
+
+@dataclass(frozen=True)
 class SequenceReplayBatch:
     """Boundary-safe FastWMR sequence with burn-in and learning windows.
 
@@ -419,6 +460,39 @@ class TransitionReplayBuffer:
             raise ValueError(f"batch_size must be positive, got {batch_size}.")
         return self._size >= batch_size
 
+    def eligible_control_feature_count(
+        self,
+        *,
+        current_estimator_version: int,
+        max_estimator_feature_age: int | None,
+        recent_transition_horizon: int | None,
+    ) -> int:
+        """Count retained stored features satisfying v2 staleness controls."""
+
+        return int(
+            self._control_feature_candidates(
+                current_estimator_version=current_estimator_version,
+                max_estimator_feature_age=max_estimator_feature_age,
+                recent_transition_horizon=recent_transition_horizon,
+            ).numel()
+        )
+
+    def can_sample_control_features(
+        self,
+        batch_size: int,
+        *,
+        current_estimator_version: int,
+        max_estimator_feature_age: int | None,
+        recent_transition_horizon: int | None,
+    ) -> bool:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        return self.eligible_control_feature_count(
+            current_estimator_version=current_estimator_version,
+            max_estimator_feature_age=max_estimator_feature_age,
+            recent_transition_horizon=recent_transition_horizon,
+        ) >= batch_size
+
     def add(
         self,
         observations: torch.Tensor,
@@ -649,6 +723,41 @@ class TransitionReplayBuffer:
         batch = self._batch_at(indices)
         return batch if device is None else batch.to(device)
 
+    def sample_control_features(
+        self,
+        batch_size: int,
+        *,
+        current_estimator_version: int,
+        max_estimator_feature_age: int | None,
+        recent_transition_horizon: int | None,
+        device: torch.device | str | None = None,
+        generator: torch.Generator | None = None,
+    ) -> StoredControlReplayBatch:
+        """Sample only stored control features accepted by the v2 age policy."""
+
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        if self.spec.control_feature_dim <= 0:
+            raise RuntimeError("Stored control-feature sampling requires FastWMR replay.")
+        candidates = self._control_feature_candidates(
+            current_estimator_version=current_estimator_version,
+            max_estimator_feature_age=max_estimator_feature_age,
+            recent_transition_horizon=recent_transition_horizon,
+        )
+        if candidates.numel() < batch_size:
+            raise RuntimeError(
+                f"Need {batch_size} eligible stored features, found {candidates.numel()}."
+            )
+        choices = torch.randint(
+            candidates.numel(),
+            (batch_size,),
+            generator=generator,
+            device="cpu",
+        )
+        indices = candidates[choices.to(candidates.device)]
+        batch = self._stored_control_batch_at(indices)
+        return batch if device is None else batch.to(device)
+
     def can_sample_sequences(
         self,
         batch_size: int,
@@ -803,6 +912,54 @@ class TransitionReplayBuffer:
             final_observation_mask=self._final_observation_mask[indices],
             insertion_ids=self._insertion_ids[indices],
         )
+
+    def _stored_control_batch_at(self, indices: torch.Tensor) -> StoredControlReplayBatch:
+        bootstrap_control_features = torch.where(
+            self._final_observation_mask[indices].unsqueeze(-1),
+            self._final_control_features[indices],
+            self._next_control_features[indices],
+        )
+        return StoredControlReplayBatch(
+            control_features=self._control_features[indices],
+            actions=self._actions[indices],
+            rewards=self._rewards[indices],
+            bootstrap_control_features=bootstrap_control_features,
+            terminated=self._terminated[indices],
+            truncated=self._truncated[indices],
+            estimator_versions=self._estimator_versions[indices],
+            insertion_ids=self._insertion_ids[indices],
+        )
+
+    def _control_feature_candidates(
+        self,
+        *,
+        current_estimator_version: int,
+        max_estimator_feature_age: int | None,
+        recent_transition_horizon: int | None,
+    ) -> torch.Tensor:
+        if self.spec.control_feature_dim <= 0:
+            raise RuntimeError("Control-feature candidates require FastWMR replay.")
+        if current_estimator_version < 0:
+            raise ValueError("current_estimator_version must be non-negative.")
+        if max_estimator_feature_age is not None and max_estimator_feature_age < 0:
+            raise ValueError("max_estimator_feature_age must be non-negative when provided.")
+        if recent_transition_horizon is not None and recent_transition_horizon <= 0:
+            raise ValueError("recent_transition_horizon must be positive when provided.")
+        if self._size == 0:
+            return torch.empty(0, dtype=torch.int64, device=self.storage_device)
+
+        retained = torch.ones(self.capacity, dtype=torch.bool, device=self.storage_device)
+        if not self.is_full:
+            retained[self._size :] = False
+        ages = current_estimator_version - self._estimator_versions
+        if torch.any(ages[retained] < 0):
+            raise ValueError("Replay contains control features from a future estimator version.")
+        if max_estimator_feature_age is not None:
+            retained &= ages <= max_estimator_feature_age
+        if recent_transition_horizon is not None:
+            minimum_insertion_id = max(0, self._total_inserted - recent_transition_horizon)
+            retained &= self._insertion_ids >= minimum_insertion_id
+        return torch.nonzero(retained, as_tuple=False).squeeze(-1)
 
     def _remove_temporal_links(self, indices: torch.Tensor) -> None:
         """Unlink overwritten replay slots without scanning temporal keys."""

@@ -22,6 +22,9 @@ def test_train_cli_defaults_to_fastwmr_and_validates() -> None:
     assert args.resume is None
     assert args.log_interval == 5
     assert args.checkpoint_interval == 100
+    assert args.fastwmr_version == "v2"
+    assert args.estimator_update_interval == 8
+    assert args.max_estimator_feature_age == 100
     assert args.burn_in_length > 0
     assert args.learning_length > 0
 
@@ -107,6 +110,9 @@ def test_play_cli_validates_fixed_budget(tmp_path) -> None:
         ("--burn-in-length", "-1", "--burn-in-length"),
         ("--validation-interval", "0", "--validation-interval"),
         ("--initial-validation-updates", "-1", "--initial-validation-updates"),
+        ("--estimator-update-interval", "0", "--estimator-update-interval"),
+        ("--max-estimator-feature-age", "-1", "--max-estimator-feature-age"),
+        ("--control-estimator-tau", "0", "--control-estimator-tau"),
         ("--estimator-cache-steps", "0", "--estimator-cache-steps"),
         ("--run-name", "nested/run", "--run-name"),
     ),

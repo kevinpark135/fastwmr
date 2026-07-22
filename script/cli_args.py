@@ -78,6 +78,15 @@ def build_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--estimator-learning-rate", type=float, default=3e-4)
     parser.add_argument("--estimator-weight-decay", type=float, default=1e-3)
     parser.add_argument("--estimator-cache-steps", type=int, default=64)
+    parser.add_argument("--fastwmr-version", choices=("v1", "v2"), default="v2")
+    parser.add_argument("--estimator-update-interval", type=int, default=8)
+    parser.add_argument("--estimator-updates-per-trigger", type=int, default=1)
+    parser.add_argument("--max-estimator-feature-age", type=int, default=100)
+    parser.add_argument("--disable-feature-age-filter", action="store_true")
+    parser.add_argument("--stored-feature-replay-horizon", type=int, default=200_000)
+    parser.add_argument("--control-estimator-tau", type=float, default=0.005)
+    parser.add_argument("--reconstruction-gate-start-updates", type=int, default=0)
+    parser.add_argument("--reconstruction-gate-warmup-updates", type=int, default=1_000)
     parser.add_argument("--sequence-batch-size", type=int, default=256)
     parser.add_argument("--burn-in-length", type=int, default=16)
     parser.add_argument("--learning-length", type=int, default=8)
@@ -151,6 +160,9 @@ def validate_train_args(args: argparse.Namespace) -> None:
         "estimator_hidden_dim",
         "estimator_num_layers",
         "estimator_cache_steps",
+        "estimator_update_interval",
+        "estimator_updates_per_trigger",
+        "stored_feature_replay_horizon",
         "sequence_batch_size",
         "learning_length",
         "validation_interval",
@@ -167,12 +179,22 @@ def validate_train_args(args: argparse.Namespace) -> None:
         raise ValueError("--burn-in-length must be non-negative.")
     if args.initial_validation_updates < 0:
         raise ValueError("--initial-validation-updates must be non-negative.")
+    if args.max_estimator_feature_age < 0:
+        raise ValueError("--max-estimator-feature-age must be non-negative.")
+    if not 0.0 < args.control_estimator_tau <= 1.0:
+        raise ValueError("--control-estimator-tau must be in (0, 1].")
+    if args.reconstruction_gate_start_updates < 0:
+        raise ValueError("--reconstruction-gate-start-updates must be non-negative.")
+    if args.reconstruction_gate_warmup_updates < 0:
+        raise ValueError("--reconstruction-gate-warmup-updates must be non-negative.")
     if args.checkpoint_interval < 0:
         raise ValueError("--checkpoint-interval must be non-negative.")
     if args.recent_replay_horizon is not None and args.recent_replay_horizon <= 0:
         raise ValueError("--recent-replay-horizon must be positive when provided.")
     if args.freeze_estimator and args.disable_gradient_cutoff:
         raise ValueError("--freeze-estimator cannot be combined with --disable-gradient-cutoff.")
+    if args.fastwmr_version == "v2" and args.disable_gradient_cutoff:
+        raise ValueError("--disable-gradient-cutoff is only available in FastWMR v1.")
     fastwmr_ablation_requested = (
         args.control_feature_mode != "obs_and_reconstruction"
         or args.freeze_estimator

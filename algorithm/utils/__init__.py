@@ -17,12 +17,15 @@ from .logging_utils import (
     CompletedEpisodeStatistics,
     EpisodeStatisticsTracker,
     TrainingMetricsLogger,
+    estimator_metrics_dict,
     fastwmr_agent_metrics_dict,
+    fastwmr_v2_metrics_dict,
     format_console_metrics,
     format_console_metrics_header,
     sac_metrics_dict,
 )
 from .normalization import RunningObservationNormalizer
+from .profiling import StageProfiler
 from .temporal_state import (
     RecurrentState,
     RecurrentStateManager,
@@ -42,13 +45,16 @@ __all__ = [
     "RecurrentState",
     "RecurrentStateManager",
     "RunningObservationNormalizer",
+    "StageProfiler",
     "TrainingMetricsLogger",
     "aggregate_evaluation_records",
     "bellman_bootstrap_mask",
     "build_control_feature",
     "build_critic_input",
     "episode_end_mask",
+    "estimator_metrics_dict",
     "fastwmr_agent_metrics_dict",
+    "fastwmr_v2_metrics_dict",
     "format_console_metrics",
     "format_console_metrics_header",
     "load_evaluation_record",

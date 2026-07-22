@@ -16,6 +16,10 @@ deployable proprioceptive observation and the estimator's reconstruction.
   reconstruction target.
 - Boundary-safe sequence replay with episode-aware sampling, recurrent burn-in,
   and a separate estimator rollout cache.
+- A two-timescale FastWMR v2 learner with stored SAC features, a low-frequency
+  online estimator, an EMA control estimator, reconstruction gating, and
+  feature-age filtering. Strict-current FastWMR v1 remains available as a
+  reference mode.
 - Recurrent history encoder with continuous regression and discrete contact
   decoding heads.
 - Tanh-Gaussian actor, automatic entropy temperature optimization, and twin C51
@@ -83,6 +87,23 @@ Train FastWMR with the default C51 critic:
 python script/train.py \
   --task Isaac-Velocity-G1-FastWMR-v0 \
   --run-name g1_fastwmr \
+  --device cuda:0 \
+  --viz none
+```
+
+The default `--fastwmr-version v2` runs eight stored-feature SAC updates per
+estimator trigger, performs one sequence estimator update, synchronizes the EMA
+control estimator, and rebuilds recurrent runtime state once. The main controls
+are `--estimator-update-interval`, `--estimator-updates-per-trigger`,
+`--control-estimator-tau`, `--max-estimator-feature-age`,
+`--stored-feature-replay-horizon`, and the reconstruction-gate options.
+
+Run the strict-current v1 reference path with:
+
+```bash
+python script/train.py \
+  --fastwmr-version v1 \
+  --run-name g1_fastwmr_v1 \
   --device cuda:0 \
   --viz none
 ```
@@ -186,8 +207,11 @@ python script/train.py --control-feature-mode reconstruction_only --viz none
 # Freeze the estimator while training the controller
 python script/train.py --freeze-estimator --viz none
 
-# Remove the estimator-to-controller gradient cutoff
-python script/train.py --disable-gradient-cutoff --viz none
+# Remove the estimator-to-controller gradient cutoff in strict v1
+python script/train.py --fastwmr-version v1 --disable-gradient-cutoff --viz none
+
+# Disable v2 feature-age rejection while retaining the recent replay horizon
+python script/train.py --disable-feature-age-filter --viz none
 
 # Restrict sequence sampling to recent replay and enable symmetry augmentation
 python script/train.py --recent-replay-horizon 131072 --use-symmetry --viz none

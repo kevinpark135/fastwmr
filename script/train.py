@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import time
 import traceback
 from functools import partial
@@ -35,6 +36,7 @@ import isaaclab_tasks  # noqa: F401
 import isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr  # noqa: F401
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.algorithm import (
     C51SACUpdater,
+    EMAControlEstimator,
     EntropyTemperature,
     EstimatorUpdater,
     FastSACReplayUpdateLoop,
@@ -43,6 +45,8 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.a
     FastWMRRolloutCollector,
     FastWMRSequenceFeatureProcessor,
     FastWMRSequenceUpdateLoop,
+    FastWMRV2EstimatorController,
+    FastWMRV2UpdateLoop,
     SACUpdater,
     TrainingMode,
     WorldStateEstimator,
@@ -61,6 +65,7 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.c
     ControlFeatureMode,
     DistributionalCriticCfg,
     FastWMRInterfaceCfg,
+    FastWMRV2Cfg,
     ObservationNormalizationCfg,
     ReplayUpdateCfg,
     ScalarCriticCfg,
@@ -81,7 +86,9 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.u
     IsaacLabEnvAdapter,
     RunningObservationNormalizer,
     TrainingMetricsLogger,
+    estimator_metrics_dict,
     fastwmr_agent_metrics_dict,
+    fastwmr_v2_metrics_dict,
     format_console_metrics,
     format_console_metrics_header,
     sac_metrics_dict,
@@ -303,16 +310,6 @@ def _build_components(
         ),
         interface=interface,
     )
-    runtime = FastWMREstimatorRuntime(estimator, env.num_envs)
-    processor = FastWMRSequenceFeatureProcessor(
-        estimator_updater,
-        runtime,
-        rollout_cache,
-        interface=interface,
-        observation_normalizer=normalizer,
-        gradient_cutoff=not ARGS.disable_gradient_cutoff,
-        estimator_frozen=ARGS.freeze_estimator,
-    )
     updater = _build_sac_updater(
         interface.control_feature_dim,
         action_dim,
@@ -320,31 +317,87 @@ def _build_components(
         action_low=action_low,
         action_high=action_high,
     )
-    update_loop = FastWMRSequenceUpdateLoop(
-        replay,
-        updater,
-        update_cfg,
-        SequenceReplayCfg(
-            batch_size=ARGS.sequence_batch_size,
-            burn_in_length=ARGS.burn_in_length,
-            learning_length=ARGS.learning_length,
-            require_episode_start=ARGS.require_episode_start,
-            recent_transition_horizon=ARGS.recent_replay_horizon,
-        ),
-        processor,
-        learner_device=device,
-        verify_gradient_boundaries=(
-            not ARGS.disable_gradient_boundary_checks
-            and not ARGS.disable_gradient_cutoff
-        ),
-        validation_interval=ARGS.validation_interval,
-        initial_validation_updates=ARGS.initial_validation_updates,
-        sequence_augmentation=(
-            partial(augment_sequence_batch, interface=interface)
-            if ARGS.use_symmetry
-            else None
-        ),
+    sequence_cfg = SequenceReplayCfg(
+        batch_size=ARGS.sequence_batch_size,
+        burn_in_length=ARGS.burn_in_length,
+        learning_length=ARGS.learning_length,
+        require_episode_start=ARGS.require_episode_start,
+        recent_transition_horizon=ARGS.recent_replay_horizon,
     )
+    sequence_augmentation = (
+        partial(augment_sequence_batch, interface=interface)
+        if ARGS.use_symmetry
+        else None
+    )
+    if ARGS.fastwmr_version == "v1":
+        runtime = FastWMREstimatorRuntime(estimator, env.num_envs)
+        processor = FastWMRSequenceFeatureProcessor(
+            estimator_updater,
+            runtime,
+            rollout_cache,
+            interface=interface,
+            observation_normalizer=normalizer,
+            gradient_cutoff=not ARGS.disable_gradient_cutoff,
+            estimator_frozen=ARGS.freeze_estimator,
+        )
+        update_loop = FastWMRSequenceUpdateLoop(
+            replay,
+            updater,
+            update_cfg,
+            sequence_cfg,
+            processor,
+            learner_device=device,
+            verify_gradient_boundaries=(
+                not ARGS.disable_gradient_boundary_checks
+                and not ARGS.disable_gradient_cutoff
+            ),
+            validation_interval=ARGS.validation_interval,
+            initial_validation_updates=ARGS.initial_validation_updates,
+            sequence_augmentation=sequence_augmentation,
+        )
+    else:
+        v2_cfg = FastWMRV2Cfg(
+            estimator_update_interval=ARGS.estimator_update_interval,
+            estimator_updates_per_trigger=ARGS.estimator_updates_per_trigger,
+            max_estimator_feature_age=(
+                None
+                if ARGS.disable_feature_age_filter
+                else ARGS.max_estimator_feature_age
+            ),
+            stored_feature_replay_horizon=ARGS.stored_feature_replay_horizon,
+            control_estimator_tau=ARGS.control_estimator_tau,
+            reconstruction_gate_start_updates=ARGS.reconstruction_gate_start_updates,
+            reconstruction_gate_warmup_updates=ARGS.reconstruction_gate_warmup_updates,
+        )
+        control_estimator = copy.deepcopy(estimator).to(device)
+        ema_estimator = EMAControlEstimator(
+            estimator,
+            control_estimator,
+            tau=v2_cfg.control_estimator_tau,
+        )
+        runtime = FastWMREstimatorRuntime(control_estimator, env.num_envs)
+        controller = FastWMRV2EstimatorController(
+            estimator_updater,
+            ema_estimator,
+            runtime,
+            rollout_cache,
+            cfg=v2_cfg,
+            interface=interface,
+            observation_normalizer=normalizer,
+            estimator_frozen=ARGS.freeze_estimator,
+            validation_interval=ARGS.validation_interval,
+            initial_validation_updates=ARGS.initial_validation_updates,
+        )
+        update_loop = FastWMRV2UpdateLoop(
+            replay,
+            updater,
+            update_cfg,
+            sequence_cfg,
+            controller,
+            learner_device=device,
+            v2_cfg=v2_cfg,
+            sequence_augmentation=sequence_augmentation,
+        )
     return TrainingComponents(
         mode=TrainingMode.FASTWMR,
         replay=replay,
@@ -488,6 +541,7 @@ def run() -> None:
         interval_length_sum = 0
         last_sac_metrics = None
         last_agent_update = None
+        last_estimator_update = None
         training_started = time.perf_counter()
         collected_steps = 0
 
@@ -511,6 +565,11 @@ def run() -> None:
                 and components.update_loop.last_agent_updates
             ):
                 last_agent_update = components.update_loop.last_agent_updates[-1]
+            if (
+                isinstance(components.update_loop, FastWMRV2UpdateLoop)
+                and components.update_loop.last_estimator_updates
+            ):
+                last_estimator_update = components.update_loop.last_estimator_updates[-1]
 
             global_step = components.update_loop.environment_steps
             training_elapsed = time.perf_counter() - training_started
@@ -577,6 +636,10 @@ def run() -> None:
                     metrics.update(sac_metrics_dict(last_sac_metrics))
                 if last_agent_update is not None:
                     metrics.update(fastwmr_agent_metrics_dict(last_agent_update))
+                if last_estimator_update is not None:
+                    metrics.update(estimator_metrics_dict(last_estimator_update))
+                if isinstance(components.update_loop, FastWMRV2UpdateLoop):
+                    metrics.update(fastwmr_v2_metrics_dict(components.update_loop))
                 if components.runtime is not None:
                     metrics.update(
                         {
@@ -587,6 +650,7 @@ def run() -> None:
                     )
                 if components.rollout_cache is not None:
                     metrics["estimator_cache/steps"] = len(components.rollout_cache)
+                metrics.update(components.update_loop.drain_profile_metrics())
                 if getattr(cfg.curriculum, "terrain_levels", None) is not None:
                     terrain_state = terrain_curriculum_state(raw_env.unwrapped)
                     if terrain_state is not None:

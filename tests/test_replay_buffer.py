@@ -112,6 +112,51 @@ def test_fastwmr_replay_preserves_every_extended_field() -> None:
     assert torch.equal(retained.bootstrap_mask, torch.tensor([0.0, 1.0]))
 
 
+def test_stored_control_sampling_filters_feature_age_and_transfers_minimal_fields() -> None:
+    buffer = TransitionReplayBuffer(
+        ReplayBufferSpec(
+            capacity=8,
+            observation_dim=3,
+            action_dim=2,
+            privileged_state_dim=2,
+            control_feature_dim=5,
+            require_temporal_metadata=True,
+        )
+    )
+    transition = _base_transition(0, 4)
+    values = torch.arange(4, dtype=torch.float32)
+    buffer.add(
+        **transition,
+        privileged_states=values[:, None].repeat(1, 2),
+        next_privileged_states=(values + 1)[:, None].repeat(1, 2),
+        control_features=values[:, None].repeat(1, 5),
+        next_control_features=(values + 1)[:, None].repeat(1, 5),
+        estimator_versions=torch.arange(4),
+        episode_ids=torch.zeros(4, dtype=torch.int64),
+        env_ids=torch.arange(4),
+        timesteps=torch.zeros(4, dtype=torch.int64),
+        reset_boundaries=torch.ones(4, dtype=torch.bool),
+    )
+
+    assert buffer.eligible_control_feature_count(
+        current_estimator_version=3,
+        max_estimator_feature_age=1,
+        recent_transition_horizon=3,
+    ) == 2
+    batch = buffer.sample_control_features(
+        2,
+        current_estimator_version=3,
+        max_estimator_feature_age=1,
+        recent_transition_horizon=3,
+        generator=torch.Generator().manual_seed(4),
+    )
+
+    assert batch.control_features.shape == (2, 5)
+    assert torch.all(batch.estimator_versions >= 2)
+    assert torch.all(batch.feature_ages(3) <= 1)
+    assert not hasattr(batch, "privileged_states")
+
+
 def test_fastwmr_spec_requires_extension_fields_and_temporal_metadata() -> None:
     spec = ReplayBufferSpec(
         capacity=4,

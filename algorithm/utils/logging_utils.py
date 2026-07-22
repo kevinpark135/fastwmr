@@ -180,16 +180,9 @@ def fastwmr_agent_metrics_dict(update: object) -> dict[str, float | int]:
     """Combine SAC, estimator, and gradient-boundary diagnostics."""
 
     output: dict[str, float | int] = sac_metrics_dict(update.sac_update)
-    estimator = update.estimator_update.metrics
+    output.update(estimator_metrics_dict(update.estimator_update))
     output.update(
         {
-            "estimator/total_loss": float(estimator.total_loss),
-            "estimator/continuous_mse": float(estimator.continuous_mse),
-            "estimator/discrete_bce": float(estimator.discrete_bce),
-            "estimator/latent_l1": float(estimator.latent_l1),
-            "estimator/gradient_norm": float(estimator.gradient_norm),
-            "estimator/context_exact_fraction": float(estimator.context_exact_fraction),
-            "estimator/version": int(estimator.estimator_version),
             "gradient_boundary/checks": int(update.gradient_boundary.checks),
             "gradient_boundary/enabled": int(update.gradient_boundary.enabled),
             "gradient_boundary/cutoff_enabled": int(
@@ -210,9 +203,46 @@ def fastwmr_agent_metrics_dict(update: object) -> dict[str, float | int]:
         output["gradient_boundary/policy_estimator_gradient_norm"] = float(
             policy_gradient_norm
         )
+    return output
+
+
+def estimator_metrics_dict(update: object) -> dict[str, float | int]:
+    """Convert one standalone estimator result into logging scalars."""
+
+    estimator = update.metrics
+    output: dict[str, float | int] = {
+        "estimator/total_loss": float(estimator.total_loss),
+        "estimator/continuous_mse": float(estimator.continuous_mse),
+        "estimator/discrete_bce": float(estimator.discrete_bce),
+        "estimator/latent_l1": float(estimator.latent_l1),
+        "estimator/gradient_norm": float(estimator.gradient_norm),
+        "estimator/context_exact_fraction": float(estimator.context_exact_fraction),
+        "estimator/version": int(estimator.estimator_version),
+    }
     for name, value in estimator.field_losses.items():
         output[f"estimator/field/{name}"] = float(value)
     return output
+
+
+def fastwmr_v2_metrics_dict(update_loop: object) -> dict[str, float | int]:
+    """Expose two-timescale scheduling, gate, and feature-age diagnostics."""
+
+    controller = update_loop.estimator_controller
+    metrics: dict[str, float | int] = {
+        "v2/estimator_updates": int(controller.estimator_updates),
+        "v2/estimator_attempts": int(controller.estimator_attempts),
+        "v2/estimator_triggers": int(controller.estimator_triggers),
+        "v2/control_estimator_version": int(controller.control_estimator_version),
+        "v2/sac_updates_since_estimator": int(update_loop.sac_updates_since_estimator),
+        "v2/reconstruction_gate": float(controller.reconstruction_gate),
+        "v2/eligible_features": int(update_loop.last_eligible_features),
+        "v2/rejected_features": int(update_loop.last_rejected_features),
+    }
+    if update_loop.last_feature_age_mean is not None:
+        metrics["v2/feature_age_mean"] = float(update_loop.last_feature_age_mean)
+    if update_loop.last_feature_age_max is not None:
+        metrics["v2/feature_age_max"] = int(update_loop.last_feature_age_max)
+    return metrics
 
 
 def format_console_metrics_header(mode: str) -> str:

@@ -25,6 +25,13 @@ class ControlFeatureMode(str, Enum):
     RECONSTRUCTION_ONLY = "reconstruction_only"
 
 
+class FastWMRLearnerMode(str, Enum):
+    """Training topology used by the FastWMR task."""
+
+    STRICT_CURRENT = "v1"
+    TWO_TIMESCALE = "v2"
+
+
 @dataclass(frozen=True)
 class TensorFieldSpec:
     """A named, fixed-width slice in a concatenated tensor."""
@@ -304,6 +311,44 @@ DEFAULT_SEQUENCE_REPLAY_CFG = SequenceReplayCfg()
 
 
 @dataclass(frozen=True)
+class FastWMRV2Cfg:
+    """Two-timescale learner, EMA, gate, and feature-age settings."""
+
+    estimator_update_interval: int = 8
+    estimator_updates_per_trigger: int = 1
+    max_estimator_feature_age: int | None = 100
+    stored_feature_replay_horizon: int | None = 200_000
+    control_estimator_tau: float = 0.005
+    reconstruction_gate_start_updates: int = 0
+    reconstruction_gate_warmup_updates: int = 1_000
+
+    def __post_init__(self) -> None:
+        if self.estimator_update_interval <= 0:
+            raise ValueError("estimator_update_interval must be positive.")
+        if self.estimator_updates_per_trigger <= 0:
+            raise ValueError("estimator_updates_per_trigger must be positive.")
+        if (
+            self.max_estimator_feature_age is not None
+            and self.max_estimator_feature_age < 0
+        ):
+            raise ValueError("max_estimator_feature_age must be non-negative when provided.")
+        if (
+            self.stored_feature_replay_horizon is not None
+            and self.stored_feature_replay_horizon <= 0
+        ):
+            raise ValueError("stored_feature_replay_horizon must be positive when provided.")
+        if not 0.0 < self.control_estimator_tau <= 1.0:
+            raise ValueError("control_estimator_tau must be in (0, 1].")
+        if self.reconstruction_gate_start_updates < 0:
+            raise ValueError("reconstruction_gate_start_updates must be non-negative.")
+        if self.reconstruction_gate_warmup_updates < 0:
+            raise ValueError("reconstruction_gate_warmup_updates must be non-negative.")
+
+
+DEFAULT_FASTWMR_V2_CFG = FastWMRV2Cfg()
+
+
+@dataclass(frozen=True)
 class EstimatorLossCfg:
     """WMR reconstruction-loss weights.
 
@@ -347,6 +392,8 @@ class FastWMRAlgoCfg:
     joint_limit_action_bounds: JointLimitActionBoundsCfg = DEFAULT_JOINT_LIMIT_ACTION_BOUNDS_CFG
     replay_update: ReplayUpdateCfg = DEFAULT_REPLAY_UPDATE_CFG
     sequence_replay: SequenceReplayCfg = DEFAULT_SEQUENCE_REPLAY_CFG
+    learner_mode: FastWMRLearnerMode = FastWMRLearnerMode.TWO_TIMESCALE
+    v2: FastWMRV2Cfg = DEFAULT_FASTWMR_V2_CFG
     estimator_loss: EstimatorLossCfg = DEFAULT_ESTIMATOR_LOSS_CFG
     discount: float = 0.97
     target_update_rate: float = 0.005

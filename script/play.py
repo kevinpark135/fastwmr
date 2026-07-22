@@ -250,7 +250,7 @@ def run() -> Path:
             runtime = FastWMREstimatorRuntime(
                 estimator,
                 env.num_envs,
-                estimator_version=metadata.counters.estimator_version,
+                estimator_version=metadata.counters.control_estimator_version,
             )
             correlations = _OnlineCorrelation(interface)
         load_policy_checkpoint(

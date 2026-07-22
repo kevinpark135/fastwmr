@@ -20,6 +20,8 @@ from .fastwmr_agent import (
     FastSACReplayUpdateLoop,
     FastWMRSequenceFeatureProcessor,
     FastWMRSequenceUpdateLoop,
+    FastWMRV2EstimatorController,
+    FastWMRV2UpdateLoop,
 )
 from .sac_update import SACUpdateMetrics
 
@@ -467,21 +469,23 @@ class FastSACRolloutCollector:
             raise RuntimeError("Call reset() before collecting transitions.")
         observations = self.env.policy_observation(self._observations)
         actions = self.update_loop.select_actions(observations, deterministic=deterministic)
-        step = self.env.step(actions)
+        with self.update_loop.profiler.measure("collection_env_step"):
+            step = self.env.step(actions)
         next_observations = self.env.policy_observation(step.observations)
         final_observations = self.env.policy_observation(step.final_observations)
         self._validate_policy_shape(next_observations)
 
-        self.replay.add(
-            observations=observations,
-            actions=actions,
-            rewards=step.rewards,
-            next_observations=next_observations,
-            terminated=step.terminated,
-            truncated=step.truncated,
-            final_observations=final_observations,
-            final_observation_mask=step.final_observation_mask,
-        )
+        with self.update_loop.profiler.measure("collection_replay_add"):
+            self.replay.add(
+                observations=observations,
+                actions=actions,
+                rewards=step.rewards,
+                next_observations=next_observations,
+                terminated=step.terminated,
+                truncated=step.truncated,
+                final_observations=final_observations,
+                final_observation_mask=step.final_observation_mask,
+            )
         self.update_loop.update_observation_statistics(next_observations)
         self._observations = step.observations
         self.update_loop.advance_environment()
@@ -512,16 +516,19 @@ class FastWMRRolloutCollector:
         self,
         env: IsaacLabEnvAdapter,
         replay: TransitionReplayBuffer,
-        update_loop: FastWMRSequenceUpdateLoop,
+        update_loop: FastWMRSequenceUpdateLoop | FastWMRV2UpdateLoop,
         *,
         interface: FastWMRInterfaceCfg = DEFAULT_INTERFACE_CFG,
     ) -> None:
         if replay is not update_loop.replay:
             raise ValueError("Collector and update loop must share the same replay buffer.")
         processor = update_loop.sequence_feature_processor
-        if not isinstance(processor, FastWMRSequenceFeatureProcessor):
+        if not isinstance(
+            processor,
+            (FastWMRSequenceFeatureProcessor, FastWMRV2EstimatorController),
+        ):
             raise TypeError(
-                "FastWMRRolloutCollector requires FastWMRSequenceFeatureProcessor "
+                "FastWMRRolloutCollector requires a FastWMR estimator controller "
                 "to synchronize estimator updates."
             )
         if processor.interface != interface:
@@ -583,13 +590,13 @@ class FastWMRRolloutCollector:
         )
 
         self.rollout_cache.clear()
-        self.runtime.reset_all(estimator_version=self.processor.estimator_updater.version)
+        self.runtime.reset_all(estimator_version=self._control_estimator_version())
         self._update_observation_statistics(policy)
         self.rollout_cache.add(policy, privileged, self._reset_boundaries)
         runtime_step = self.runtime.step(
             policy,
             reset_boundaries=self._reset_boundaries,
-            expected_estimator_version=self.processor.estimator_updater.version,
+            expected_estimator_version=self._control_estimator_version(),
         )
         self._observations = observations
         return self._build_control_feature(policy, runtime_step.reconstruction)
@@ -621,7 +628,8 @@ class FastWMRRolloutCollector:
             control_features,
             deterministic=deterministic,
         )
-        step = self.env.step(actions)
+        with self.update_loop.profiler.measure("collection_env_step"):
+            step = self.env.step(actions)
         next_observations, next_privileged = self._observation_groups(step.observations)
         final_observations, final_privileged = self._observation_groups(step.final_observations)
 
@@ -637,38 +645,40 @@ class FastWMRRolloutCollector:
         else:
             final_control_features = torch.zeros_like(control_features)
         self._update_observation_statistics(next_observations)
-        self.rollout_cache.add(next_observations, next_privileged, done)
-        next_runtime_step = self.runtime.step(
-            next_observations,
-            reset_boundaries=done,
-            expected_estimator_version=self.processor.estimator_updater.version,
-        )
+        with self.update_loop.profiler.measure("collection_estimator_runtime"):
+            self.rollout_cache.add(next_observations, next_privileged, done)
+            next_runtime_step = self.runtime.step(
+                next_observations,
+                reset_boundaries=done,
+                expected_estimator_version=self._control_estimator_version(),
+            )
         next_control_features = self._build_control_feature(
             next_observations,
             next_runtime_step.reconstruction,
         )
 
-        self.replay.add(
-            observations=observations,
-            actions=actions,
-            rewards=step.rewards,
-            next_observations=next_observations,
-            terminated=step.terminated,
-            truncated=step.truncated,
-            privileged_states=privileged,
-            next_privileged_states=next_privileged,
-            control_features=control_features,
-            next_control_features=next_control_features,
-            estimator_versions=estimator_versions,
-            episode_ids=self._episode_ids,
-            env_ids=self._env_ids,
-            timesteps=self._timesteps,
-            reset_boundaries=self._reset_boundaries,
-            final_observations=final_observations,
-            final_privileged_states=final_privileged,
-            final_control_features=final_control_features,
-            final_observation_mask=step.final_observation_mask,
-        )
+        with self.update_loop.profiler.measure("collection_replay_add"):
+            self.replay.add(
+                observations=observations,
+                actions=actions,
+                rewards=step.rewards,
+                next_observations=next_observations,
+                terminated=step.terminated,
+                truncated=step.truncated,
+                privileged_states=privileged,
+                next_privileged_states=next_privileged,
+                control_features=control_features,
+                next_control_features=next_control_features,
+                estimator_versions=estimator_versions,
+                episode_ids=self._episode_ids,
+                env_ids=self._env_ids,
+                timesteps=self._timesteps,
+                reset_boundaries=self._reset_boundaries,
+                final_observations=final_observations,
+                final_privileged_states=final_privileged,
+                final_control_features=final_control_features,
+                final_observation_mask=step.final_observation_mask,
+            )
 
         self._observations = step.observations
         self._episode_ids = self._episode_ids + done.to(dtype=torch.int64)
@@ -726,7 +736,17 @@ class FastWMRRolloutCollector:
             reconstruction,
             cfg=self.interface,
             normalizer=self.processor.observation_normalizer,
+            reconstruction_gate=getattr(self.processor, "reconstruction_gate", 1.0),
         ).detach()
         if not torch.isfinite(features).all():
             raise FloatingPointError("FastWMR rollout control features must remain finite.")
         return features
+
+    def _control_estimator_version(self) -> int:
+        return int(
+            getattr(
+                self.processor,
+                "control_estimator_version",
+                self.processor.estimator_updater.version,
+            )
+        )
