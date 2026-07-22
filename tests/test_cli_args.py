@@ -20,6 +20,7 @@ def test_train_cli_defaults_to_fastwmr_and_validates() -> None:
 
     assert args.task == FASTWMR_TASK
     assert args.resume is None
+    assert args.log_interval == 5
     assert args.checkpoint_interval == 100
     assert args.burn_in_length > 0
     assert args.learning_length > 0

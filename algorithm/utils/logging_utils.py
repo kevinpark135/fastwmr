@@ -22,11 +22,10 @@ _CONSOLE_HEADERS = (
     "Alpha",
     "Estimator",
     "Terr avg/max",
-    "Pen lvl/x",
     "Elapsed",
     "Ckpt",
 )
-_CONSOLE_WIDTHS = (8, 9, 9, 9, 8, 8, 9, 9, 12, 9, 8, 4)
+_CONSOLE_WIDTHS = (8, 9, 9, 9, 8, 8, 9, 9, 12, 8, 4)
 
 
 @dataclass(frozen=True)
@@ -230,7 +229,6 @@ def format_console_metrics(record: Mapping[str, int | float | str]) -> str:
         _format_float(record.get("sac/temperature"), ".6f"),
         _format_float(record.get("estimator/total_loss"), ".4f"),
         _format_terrain_curriculum(record),
-        _format_penalty_curriculum(record),
         _format_duration(record.get("learner/wallclock_seconds")),
         "yes" if int(record.get("checkpoint/saved", 0)) else "",
     )
@@ -269,14 +267,6 @@ def _format_terrain_curriculum(record: Mapping[str, int | float | str]) -> str:
     if mean is None or maximum is None:
         return "-"
     return f"{float(mean):.2f}/{int(maximum)}"
-
-
-def _format_penalty_curriculum(record: Mapping[str, int | float | str]) -> str:
-    level = record.get("curriculum/penalty_level")
-    scale = record.get("curriculum/penalty_scale")
-    if level is None or scale is None:
-        return "-"
-    return f"{int(level)}/{float(scale):.2f}"
 
 
 def _format_duration(value: object) -> str:

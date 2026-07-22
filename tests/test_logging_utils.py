@@ -72,10 +72,9 @@ def test_training_logger_writes_flat_finite_jsonl_and_appends(tmp_path) -> None:
     header = format_console_metrics_header("fastwmr")
     row = format_console_metrics(record)
     assert "Terr avg/max" in header
-    assert "Pen lvl/x" in header
+    assert "Pen lvl/x" not in header
     assert "1.2500" in row
     assert "0.50/2" in row
-    assert "1/0.30" in row
     assert "yes" in row
     assert len(header.splitlines()[-1]) == len(row.splitlines()[0])
 
