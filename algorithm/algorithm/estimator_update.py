@@ -15,11 +15,14 @@ from ..buffers import EstimatorRolloutBatch, EstimatorRolloutCache, SequenceRepl
 from ..config import (
     DEFAULT_ESTIMATOR_LOSS_CFG,
     DEFAULT_INTERFACE_CFG,
+    DEFAULT_RECONSTRUCTION_NORMALIZATION_CFG,
     EstimatorLossCfg,
     FastWMRInterfaceCfg,
+    ReconstructionNormalizationCfg,
     TargetKind,
 )
 from ..networks import DecoderOutput, HistoryEncoder, WorldStateDecoder
+from ..utils.reconstruction import denormalize_reconstruction, normalize_reconstruction
 from ..utils.temporal_state import RecurrentState
 
 
@@ -178,10 +181,13 @@ class EMAControlEstimator:
         self.control_estimator.eval()
 
     @torch.no_grad()
-    def hard_sync(self) -> None:
-        """Copy the complete online state without advancing the control version."""
+    def hard_sync(self, *, advance_version: bool = False) -> int:
+        """Copy online state, optionally marking a new replay-visible version."""
 
         self.control_estimator.load_state_dict(self.online_estimator.state_dict())
+        if advance_version:
+            self.version += 1
+        return self.version
 
     @torch.no_grad()
     def update(self) -> int:
@@ -267,6 +273,7 @@ class EstimatorLossOutput:
     discrete_bce: torch.Tensor
     latent_l1: torch.Tensor
     field_losses: Mapping[str, torch.Tensor]
+    physical_field_losses: Mapping[str, torch.Tensor]
 
 
 def compute_estimator_loss(
@@ -275,9 +282,12 @@ def compute_estimator_loss(
     *,
     interface: FastWMRInterfaceCfg = DEFAULT_INTERFACE_CFG,
     cfg: EstimatorLossCfg = DEFAULT_ESTIMATOR_LOSS_CFG,
+    normalization_cfg: ReconstructionNormalizationCfg = (
+        DEFAULT_RECONSTRUCTION_NORMALIZATION_CFG
+    ),
     validate_values: bool = True,
 ) -> EstimatorLossOutput:
-    """Compute WMR's weighted MSE, BCE-with-logits, and latent L1 loss."""
+    """Compute normalized field losses, contact BCE, and latent sparsity."""
 
     if not isinstance(privileged_targets, torch.Tensor):
         raise TypeError("privileged_targets must be a torch.Tensor.")
@@ -296,8 +306,21 @@ def compute_estimator_loss(
     if prediction.decoded_state.discrete_logits.shape[-1] != interface.discrete_target_dim:
         raise ValueError("Discrete decoder width does not match the reconstruction contract.")
 
-    continuous_targets = _select_target_kind(privileged_targets, interface, TargetKind.CONTINUOUS)
-    discrete_targets = _select_target_kind(privileged_targets, interface, TargetKind.DISCRETE)
+    normalized_targets = normalize_reconstruction(
+        privileged_targets,
+        interface=interface,
+        cfg=normalization_cfg,
+    )
+    continuous_targets = _select_target_kind(
+        normalized_targets,
+        interface,
+        TargetKind.CONTINUOUS,
+    )
+    discrete_targets = _select_target_kind(
+        normalized_targets,
+        interface,
+        TargetKind.DISCRETE,
+    )
     if validate_values and torch.any((discrete_targets < 0.0) | (discrete_targets > 1.0)):
         raise ValueError("Discrete reconstruction targets must lie in [0, 1].")
 
@@ -307,15 +330,24 @@ def compute_estimator_loss(
         discrete_targets,
     )
     latent_l1 = prediction.encoded_history.abs().mean()
+    field_losses = _compute_field_losses(
+        prediction.decoded_state,
+        normalized_targets,
+        interface,
+    )
     total_loss = (
-        cfg.continuous_weight * continuous_mse
-        + cfg.discrete_weight * discrete_bce
+        cfg.base_velocity_weight * field_losses["base_lin_vel_mse"]
+        + cfg.friction_weight * field_losses["friction_mse"]
+        + cfg.payload_mass_weight * field_losses["payload_mass_mse"]
+        + cfg.wrench_weight * field_losses["push_force_torque_mse"]
+        + cfg.contact_weight * field_losses["foot_contacts_bce"]
         + cfg.latent_l1_weight * latent_l1
     )
-    field_losses = _compute_field_losses(
+    physical_field_losses = _compute_physical_field_losses(
         prediction.decoded_state,
         privileged_targets,
         interface,
+        normalization_cfg,
     )
     return EstimatorLossOutput(
         total_loss=total_loss,
@@ -323,6 +355,7 @@ def compute_estimator_loss(
         discrete_bce=discrete_bce,
         latent_l1=latent_l1,
         field_losses=field_losses,
+        physical_field_losses=physical_field_losses,
     )
 
 
@@ -337,6 +370,7 @@ class EstimatorUpdateMetrics:
     gradient_norm: torch.Tensor
     context_exact_fraction: torch.Tensor
     field_losses: Mapping[str, torch.Tensor]
+    physical_field_losses: Mapping[str, torch.Tensor]
     estimator_version: int
 
 
@@ -359,6 +393,9 @@ class EstimatorUpdater:
         *,
         interface: FastWMRInterfaceCfg = DEFAULT_INTERFACE_CFG,
         loss_cfg: EstimatorLossCfg = DEFAULT_ESTIMATOR_LOSS_CFG,
+        normalization_cfg: ReconstructionNormalizationCfg = (
+            DEFAULT_RECONSTRUCTION_NORMALIZATION_CFG
+        ),
         observation_transform: ObservationTransform | None = None,
     ) -> None:
         if estimator.observation_dim != interface.policy_observation_dim:
@@ -371,6 +408,7 @@ class EstimatorUpdater:
         self.optimizer = optimizer
         self.interface = interface
         self.loss_cfg = loss_cfg
+        self.normalization_cfg = normalization_cfg
         self.observation_transform = observation_transform
         self.version = 0
 
@@ -497,6 +535,7 @@ class EstimatorUpdater:
             sequence.learning_privileged_states,
             interface=self.interface,
             cfg=self.loss_cfg,
+            normalization_cfg=self.normalization_cfg,
             validate_values=validate_values,
         )
         metrics = EstimatorUpdateMetrics(
@@ -507,6 +546,10 @@ class EstimatorUpdater:
             gradient_norm=torch.zeros_like(losses.total_loss),
             context_exact_fraction=sequence.context_is_exact.float().mean(),
             field_losses={name: value.detach() for name, value in losses.field_losses.items()},
+            physical_field_losses={
+                name: value.detach()
+                for name, value in losses.physical_field_losses.items()
+            },
             estimator_version=self.version,
         )
         return EstimatorUpdateResult(
@@ -607,6 +650,7 @@ class EstimatorUpdater:
             privileged_targets,
             interface=self.interface,
             cfg=self.loss_cfg,
+            normalization_cfg=self.normalization_cfg,
             validate_values=validate_values,
         )
         if validate_values and not torch.isfinite(losses.total_loss):
@@ -628,6 +672,10 @@ class EstimatorUpdater:
             gradient_norm=gradient_norm,
             context_exact_fraction=context_is_exact.float().mean(),
             field_losses={name: value.detach() for name, value in losses.field_losses.items()},
+            physical_field_losses={
+                name: value.detach()
+                for name, value in losses.physical_field_losses.items()
+            },
             estimator_version=self.version,
         )
         return EstimatorUpdateResult(
@@ -686,3 +734,53 @@ def _compute_field_losses(
             losses[f"{field.name}_bce"] = F.binary_cross_entropy_with_logits(logits, target)
             discrete_offset += field.width
     return losses
+
+
+def _compute_physical_field_losses(
+    decoded_state: DecoderOutput,
+    physical_targets: torch.Tensor,
+    interface: FastWMRInterfaceCfg,
+    normalization_cfg: ReconstructionNormalizationCfg,
+) -> dict[str, torch.Tensor]:
+    physical_reconstruction = denormalize_reconstruction(
+        decoded_state.reconstruction,
+        interface=interface,
+        cfg=normalization_cfg,
+    )
+    losses: dict[str, torch.Tensor] = {}
+    for field in interface.reconstruction_layout.fields:
+        field_slice = interface.reconstruction_layout.field_slice(field.name)
+        target = physical_targets[..., field_slice]
+        if field.kind is TargetKind.CONTINUOUS:
+            losses[f"{field.name}_mse"] = F.mse_loss(
+                physical_reconstruction[..., field_slice],
+                target,
+            )
+        else:
+            logits = _select_decoder_field(
+                decoded_state.discrete_logits,
+                interface,
+                field.name,
+                TargetKind.DISCRETE,
+            )
+            losses[f"{field.name}_bce"] = F.binary_cross_entropy_with_logits(
+                logits,
+                target,
+            )
+    return losses
+
+
+def _select_decoder_field(
+    values: torch.Tensor,
+    interface: FastWMRInterfaceCfg,
+    field_name: str,
+    kind: TargetKind,
+) -> torch.Tensor:
+    offset = 0
+    for field in interface.reconstruction_layout.fields:
+        if field.kind is not kind:
+            continue
+        if field.name == field_name:
+            return values[..., offset : offset + field.width]
+        offset += field.width
+    raise KeyError(f"Unknown {kind.value} decoder field {field_name!r}.")

@@ -445,7 +445,7 @@ class FastSACRolloutCollector:
     ) -> None:
         if replay is not update_loop.replay:
             raise ValueError("Collector and update loop must share the same replay buffer.")
-        if replay.spec.privileged_state_dim != 0 or replay.spec.control_feature_dim != 0:
+        if replay.spec.privileged_state_dim != 0 or replay.spec.reconstruction_dim != 0:
             raise ValueError("FastSACRolloutCollector requires a policy-only replay specification.")
         self.env = env
         self.replay = replay
@@ -537,13 +537,13 @@ class FastWMRRolloutCollector:
             interface.policy_observation_dim,
             interface.action_dim,
             interface.reconstruction_target_dim,
-            interface.control_feature_dim,
+            interface.reconstruction_target_dim,
         )
         replay_dimensions = (
             replay.spec.observation_dim,
             replay.spec.action_dim,
             replay.spec.privileged_state_dim,
-            replay.spec.control_feature_dim,
+            replay.spec.reconstruction_dim,
         )
         if replay_dimensions != expected_dimensions or not replay.spec.require_temporal_metadata:
             raise ValueError("FastWMR collector requires the complete FastWMR replay contract.")
@@ -620,6 +620,7 @@ class FastWMRRolloutCollector:
             observations,
             self.runtime.current_reconstruction,
         )
+        reconstructions = self.runtime.current_reconstruction.detach()
         estimator_versions = torch.full_like(
             self._env_ids,
             self.runtime.estimator_version,
@@ -637,13 +638,11 @@ class FastWMRRolloutCollector:
         # post-reset observations with only completed environment slices zeroed.
         done = step.terminated | step.truncated
         if torch.any(done):
-            final_reconstruction = self.runtime.preview(final_observations).reconstruction
-            final_control_features = self._build_control_feature(
-                final_observations,
-                final_reconstruction,
-            )
+            final_reconstructions = self.runtime.preview(
+                final_observations
+            ).reconstruction.detach()
         else:
-            final_control_features = torch.zeros_like(control_features)
+            final_reconstructions = torch.zeros_like(reconstructions)
         self._update_observation_statistics(next_observations)
         with self.update_loop.profiler.measure("collection_estimator_runtime"):
             self.rollout_cache.add(next_observations, next_privileged, done)
@@ -652,10 +651,7 @@ class FastWMRRolloutCollector:
                 reset_boundaries=done,
                 expected_estimator_version=self._control_estimator_version(),
             )
-        next_control_features = self._build_control_feature(
-            next_observations,
-            next_runtime_step.reconstruction,
-        )
+        next_reconstructions = next_runtime_step.reconstruction.detach()
 
         with self.update_loop.profiler.measure("collection_replay_add"):
             self.replay.add(
@@ -667,8 +663,8 @@ class FastWMRRolloutCollector:
                 truncated=step.truncated,
                 privileged_states=privileged,
                 next_privileged_states=next_privileged,
-                control_features=control_features,
-                next_control_features=next_control_features,
+                reconstructions=reconstructions,
+                next_reconstructions=next_reconstructions,
                 estimator_versions=estimator_versions,
                 episode_ids=self._episode_ids,
                 env_ids=self._env_ids,
@@ -676,7 +672,7 @@ class FastWMRRolloutCollector:
                 reset_boundaries=self._reset_boundaries,
                 final_observations=final_observations,
                 final_privileged_states=final_privileged,
-                final_control_features=final_control_features,
+                final_reconstructions=final_reconstructions,
                 final_observation_mask=step.final_observation_mask,
             )
 

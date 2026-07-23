@@ -8,6 +8,8 @@ from script.cli_args import (
     FASTWMR_TASK,
     build_play_parser,
     build_train_parser,
+    resolve_max_estimator_feature_age,
+    resolve_network_hidden_dims,
     validate_play_args,
     validate_train_args,
 )
@@ -25,10 +27,14 @@ def test_train_cli_defaults_to_fastwmr_and_validates() -> None:
     assert args.log_dir is None
     assert args.fastwmr_version == "v2"
     assert args.estimator_update_interval == 8
-    assert args.max_estimator_feature_age == 100
+    assert args.max_estimator_feature_age is None
+    assert resolve_max_estimator_feature_age(args) == 256
+    assert resolve_network_hidden_dims(args) == (512, 768)
     assert args.normalizer_freeze_iteration is None
-    assert args.burn_in_length > 0
+    assert args.burn_in_length == 32
     assert args.learning_length > 0
+    assert args.episode_start_fraction == pytest.approx(0.25)
+    assert args.recent_replay_horizon == 200_000
 
 
 def test_train_cli_accepts_resume_and_sequence_overrides(tmp_path) -> None:
@@ -55,6 +61,26 @@ def test_train_cli_accepts_resume_and_sequence_overrides(tmp_path) -> None:
     assert args.resume == checkpoint
     assert args.checkpoint_interval == 0
     assert args.burn_in_length == 0
+
+
+def test_train_cli_rejects_explicit_feature_age_below_replay_throughput() -> None:
+    args = build_train_parser().parse_args(
+        [
+            "--num-envs",
+            "64",
+            "--batch-size",
+            "8192",
+            "--num-updates",
+            "8",
+            "--estimator-update-interval",
+            "8",
+            "--max-estimator-feature-age",
+            "127",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="too small"):
+        validate_train_args(args)
 
 
 def test_train_cli_accepts_fastwmr_ablation_matrix() -> None:
@@ -131,6 +157,7 @@ def test_play_cli_validates_fixed_budget(tmp_path) -> None:
         ("--max-estimator-feature-age", "-1", "--max-estimator-feature-age"),
         ("--control-estimator-tau", "0", "--control-estimator-tau"),
         ("--estimator-cache-steps", "0", "--estimator-cache-steps"),
+        ("--episode-start-fraction", "1.1", "--episode-start-fraction"),
         ("--run-name", "nested/run", "--run-name"),
     ),
 )

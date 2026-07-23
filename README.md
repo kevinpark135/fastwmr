@@ -90,9 +90,11 @@ python script/train.py \
   --viz none
 ```
 
-The default `--fastwmr-version v2` runs eight stored-feature SAC updates per
-estimator trigger, performs one sequence estimator update, synchronizes the EMA
-control estimator, and rebuilds recurrent runtime state once. The main controls
+The default `--fastwmr-version v2` runs eight reconstruction-replay SAC updates
+per estimator trigger, performs one sequence estimator update, synchronizes the
+EMA control estimator, and rebuilds recurrent runtime state once. Replay keeps
+raw observations and ungated normalized reconstructions; each learner minibatch
+is rebuilt with the current observation normalizer and reconstruction gate. The main controls
 are `--estimator-update-interval`, `--estimator-updates-per-trigger`,
 `--control-estimator-tau`, `--max-estimator-feature-age`,
 `--stored-feature-replay-horizon`, and the reconstruction-gate options.
@@ -131,10 +133,11 @@ options.
 | `--estimator-weight-decay` | `1e-3` | Set estimator Adam weight decay. |
 | `--estimator-cache-steps` | `64` | Set the per-environment recurrent rollout-cache length. |
 | `--sequence-batch-size` | `256` | Set the number of replay sequences sampled per estimator update. |
-| `--burn-in-length` | `16` | Set recurrent warm-up steps excluded from estimator loss. |
+| `--burn-in-length` | `32` | Set recurrent warm-up steps excluded from estimator loss. |
 | `--learning-length` | `8` | Set sequence steps included in estimator loss. |
 | `--require-episode-start` | disabled | Restrict sampled sequences to episode starts. |
-| `--recent-replay-horizon` | unset | Restrict estimator sequence sampling to recent transitions. |
+| `--episode-start-fraction` | `0.25` | Guarantee this minimum exact-context fraction in estimator batches. |
+| `--recent-replay-horizon` | `200000` | Restrict estimator sequence sampling to recent transitions. |
 
 FastWMR v2 adds the following two-timescale controls:
 
@@ -142,12 +145,20 @@ FastWMR v2 adds the following two-timescale controls:
 | --- | --- | --- |
 | `--estimator-update-interval` | `8` | Trigger estimator learning after this many SAC updates. |
 | `--estimator-updates-per-trigger` | `1` | Run this many sequence updates per estimator trigger. |
-| `--max-estimator-feature-age` | `100` | Reject stored control features older than this many EMA versions. |
-| `--disable-feature-age-filter` | disabled | Allow stored features regardless of estimator-version age. |
-| `--stored-feature-replay-horizon` | `200000` | Restrict SAC sampling to this many recent stored-feature transitions. |
+| `--max-estimator-feature-age` | auto | Override the reconstruction age limit; auto mode derives a safe value from env/update throughput. |
+| `--disable-feature-age-filter` | disabled | Allow stored reconstructions regardless of estimator-version age. |
+| `--stored-feature-replay-horizon` | `200000` | Restrict SAC sampling to this many recent reconstruction transitions. |
 | `--control-estimator-tau` | `0.005` | Set the EMA update rate for the control estimator. |
-| `--reconstruction-gate-start-updates` | `0` | Delay reconstruction-feature activation until this estimator update. |
-| `--reconstruction-gate-warmup-updates` | `1000` | Linearly open the reconstruction gate over this many estimator updates. |
+| `--reconstruction-gate-start-updates` | `0` | Require at least this many estimator updates before quality can open the gate. |
+| `--reconstruction-gate-warmup-updates` | `200` | Ramp the gate after its quality checks pass. |
+| `--reconstruction-gate-quality-threshold` | `1.0` | Maximum normalized validation loss accepted by the gate. |
+| `--reconstruction-gate-quality-ema-decay` | `0.9` | Smooth independently sampled gate-validation losses. |
+| `--reconstruction-gate-quality-patience` | `3` | Require this many consecutive EMA threshold passes. |
+| `--reconstruction-gate-validation-interval` | `8` | Validate gate quality every N estimator attempts while closed. |
+
+The actor and critic use separate width controls: `--actor-hidden-dim 512` and
+`--critic-hidden-dim 768`. The legacy `--hidden-dim` option still overrides
+both widths for reproducing older runs.
 
 FastWMR diagnostics and ablations are controlled with
 `--validation-interval`, `--initial-validation-updates`,
@@ -231,6 +242,9 @@ variant cannot overwrite one another. Metrics are averaged across evaluation see
 within each training seed first; the reported mean and standard deviation are then
 computed across independent training seeds. Aggregated JSON, CSV, and Markdown
 summaries are written under `evaluations/suite/` by default.
+Evaluation records include return, survival/fall rate, linear and yaw tracking
+RMSE, push recovery, action-rate RMS, mechanical power, and physical estimator
+RMSE/correlation for every reconstructed field.
 
 ### Representation Diagnostics
 
@@ -280,7 +294,11 @@ python script/train.py \
 
 Run these experiments sequentially to avoid GPU contention. Pin
 `episode/return_mean`, `sac/policy_entropy`, `normalizer/frozen`,
-`normalizer/samples_seen`, and `v2/reconstruction_gate` in TensorBoard.
+`normalizer/samples_seen`, `v2/reconstruction_gate`,
+`v2/gate_quality_ema`, `v2/gate_state`, `sac/q_gap_mean`,
+`sac/c51_lower_endpoint_mass`, `sac/c51_upper_endpoint_mass`,
+`sac/c51_distribution_entropy`, `sac/policy_action_saturation_fraction`, and
+`estimator/context_exact_fraction` in TensorBoard.
 
 ### Ablations
 

@@ -1,9 +1,8 @@
 """FastSAC actor, critic, temperature, and target-network updates.
 
-The learner sees only a prepared SAC feature tensor. In baseline mode this is
-the policy observation; in FastWMR mode it is the stored detached control
-feature ``x_t``. Privileged reconstruction targets and recurrent hidden state
-are intentionally absent from :class:`SACTransitionBatch`.
+The learner sees only a prepared SAC feature tensor. FastWMR v2 rebuilds it
+from raw replay observations and ungated normalized reconstructions using the
+current observation normalizer and one current learner gate.
 
 The categorical target construction follows Holosoma's FastSAC C51 update:
 https://github.com/amazon-far/holosoma
@@ -21,7 +20,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ..buffers import StoredControlReplayBatch, TransitionReplayBatch
+from ..buffers import StoredReconstructionReplayBatch, TransitionReplayBatch
+from ..config import DEFAULT_INTERFACE_CFG, FastWMRInterfaceCfg
 from ..networks import (
     TargetTwinC51Critic,
     TargetTwinScalarCritic,
@@ -29,13 +29,14 @@ from ..networks import (
     TwinC51Critic,
     TwinScalarCritic,
 )
+from ..utils.feature_builder import ObservationNormalizer, build_control_feature
 
 
 class SACFeatureSource(str, Enum):
     """Replay field exposed as the state input to actor and critics."""
 
     POLICY_OBSERVATION = "policy_observation"
-    CONTROL_FEATURE = "control_feature"
+    RECONSTRUCTION = "reconstruction"
 
 
 @dataclass(frozen=True)
@@ -94,11 +95,11 @@ class SACTransitionBatch:
         if feature_source is SACFeatureSource.POLICY_OBSERVATION:
             states = replay.observations
             next_states = replay.bootstrap_observations
-        elif feature_source is SACFeatureSource.CONTROL_FEATURE:
-            if replay.control_features.shape[-1] == 0:
-                raise ValueError("Replay batch does not contain FastWMR control features.")
-            states = replay.control_features
-            next_states = replay.bootstrap_control_features
+        elif feature_source is SACFeatureSource.RECONSTRUCTION:
+            if replay.reconstructions.shape[-1] == 0:
+                raise ValueError("Replay batch does not contain FastWMR reconstructions.")
+            states = replay.reconstructions
+            next_states = replay.bootstrap_reconstructions
         else:
             raise ValueError(f"Unsupported SAC feature source {feature_source!r}.")
 
@@ -112,17 +113,33 @@ class SACTransitionBatch:
         )
 
     @classmethod
-    def from_stored_control_replay(
+    def from_stored_reconstruction_replay(
         cls,
-        replay: StoredControlReplayBatch,
+        replay: StoredReconstructionReplayBatch,
+        *,
+        interface: FastWMRInterfaceCfg = DEFAULT_INTERFACE_CFG,
+        normalizer: ObservationNormalizer | None = None,
+        reconstruction_gate: float = 1.0,
     ) -> "SACTransitionBatch":
-        """Build the v2 SAC batch without transferring estimator-only fields."""
+        """Rebuild one v2 SAC batch under the current learner representation."""
 
         return cls(
-            states=replay.control_features.detach(),
+            states=build_control_feature(
+                replay.observations,
+                replay.reconstructions,
+                cfg=interface,
+                normalizer=normalizer,
+                reconstruction_gate=reconstruction_gate,
+            ).detach(),
             actions=replay.actions.detach(),
             rewards=replay.rewards.detach(),
-            next_states=replay.bootstrap_control_features.detach(),
+            next_states=build_control_feature(
+                replay.bootstrap_observations,
+                replay.bootstrap_reconstructions,
+                cfg=interface,
+                normalizer=normalizer,
+                reconstruction_gate=reconstruction_gate,
+            ).detach(),
             terminated=replay.terminated.detach(),
             truncated=replay.truncated.detach(),
         )
@@ -173,6 +190,7 @@ class C51CriticLossOutput:
     q1: torch.Tensor
     q2: torch.Tensor
     target: torch.Tensor
+    probabilities: torch.Tensor
     target_distributions: torch.Tensor
 
 
@@ -196,7 +214,15 @@ class SACUpdateMetrics:
     q1_std: torch.Tensor
     q2_mean: torch.Tensor
     q2_std: torch.Tensor
+    q_gap_mean: torch.Tensor
+    q_gap_max: torch.Tensor
     policy_entropy: torch.Tensor
+    policy_action_saturation_fraction: torch.Tensor
+    c51_lower_endpoint_mass: torch.Tensor | None = None
+    c51_upper_endpoint_mass: torch.Tensor | None = None
+    c51_target_lower_endpoint_mass: torch.Tensor | None = None
+    c51_target_upper_endpoint_mass: torch.Tensor | None = None
+    c51_distribution_entropy: torch.Tensor | None = None
 
 
 @torch.no_grad()
@@ -328,13 +354,15 @@ def compute_c51_critic_loss(
     loss = cross_entropy.reshape(2, -1).mean(dim=-1).sum()
     _require_finite_scalar(loss, "C51 critic loss")
 
-    values = critic.values_from_probabilities(logits.softmax(dim=-1))
+    probabilities = logits.softmax(dim=-1)
+    values = critic.values_from_probabilities(probabilities)
     target_values = critic.values_from_probabilities(target_distributions)
     return C51CriticLossOutput(
         loss=loss,
         q1=values[0],
         q2=values[1],
         target=target_values,
+        probabilities=probabilities,
         target_distributions=target_distributions,
     )
 
@@ -432,10 +460,53 @@ class SACUpdater:
         actor_output = self.update_actor(batch.states)
         alpha_loss = self.update_temperature(actor_output.log_probabilities)
         self.update_target()
+        return self.metrics_from_outputs(
+            critic_output,
+            actor_output,
+            alpha_loss,
+        )
+
+    def metrics_from_outputs(
+        self,
+        critic_output: CriticLossOutput | C51CriticLossOutput,
+        actor_output: ActorLossOutput,
+        temperature_loss: torch.Tensor,
+    ) -> SACUpdateMetrics:
+        """Build shared scalar diagnostics, including categorical collapse signals."""
+
+        q_gap = (critic_output.q1 - critic_output.q2).abs()
+        normalized_actions = (
+            actor_output.actions - self.actor.action_bias
+        ) / self.actor.action_scale
+        c51_metrics: dict[str, torch.Tensor | None] = {
+            "c51_lower_endpoint_mass": None,
+            "c51_upper_endpoint_mass": None,
+            "c51_target_lower_endpoint_mass": None,
+            "c51_target_upper_endpoint_mass": None,
+            "c51_distribution_entropy": None,
+        }
+        if isinstance(critic_output, C51CriticLossOutput):
+            probabilities = critic_output.probabilities
+            c51_metrics = {
+                "c51_lower_endpoint_mass": probabilities[..., 0].mean().detach(),
+                "c51_upper_endpoint_mass": probabilities[..., -1].mean().detach(),
+                "c51_target_lower_endpoint_mass": (
+                    critic_output.target_distributions[..., 0].mean().detach()
+                ),
+                "c51_target_upper_endpoint_mass": (
+                    critic_output.target_distributions[..., -1].mean().detach()
+                ),
+                "c51_distribution_entropy": (
+                    -(
+                        probabilities
+                        * probabilities.clamp_min(1e-8).log()
+                    ).sum(dim=-1).mean().detach()
+                ),
+            }
         return SACUpdateMetrics(
             critic_loss=critic_output.loss.detach(),
             actor_loss=actor_output.loss.detach(),
-            temperature_loss=alpha_loss.detach(),
+            temperature_loss=temperature_loss.detach(),
             temperature=self.temperature().detach(),
             target_q_mean=critic_output.target.mean().detach(),
             target_q_std=critic_output.target.std(unbiased=False).detach(),
@@ -443,7 +514,13 @@ class SACUpdater:
             q1_std=critic_output.q1.std(unbiased=False).detach(),
             q2_mean=critic_output.q2.mean().detach(),
             q2_std=critic_output.q2.std(unbiased=False).detach(),
+            q_gap_mean=q_gap.mean().detach(),
+            q_gap_max=q_gap.max().detach(),
             policy_entropy=(-actor_output.log_probabilities.mean()).detach(),
+            policy_action_saturation_fraction=(
+                normalized_actions.abs() >= 0.95
+            ).float().mean().detach(),
+            **c51_metrics,
         )
 
     def update_critic(

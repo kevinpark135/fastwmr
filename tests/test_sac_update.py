@@ -16,7 +16,11 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.a
 )
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.buffers import (
     ReplayBufferSpec,
+    StoredReconstructionReplayBatch,
     TransitionReplayBuffer,
+)
+from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.config import (
+    DEFAULT_INTERFACE_CFG,
 )
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.config import (
     ScalarCriticCfg,
@@ -108,7 +112,7 @@ def test_replay_conversion_selects_baseline_or_fastwmr_features_and_final_state(
             observation_dim=3,
             action_dim=2,
             privileged_state_dim=2,
-            control_feature_dim=5,
+            reconstruction_dim=5,
             require_temporal_metadata=True,
         )
     )
@@ -121,8 +125,8 @@ def test_replay_conversion_selects_baseline_or_fastwmr_features_and_final_state(
         truncated=torch.tensor([True]),
         privileged_states=torch.full((1, 2), 1000.0),
         next_privileged_states=torch.full((1, 2), 2000.0),
-        control_features=torch.full((1, 5), 2.0),
-        next_control_features=torch.full((1, 5), 3.0),
+        reconstructions=torch.full((1, 5), 2.0),
+        next_reconstructions=torch.full((1, 5), 3.0),
         estimator_versions=torch.tensor([4]),
         episode_ids=torch.tensor([8]),
         env_ids=torch.tensor([0]),
@@ -130,19 +134,67 @@ def test_replay_conversion_selects_baseline_or_fastwmr_features_and_final_state(
         reset_boundaries=torch.tensor([False]),
         final_observations=torch.full((1, 3), 4.0),
         final_privileged_states=torch.full((1, 2), 3000.0),
-        final_control_features=torch.full((1, 5), 5.0),
+        final_reconstructions=torch.full((1, 5), 5.0),
         final_observation_mask=torch.tensor([True]),
     )
     replay = buffer.chronological()
 
     baseline = SACTransitionBatch.from_replay(replay, feature_source=SACFeatureSource.POLICY_OBSERVATION)
-    fastwmr = SACTransitionBatch.from_replay(replay, feature_source=SACFeatureSource.CONTROL_FEATURE)
+    fastwmr = SACTransitionBatch.from_replay(
+        replay,
+        feature_source=SACFeatureSource.RECONSTRUCTION,
+    )
 
     assert baseline.states.shape == (1, 3)
     assert torch.equal(baseline.next_states, torch.full((1, 3), 4.0))
     assert fastwmr.states.shape == (1, 5)
     assert torch.equal(fastwmr.next_states, torch.full((1, 5), 5.0))
     assert not hasattr(fastwmr, "privileged_states")
+
+
+def test_v2_replay_rebuilds_features_with_current_normalizer_and_gate() -> None:
+    interface = DEFAULT_INTERFACE_CFG
+    replay = StoredReconstructionReplayBatch(
+        observations=torch.ones(2, interface.policy_observation_dim),
+        reconstructions=torch.full((2, interface.reconstruction_target_dim), 4.0),
+        actions=torch.zeros(2, interface.action_dim),
+        rewards=torch.zeros(2),
+        bootstrap_observations=torch.full(
+            (2, interface.policy_observation_dim),
+            2.0,
+        ),
+        bootstrap_reconstructions=torch.full(
+            (2, interface.reconstruction_target_dim),
+            6.0,
+        ),
+        terminated=torch.zeros(2, dtype=torch.bool),
+        truncated=torch.zeros(2, dtype=torch.bool),
+        estimator_versions=torch.zeros(2, dtype=torch.int64),
+        insertion_ids=torch.arange(2),
+    )
+
+    batch = SACTransitionBatch.from_stored_reconstruction_replay(
+        replay,
+        normalizer=lambda observations: observations + 10.0,
+        reconstruction_gate=0.5,
+    )
+
+    torch.testing.assert_close(
+        batch.states[:, : interface.policy_observation_dim],
+        torch.full((2, interface.policy_observation_dim), 11.0),
+    )
+    torch.testing.assert_close(
+        batch.states[:, interface.policy_observation_dim :],
+        torch.full((2, interface.reconstruction_target_dim), 2.0),
+    )
+    torch.testing.assert_close(
+        batch.next_states[:, : interface.policy_observation_dim],
+        torch.full((2, interface.policy_observation_dim), 12.0),
+    )
+    torch.testing.assert_close(
+        batch.next_states[:, interface.policy_observation_dim :],
+        torch.full((2, interface.reconstruction_target_dim), 3.0),
+    )
 
 
 def test_full_sac_update_changes_online_alpha_and_polyak_target_parameters() -> None:
@@ -180,7 +232,10 @@ def test_full_sac_update_changes_online_alpha_and_polyak_target_parameters() -> 
     for before, online, updated_target in zip(target_before, critic.parameters(), target.parameters(), strict=True):
         assert torch.allclose(updated_target, torch.lerp(before, online.detach(), 0.25))
     assert all(parameter.grad is None for parameter in target.parameters())
-    assert all(torch.isfinite(value) for value in metrics.__dict__.values())
+    assert all(
+        value is None or torch.isfinite(value)
+        for value in metrics.__dict__.values()
+    )
 
 
 def test_actor_and_temperature_steps_do_not_update_critic_or_each_other() -> None:

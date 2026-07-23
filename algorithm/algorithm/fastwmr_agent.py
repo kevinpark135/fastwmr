@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from enum import Enum
 from typing import TYPE_CHECKING
 
 import torch
@@ -418,6 +419,14 @@ class FastWMRSequenceFeatureProcessor:
         return None
 
 
+class ReconstructionGateState(str, Enum):
+    """Quality-controlled learner routing state for reconstructed features."""
+
+    CLOSED = "closed"
+    RAMPING = "ramping"
+    OPEN = "open"
+
+
 class FastWMRV2EstimatorController:
     """Own the slow online estimator and the EMA estimator used for control."""
 
@@ -459,7 +468,14 @@ class FastWMRV2EstimatorController:
         self.estimator_attempts = 0
         self.estimator_triggers = 0
         self.last_estimator_update: EstimatorUpdateResult | None = None
+        self.last_gate_validation: EstimatorUpdateResult | None = None
         self.last_runtime_rebuild: EstimatorRuntimeRebuild | None = None
+        self.gate_state = ReconstructionGateState.CLOSED
+        self.gate_quality_ema: float | None = None
+        self.gate_quality_passes = 0
+        self.gate_validation_checks = 0
+        self._gate_ramp_start_update: int | None = None
+        self._gate_hard_sync_pending = False
 
     @property
     def updates(self) -> int:
@@ -471,14 +487,28 @@ class FastWMRV2EstimatorController:
 
     @property
     def reconstruction_gate(self) -> float:
-        start = self.cfg.reconstruction_gate_start_updates
-        warmup = self.cfg.reconstruction_gate_warmup_updates
-        if self.estimator_updates < start:
+        if self.gate_state is ReconstructionGateState.CLOSED:
             return 0.0
+        if self.gate_state is ReconstructionGateState.OPEN:
+            return 1.0
+        if self._gate_ramp_start_update is None:
+            raise RuntimeError("Ramping reconstruction gate has no start update.")
+        warmup = self.cfg.reconstruction_gate_warmup_updates
         if warmup == 0:
             return 1.0
-        progress = self.estimator_updates - start
+        progress = self.estimator_updates - self._gate_ramp_start_update
         return min(1.0, max(0.0, progress / warmup))
+
+    @property
+    def gate_validation_due(self) -> bool:
+        return (
+            self.gate_state is ReconstructionGateState.CLOSED
+            and self.estimator_attempts
+            >= (
+                self.gate_validation_checks + 1
+            )
+            * self.cfg.reconstruction_gate_validation_interval
+        )
 
     def update_sequence(self, sequence: SequenceReplayBatch) -> EstimatorUpdateResult:
         """Run one slow estimator step without re-inferring SAC features."""
@@ -498,17 +528,58 @@ class FastWMRV2EstimatorController:
         self.estimator_attempts += 1
         if not self.estimator_frozen:
             self.estimator_updates += 1
+            self._advance_gate_state()
         self.last_estimator_update = result
+        return result
+
+    def validate_reconstruction_gate(
+        self,
+        sequence: SequenceReplayBatch,
+    ) -> EstimatorUpdateResult:
+        """Update the gate quality EMA from a separately sampled replay sequence."""
+
+        result = self.estimator_updater.evaluate_sequence(sequence)
+        quality = float(result.metrics.total_loss)
+        decay = self.cfg.reconstruction_gate_quality_ema_decay
+        self.gate_quality_ema = (
+            quality
+            if self.gate_quality_ema is None
+            else decay * self.gate_quality_ema + (1.0 - decay) * quality
+        )
+        self.gate_validation_checks += 1
+        if self.gate_quality_ema <= self.cfg.reconstruction_gate_quality_threshold:
+            self.gate_quality_passes += 1
+        else:
+            self.gate_quality_passes = 0
+
+        ready = (
+            self.estimator_updates >= self.cfg.reconstruction_gate_start_updates
+            and self.gate_quality_passes
+            >= self.cfg.reconstruction_gate_quality_patience
+        )
+        if self.gate_state is ReconstructionGateState.CLOSED and ready:
+            self._gate_hard_sync_pending = True
+            if self.cfg.reconstruction_gate_warmup_updates == 0:
+                self._gate_ramp_start_update = None
+                self.gate_state = ReconstructionGateState.OPEN
+            else:
+                self._gate_ramp_start_update = self.estimator_updates
+                self.gate_state = ReconstructionGateState.RAMPING
+        self.last_gate_validation = result
         return result
 
     def synchronize_control_estimator(self) -> "EstimatorRuntimeRebuild | None":
         """EMA-sync once and rebuild rollout memory once after one trigger."""
 
         self.estimator_triggers += 1
-        if self.estimator_frozen:
+        if self._gate_hard_sync_pending:
+            version = self.ema_estimator.hard_sync(advance_version=True)
+            self._gate_hard_sync_pending = False
+        elif self.estimator_frozen:
             self.last_runtime_rebuild = None
             return None
-        version = self.ema_estimator.update()
+        else:
+            version = self.ema_estimator.update()
         if len(self.rollout_cache) > 0:
             rebuild = self.runtime.rebuild_from_cache(
                 self.rollout_cache,
@@ -523,7 +594,16 @@ class FastWMRV2EstimatorController:
 
     def clear_transient_state(self) -> None:
         self.last_estimator_update = None
+        self.last_gate_validation = None
         self.last_runtime_rebuild = None
+
+    def _advance_gate_state(self) -> None:
+        if (
+            self.gate_state is ReconstructionGateState.RAMPING
+            and self.reconstruction_gate >= 1.0
+        ):
+            self.gate_state = ReconstructionGateState.OPEN
+            self._gate_ramp_start_update = None
 
     def _should_validate_attempt(self) -> bool:
         return (
@@ -645,18 +725,10 @@ class FastWMRAgent:
 
             if tuple(completed_phases) != self.UPDATE_ORDER:
                 raise RuntimeError(f"FastWMR update order drifted to {tuple(completed_phases)}.")
-            sac_metrics = SACUpdateMetrics(
-                critic_loss=critic_output.loss.detach(),
-                actor_loss=actor_output.loss.detach(),
-                temperature_loss=temperature_loss.detach(),
-                temperature=self.sac_updater.temperature().detach(),
-                target_q_mean=critic_output.target.mean().detach(),
-                target_q_std=critic_output.target.std(unbiased=False).detach(),
-                q1_mean=critic_output.q1.mean().detach(),
-                q1_std=critic_output.q1.std(unbiased=False).detach(),
-                q2_mean=critic_output.q2.mean().detach(),
-                q2_std=critic_output.q2.std(unbiased=False).detach(),
-                policy_entropy=(-actor_output.log_probabilities.mean()).detach(),
+            sac_metrics = self.sac_updater.metrics_from_outputs(
+                critic_output,
+                actor_output,
+                temperature_loss,
             )
             result = FastWMRAgentUpdateResult(
                 estimator_update=estimator_update,
@@ -886,6 +958,7 @@ class FastWMRSequenceUpdateLoop(FastSACReplayUpdateLoop):
                 self.sequence_cfg.burn_in_length,
                 self.sequence_cfg.learning_length,
                 require_episode_start=self.sequence_cfg.require_episode_start,
+                episode_start_fraction=self.sequence_cfg.episode_start_fraction,
                 minimum_insertion_id=minimum_insertion_id,
             )
         )
@@ -904,6 +977,7 @@ class FastWMRSequenceUpdateLoop(FastSACReplayUpdateLoop):
                     self.sequence_cfg.burn_in_length,
                     self.sequence_cfg.learning_length,
                     require_episode_start=self.sequence_cfg.require_episode_start,
+                    episode_start_fraction=self.sequence_cfg.episode_start_fraction,
                     minimum_insertion_id=minimum_insertion_id,
                     device=self.learner_device,
                     generator=generator,
@@ -972,8 +1046,8 @@ class FastWMRV2UpdateLoop(FastSACReplayUpdateLoop):
         )
         if estimator_controller.cfg != v2_cfg:
             raise ValueError("V2 update loop and estimator controller configs must match.")
-        if replay.spec.control_feature_dim != updater.actor.input_dim:
-            raise ValueError("Stored control-feature width must match the actor input.")
+        if replay.spec.reconstruction_dim != estimator_controller.interface.reconstruction_target_dim:
+            raise ValueError("Stored reconstruction width must match the estimator contract.")
         self.sequence_cfg = sequence_cfg
         self.estimator_controller = estimator_controller
         self.sequence_feature_processor = estimator_controller
@@ -990,7 +1064,7 @@ class FastWMRV2UpdateLoop(FastSACReplayUpdateLoop):
     def ready(self) -> bool:
         if self.warming_up or len(self.replay) < self.cfg.minimum_replay_size:
             return False
-        return self.replay.can_sample_control_features(
+        return self.replay.can_sample_reconstructions(
             self.cfg.batch_size,
             current_estimator_version=self.estimator_controller.control_estimator_version,
             max_estimator_feature_age=self.v2_cfg.max_estimator_feature_age,
@@ -1004,6 +1078,7 @@ class FastWMRV2UpdateLoop(FastSACReplayUpdateLoop):
             self.sequence_cfg.burn_in_length,
             self.sequence_cfg.learning_length,
             require_episode_start=self.sequence_cfg.require_episode_start,
+            episode_start_fraction=self.sequence_cfg.episode_start_fraction,
             minimum_insertion_id=self._minimum_sequence_insertion_id(),
         )
 
@@ -1016,7 +1091,7 @@ class FastWMRV2UpdateLoop(FastSACReplayUpdateLoop):
         for _ in range(self.cfg.num_updates):
             current_version = self.estimator_controller.control_estimator_version
             with self.profiler.measure("stored_feature_sample"):
-                replay_batch = self.replay.sample_control_features(
+                replay_batch = self.replay.sample_reconstructions(
                     self.cfg.batch_size,
                     current_estimator_version=current_version,
                     max_estimator_feature_age=self.v2_cfg.max_estimator_feature_age,
@@ -1025,8 +1100,12 @@ class FastWMRV2UpdateLoop(FastSACReplayUpdateLoop):
                 )
                 feature_ages = replay_batch.feature_ages(current_version)
             with self.profiler.measure("transfer"):
-                batch = SACTransitionBatch.from_stored_control_replay(replay_batch).to(
-                    self.learner_device
+                replay_batch = replay_batch.to(self.learner_device)
+                batch = SACTransitionBatch.from_stored_reconstruction_replay(
+                    replay_batch,
+                    interface=self.estimator_controller.interface,
+                    normalizer=self.estimator_controller.observation_normalizer,
+                    reconstruction_gate=self.estimator_controller.reconstruction_gate,
                 )
             with self.profiler.measure("sac_update"):
                 metrics.append(self.updater.update(batch))
@@ -1042,7 +1121,7 @@ class FastWMRV2UpdateLoop(FastSACReplayUpdateLoop):
                 estimator_updates.extend(self._run_estimator_trigger(generator=generator))
                 self.sac_updates_since_estimator = 0
 
-        self.last_eligible_features = self.replay.eligible_control_feature_count(
+        self.last_eligible_features = self.replay.eligible_reconstruction_count(
             current_estimator_version=self.estimator_controller.control_estimator_version,
             max_estimator_feature_age=self.v2_cfg.max_estimator_feature_age,
             recent_transition_horizon=self.v2_cfg.stored_feature_replay_horizon,
@@ -1051,7 +1130,7 @@ class FastWMRV2UpdateLoop(FastSACReplayUpdateLoop):
         self.last_estimator_updates = tuple(estimator_updates)
         return metrics
 
-    def state_dict(self) -> dict[str, int]:
+    def state_dict(self) -> dict[str, int | float | str | None]:
         return {
             "sac_updates_since_estimator": self.sac_updates_since_estimator,
             "estimator_updates": self.estimator_controller.estimator_updates,
@@ -1060,23 +1139,66 @@ class FastWMRV2UpdateLoop(FastSACReplayUpdateLoop):
             "control_estimator_version": (
                 self.estimator_controller.control_estimator_version
             ),
+            "gate_state": self.estimator_controller.gate_state.value,
+            "gate_quality_ema": self.estimator_controller.gate_quality_ema,
+            "gate_quality_passes": self.estimator_controller.gate_quality_passes,
+            "gate_validation_checks": self.estimator_controller.gate_validation_checks,
+            "gate_ramp_start_update": (
+                self.estimator_controller._gate_ramp_start_update
+            ),
         }
 
-    def load_state_dict(self, state: dict[str, int]) -> None:
-        values = {name: int(value) for name, value in state.items()}
+    def load_state_dict(self, state: dict[str, object]) -> None:
         required = {
             "sac_updates_since_estimator",
             "estimator_updates",
             "estimator_attempts",
             "estimator_triggers",
             "control_estimator_version",
+            "gate_state",
+            "gate_quality_ema",
+            "gate_quality_passes",
+            "gate_validation_checks",
+            "gate_ramp_start_update",
         }
-        if values.keys() != required or any(value < 0 for value in values.values()):
+        if state.keys() != required:
             raise ValueError("FastWMR v2 scheduler state is incomplete or invalid.")
+        integer_names = {
+            "sac_updates_since_estimator",
+            "estimator_updates",
+            "estimator_attempts",
+            "estimator_triggers",
+            "control_estimator_version",
+            "gate_quality_passes",
+            "gate_validation_checks",
+        }
+        values = {name: int(state[name]) for name in integer_names}
+        if any(value < 0 for value in values.values()):
+            raise ValueError("FastWMR v2 scheduler counters must be non-negative.")
+        gate_state = ReconstructionGateState(str(state["gate_state"]))
+        quality_value = state["gate_quality_ema"]
+        gate_quality_ema = None if quality_value is None else float(quality_value)
+        if gate_quality_ema is not None and gate_quality_ema < 0.0:
+            raise ValueError("Gate quality EMA must be non-negative.")
+        ramp_value = state["gate_ramp_start_update"]
+        ramp_start = None if ramp_value is None else int(ramp_value)
+        if ramp_start is not None and ramp_start < 0:
+            raise ValueError("Gate ramp start must be non-negative.")
+        if (gate_state is ReconstructionGateState.RAMPING) != (ramp_start is not None):
+            raise ValueError("Only a ramping gate may contain a ramp start update.")
+
         self.sac_updates_since_estimator = values["sac_updates_since_estimator"]
         self.estimator_controller.estimator_updates = values["estimator_updates"]
         self.estimator_controller.estimator_attempts = values["estimator_attempts"]
         self.estimator_controller.estimator_triggers = values["estimator_triggers"]
+        self.estimator_controller.gate_state = gate_state
+        self.estimator_controller.gate_quality_ema = gate_quality_ema
+        self.estimator_controller.gate_quality_passes = values["gate_quality_passes"]
+        self.estimator_controller.gate_validation_checks = values[
+            "gate_validation_checks"
+        ]
+        self.estimator_controller._gate_ramp_start_update = ramp_start
+        self.estimator_controller._gate_hard_sync_pending = False
         self.estimator_controller.ema_estimator.restart(
             version=values["control_estimator_version"]
         )
@@ -1097,6 +1219,7 @@ class FastWMRV2UpdateLoop(FastSACReplayUpdateLoop):
                     self.sequence_cfg.burn_in_length,
                     self.sequence_cfg.learning_length,
                     require_episode_start=self.sequence_cfg.require_episode_start,
+                    episode_start_fraction=self.sequence_cfg.episode_start_fraction,
                     minimum_insertion_id=minimum_insertion_id,
                     device=self.learner_device,
                     generator=generator,
@@ -1105,6 +1228,21 @@ class FastWMRV2UpdateLoop(FastSACReplayUpdateLoop):
                     sequence = self.sequence_augmentation(sequence)
             with self.profiler.measure("estimator_update"):
                 updates.append(self.estimator_controller.update_sequence(sequence))
+        if self.estimator_controller.gate_validation_due:
+            with self.profiler.measure("estimator_gate_validation"):
+                validation_sequence = self.replay.sample_sequences(
+                    self.sequence_cfg.batch_size,
+                    self.sequence_cfg.burn_in_length,
+                    self.sequence_cfg.learning_length,
+                    require_episode_start=self.sequence_cfg.require_episode_start,
+                    episode_start_fraction=self.sequence_cfg.episode_start_fraction,
+                    minimum_insertion_id=minimum_insertion_id,
+                    device=self.learner_device,
+                    generator=generator,
+                )
+                self.estimator_controller.validate_reconstruction_gate(
+                    validation_sequence
+                )
         with self.profiler.measure("ema_sync_runtime_rebuild"):
             self.estimator_controller.synchronize_control_estimator()
         return updates

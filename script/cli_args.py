@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 
@@ -47,7 +48,14 @@ def build_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--minimum-replay-size", type=int, default=8192)
     parser.add_argument("--batch-size", type=int, default=8192)
     parser.add_argument("--num-updates", type=int, default=8)
-    parser.add_argument("--hidden-dim", type=int, default=768)
+    parser.add_argument(
+        "--hidden-dim",
+        type=int,
+        default=None,
+        help="Legacy override that sets both actor and critic hidden dimensions.",
+    )
+    parser.add_argument("--actor-hidden-dim", type=int, default=512)
+    parser.add_argument("--critic-hidden-dim", type=int, default=768)
     parser.add_argument("--critic-type", choices=("c51", "scalar"), default="c51")
     parser.add_argument("--num-atoms", type=int, default=101)
     parser.add_argument("--value-min", type=float, default=-20.0)
@@ -94,16 +102,31 @@ def build_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fastwmr-version", choices=("v1", "v2"), default="v2")
     parser.add_argument("--estimator-update-interval", type=int, default=8)
     parser.add_argument("--estimator-updates-per-trigger", type=int, default=1)
-    parser.add_argument("--max-estimator-feature-age", type=int, default=100)
+    parser.add_argument(
+        "--max-estimator-feature-age",
+        type=int,
+        default=None,
+        help="Explicit reconstruction age limit; default derives a safe value from throughput.",
+    )
     parser.add_argument("--disable-feature-age-filter", action="store_true")
     parser.add_argument("--stored-feature-replay-horizon", type=int, default=200_000)
     parser.add_argument("--control-estimator-tau", type=float, default=0.005)
     parser.add_argument("--reconstruction-gate-start-updates", type=int, default=0)
-    parser.add_argument("--reconstruction-gate-warmup-updates", type=int, default=1_000)
+    parser.add_argument("--reconstruction-gate-warmup-updates", type=int, default=200)
+    parser.add_argument("--reconstruction-gate-quality-threshold", type=float, default=1.0)
+    parser.add_argument("--reconstruction-gate-quality-ema-decay", type=float, default=0.9)
+    parser.add_argument("--reconstruction-gate-quality-patience", type=int, default=3)
+    parser.add_argument("--reconstruction-gate-validation-interval", type=int, default=8)
     parser.add_argument("--sequence-batch-size", type=int, default=256)
-    parser.add_argument("--burn-in-length", type=int, default=16)
+    parser.add_argument("--burn-in-length", type=int, default=32)
     parser.add_argument("--learning-length", type=int, default=8)
     parser.add_argument("--require-episode-start", action="store_true")
+    parser.add_argument(
+        "--episode-start-fraction",
+        type=float,
+        default=0.25,
+        help="Minimum estimator minibatch fraction sampled from exact episode starts.",
+    )
     parser.add_argument("--disable-gradient-boundary-checks", action="store_true")
     parser.add_argument(
         "--validation-interval",
@@ -125,7 +148,7 @@ def build_train_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--freeze-estimator", action="store_true")
     parser.add_argument("--disable-gradient-cutoff", action="store_true")
-    parser.add_argument("--recent-replay-horizon", type=int, default=None)
+    parser.add_argument("--recent-replay-horizon", type=int, default=200_000)
     parser.add_argument("--use-symmetry", action="store_true")
     parser.add_argument("--disable-penalty-curriculum", action="store_true")
     parser.add_argument(
@@ -168,7 +191,8 @@ def validate_train_args(args: argparse.Namespace) -> None:
         "minimum_replay_size",
         "batch_size",
         "num_updates",
-        "hidden_dim",
+        "actor_hidden_dim",
+        "critic_hidden_dim",
         "log_interval",
         "estimator_hidden_dim",
         "estimator_num_layers",
@@ -176,6 +200,8 @@ def validate_train_args(args: argparse.Namespace) -> None:
         "estimator_update_interval",
         "estimator_updates_per_trigger",
         "stored_feature_replay_horizon",
+        "reconstruction_gate_quality_patience",
+        "reconstruction_gate_validation_interval",
         "sequence_batch_size",
         "learning_length",
         "validation_interval",
@@ -192,12 +218,14 @@ def validate_train_args(args: argparse.Namespace) -> None:
         raise ValueError("--burn-in-length must be non-negative.")
     if args.initial_validation_updates < 0:
         raise ValueError("--initial-validation-updates must be non-negative.")
+    if not 0.0 <= args.episode_start_fraction <= 1.0:
+        raise ValueError("--episode-start-fraction must be in [0, 1].")
     if (
         args.normalizer_freeze_iteration is not None
         and args.normalizer_freeze_iteration < 0
     ):
         raise ValueError("--normalizer-freeze-iteration must be non-negative.")
-    if args.max_estimator_feature_age < 0:
+    if args.max_estimator_feature_age is not None and args.max_estimator_feature_age < 0:
         raise ValueError("--max-estimator-feature-age must be non-negative.")
     if not 0.0 < args.control_estimator_tau <= 1.0:
         raise ValueError("--control-estimator-tau must be in (0, 1].")
@@ -205,6 +233,10 @@ def validate_train_args(args: argparse.Namespace) -> None:
         raise ValueError("--reconstruction-gate-start-updates must be non-negative.")
     if args.reconstruction_gate_warmup_updates < 0:
         raise ValueError("--reconstruction-gate-warmup-updates must be non-negative.")
+    if args.reconstruction_gate_quality_threshold <= 0.0:
+        raise ValueError("--reconstruction-gate-quality-threshold must be positive.")
+    if not 0.0 <= args.reconstruction_gate_quality_ema_decay < 1.0:
+        raise ValueError("--reconstruction-gate-quality-ema-decay must be in [0, 1).")
     if args.checkpoint_interval < 0:
         raise ValueError("--checkpoint-interval must be non-negative.")
     if args.recent_replay_horizon is not None and args.recent_replay_horizon <= 0:
@@ -246,8 +278,13 @@ def validate_train_args(args: argparse.Namespace) -> None:
         raise ValueError("--minimum-replay-size must be at least --batch-size.")
     if args.replay_capacity < args.minimum_replay_size:
         raise ValueError("--replay-capacity must be at least --minimum-replay-size.")
-    if args.hidden_dim % 4 != 0:
-        raise ValueError("--hidden-dim must be divisible by four.")
+    if args.hidden_dim is not None:
+        if args.hidden_dim <= 0 or args.hidden_dim % 4 != 0:
+            raise ValueError("--hidden-dim must be positive and divisible by four.")
+    actor_hidden_dim, critic_hidden_dim = resolve_network_hidden_dims(args)
+    if actor_hidden_dim % 4 != 0 or critic_hidden_dim % 4 != 0:
+        raise ValueError("Actor and critic hidden dimensions must be divisible by four.")
+    resolve_max_estimator_feature_age(args)
     if args.num_atoms < 2:
         raise ValueError("--num-atoms must be at least two.")
     if args.value_min >= args.value_max:
@@ -267,6 +304,38 @@ def validate_train_args(args: argparse.Namespace) -> None:
             raise ValueError("--run-name must be one non-empty path component.")
     if args.resume is not None and args.task not in TRAIN_TASKS:
         raise ValueError("--resume requires a supported training task.")
+
+
+def resolve_network_hidden_dims(args: argparse.Namespace) -> tuple[int, int]:
+    """Resolve split widths while retaining the old shared-width override."""
+
+    if args.hidden_dim is not None:
+        return int(args.hidden_dim), int(args.hidden_dim)
+    return int(args.actor_hidden_dim), int(args.critic_hidden_dim)
+
+
+def resolve_max_estimator_feature_age(args: argparse.Namespace) -> int | None:
+    """Derive enough estimator-version history to fill one SAC minibatch."""
+
+    if (
+        args.task != FASTWMR_TASK
+        or args.fastwmr_version != "v2"
+        or args.disable_feature_age_filter
+    ):
+        return None
+    required_age = math.ceil(
+        args.batch_size
+        * args.num_updates
+        / (args.num_envs * args.estimator_update_interval)
+    )
+    if args.max_estimator_feature_age is None:
+        return max(100, 2 * required_age)
+    if args.max_estimator_feature_age < required_age:
+        raise ValueError(
+            "--max-estimator-feature-age is too small for the requested replay "
+            f"throughput; use at least {required_age} or leave it unset for auto mode."
+        )
+    return int(args.max_estimator_feature_age)
 
 
 def build_play_parser() -> argparse.ArgumentParser:

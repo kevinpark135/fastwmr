@@ -3,8 +3,10 @@
 import torch
 
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.algorithm import (
+    EstimatorPrediction,
     EstimatorUpdater,
     WorldStateEstimator,
+    compute_estimator_loss,
 )
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.buffers import (
     EstimatorRolloutBatch,
@@ -17,8 +19,13 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.c
     EstimatorLossCfg,
 )
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.networks import (
+    DecoderOutput,
     HistoryEncoder,
     WorldStateDecoder,
+)
+from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.utils import (
+    RecurrentState,
+    denormalize_reconstruction,
 )
 
 
@@ -68,10 +75,10 @@ def _sequence_batch() -> SequenceReplayBatch:
     return SequenceReplayBatch(
         observations=observations,
         privileged_states=_targets(observations),
-        stored_control_features=torch.zeros(
+        stored_reconstructions=torch.zeros(
             batch_size,
             transition_length + 1,
-            interface.control_feature_dim,
+            interface.reconstruction_target_dim,
         ),
         actions=torch.zeros(batch_size, transition_length, interface.action_dim),
         rewards=torch.zeros(batch_size, transition_length),
@@ -96,6 +103,31 @@ def _sequence_batch() -> SequenceReplayBatch:
         burn_in_length=burn_in_length,
         learning_length=learning_length,
     )
+
+
+def test_estimator_loss_uses_normalized_field_weights() -> None:
+    interface = DEFAULT_INTERFACE_CFG
+    normalized_target = torch.ones(1, 1, interface.reconstruction_target_dim)
+    physical_target = denormalize_reconstruction(normalized_target)
+    encoded = torch.zeros(1, 1, 4)
+    prediction = EstimatorPrediction(
+        encoded_history=encoded,
+        decoded_state=DecoderOutput(
+            continuous=torch.zeros(1, 1, interface.continuous_target_dim),
+            discrete_logits=torch.zeros(1, 1, interface.discrete_target_dim),
+        ),
+        final_state=RecurrentState(
+            hidden=torch.zeros(1, 1, 4),
+            cell=torch.zeros(1, 1, 4),
+        ),
+    )
+
+    losses = compute_estimator_loss(prediction, physical_target)
+
+    expected = 1.0 + 1.0 + 0.5 + 0.1 + 0.3 * torch.log(torch.tensor(2.0))
+    torch.testing.assert_close(losses.total_loss, expected)
+    torch.testing.assert_close(losses.continuous_mse, torch.tensor(1.0))
+    assert set(losses.physical_field_losses) == set(losses.field_losses)
 
 
 def test_sequence_update_uses_learning_window_and_returns_detached_features() -> None:

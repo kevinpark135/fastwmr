@@ -25,8 +25,9 @@ from .rollout_worker import FastWMREstimatorRuntime
 from .sac_update import SACUpdater
 
 
-CHECKPOINT_FORMAT_VERSION = 2
-SUPPORTED_CHECKPOINT_FORMAT_VERSIONS = (1, CHECKPOINT_FORMAT_VERSION)
+CHECKPOINT_FORMAT_VERSION = 3
+SUPPORTED_CHECKPOINT_FORMAT_VERSIONS = (1, 2, CHECKPOINT_FORMAT_VERSION)
+FASTWMR_REPRESENTATION_VERSION = 2
 
 
 class TrainingMode(str, Enum):
@@ -97,7 +98,7 @@ def save_training_checkpoint(
     estimator_state = None
     control_estimator_state = None
     estimator_optimizer_state = None
-    learner_state: Mapping[str, int] | None = None
+    learner_state: Mapping[str, Any] | None = None
     estimator_updates = 0
     estimator_triggers = 0
     control_estimator_version = 0
@@ -132,6 +133,11 @@ def save_training_checkpoint(
     )
     payload = {
         "format_version": CHECKPOINT_FORMAT_VERSION,
+        "fastwmr_representation_version": (
+            FASTWMR_REPRESENTATION_VERSION
+            if resolved_mode is TrainingMode.FASTWMR
+            else None
+        ),
         "mode": resolved_mode.value,
         "learner_kind": (
             "v2"
@@ -162,6 +168,8 @@ def save_training_checkpoint(
             "actor_input_dim": sac_updater.actor.input_dim,
             "action_dim": sac_updater.actor.action_dim,
             "critic_type": type(sac_updater.critic).__name__,
+            "actor_hidden_dim": sac_updater.actor.cfg.hidden_dim,
+            "critic_hidden_dim": sac_updater.critic.cfg.hidden_dim,
         },
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -221,6 +229,7 @@ def load_training_checkpoint(
         raise ValueError(
             f"Checkpoint mode is {checkpoint_mode.value!r}, expected {resolved_mode.value!r}."
         )
+    _validate_representation(payload, resolved_mode)
     if resolved_mode is TrainingMode.FASTWMR:
         checkpoint_learner = payload.get("learner_kind", "v1")
         expected_learner = "v2" if isinstance(update_loop, FastWMRV2UpdateLoop) else "v1"
@@ -235,6 +244,13 @@ def load_training_checkpoint(
         "action_dim": sac_updater.actor.action_dim,
         "critic_type": type(sac_updater.critic).__name__,
     }
+    if int(payload["format_version"]) >= 3:
+        expected_architecture.update(
+            {
+                "actor_hidden_dim": sac_updater.actor.cfg.hidden_dim,
+                "critic_hidden_dim": sac_updater.critic.cfg.hidden_dim,
+            }
+        )
     if dict(architecture) != expected_architecture:
         raise ValueError(
             f"Checkpoint architecture {dict(architecture)} does not match {expected_architecture}."
@@ -392,6 +408,12 @@ def load_policy_checkpoint(
             raise ValueError(
                 f"Checkpoint {name}={architecture.get(name)!r} does not match {expected!r}."
             )
+    if "actor_hidden_dim" in architecture:
+        actor_hidden_dim = getattr(getattr(actor, "cfg", None), "hidden_dim", None)
+        if architecture["actor_hidden_dim"] != actor_hidden_dim:
+            raise ValueError(
+                "Checkpoint actor hidden dimension does not match the evaluation actor."
+            )
 
     models = _require_mapping(payload, "models")
     estimator_state = models.get("control_estimator")
@@ -497,7 +519,21 @@ def _load_payload(
             f"Unsupported checkpoint format {payload.get('format_version')!r}; "
             f"expected one of {SUPPORTED_CHECKPOINT_FORMAT_VERSIONS}."
         )
+    _validate_representation(payload, TrainingMode(payload.get("mode")))
     return resolved_path, payload
+
+
+def _validate_representation(
+    payload: Mapping[str, Any],
+    mode: TrainingMode,
+) -> None:
+    if mode is not TrainingMode.FASTWMR:
+        return
+    if payload.get("fastwmr_representation_version") != FASTWMR_REPRESENTATION_VERSION:
+        raise ValueError(
+            "This FastWMR checkpoint predates normalized reconstruction replay and "
+            "cannot be resumed or evaluated with the current representation."
+        )
 
 
 def _checkpoint_counters(payload: Mapping[str, Any]) -> CheckpointCounters:

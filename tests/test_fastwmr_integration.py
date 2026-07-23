@@ -328,7 +328,7 @@ def test_integrated_collection_updates_estimator_runtime_and_c51_sac() -> None:
     assert normalizer.samples_seen == env.num_envs * 7
     assert torch.equal(transitions.reset_boundaries, transitions.timesteps == 0)
     assert torch.any(transitions.final_observation_mask)
-    assert torch.all(torch.isfinite(transitions.control_features))
+    assert torch.all(torch.isfinite(transitions.reconstructions))
     done_indices = transitions.final_observation_mask.nonzero(as_tuple=False).squeeze(-1)
     assert torch.all(
         transitions.final_observations[done_indices]
@@ -389,6 +389,9 @@ def test_v2_splits_sac_and_estimator_with_ema_gate_and_one_rebuild() -> None:
         stored_feature_replay_horizon=64,
         control_estimator_tau=0.25,
         reconstruction_gate_warmup_updates=2,
+        reconstruction_gate_quality_threshold=1.0e9,
+        reconstruction_gate_quality_patience=1,
+        reconstruction_gate_validation_interval=1,
     )
     (
         env,
@@ -424,7 +427,9 @@ def test_v2_splits_sac_and_estimator_with_ema_gate_and_one_rebuild() -> None:
     assert controller.estimator_updates == 1
     assert controller.estimator_triggers == 1
     assert controller.control_estimator_version == 1
-    assert controller.reconstruction_gate == pytest.approx(0.5)
+    assert controller.reconstruction_gate == pytest.approx(0.0)
+    assert controller.gate_state.value == "ramping"
+    assert controller.gate_validation_checks == 1
     assert runtime.estimator_version == 1
     assert runtime.rebuilds == 1
     assert len(update_loop.last_estimator_updates) == 1
@@ -435,10 +440,7 @@ def test_v2_splits_sac_and_estimator_with_ema_gate_and_one_rebuild() -> None:
         controller.ema_estimator.control_estimator.parameters(),
         strict=True,
     ):
-        torch.testing.assert_close(
-            control,
-            initial.lerp(online.detach(), v2_cfg.control_estimator_tau),
-        )
+        torch.testing.assert_close(control, online.detach())
 
     online_after_trigger = [
         parameter.detach().clone() for parameter in online_estimator.parameters()
@@ -456,10 +458,8 @@ def test_v2_splits_sac_and_estimator_with_ema_gate_and_one_rebuild() -> None:
         not parameter.requires_grad and parameter.grad is None
         for parameter in controller.ema_estimator.control_estimator.parameters()
     )
-    newest = replay.chronological().control_features[-env.num_envs :]
-    assert torch.count_nonzero(
-        newest[:, DEFAULT_INTERFACE_CFG.policy_observation_dim :]
-    ) > 0
+    newest = replay.chronological().reconstructions[-env.num_envs :]
+    assert torch.count_nonzero(newest) > 0
     env.close()
 
 
@@ -811,6 +811,16 @@ def test_v2_checkpoint_restores_online_ema_scheduler_gate_and_policy_state(tmp_p
         estimator_updater=source_estimator_updater,
         config={"arguments": {"fastwmr_version": "v2"}},
     )
+    legacy_payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    legacy_payload["format_version"] = 2
+    legacy_payload.pop("fastwmr_representation_version")
+    legacy_payload["architecture"].pop("actor_hidden_dim")
+    legacy_payload["architecture"].pop("critic_hidden_dim")
+    legacy_checkpoint = tmp_path / "legacy_v2.pt"
+    torch.save(legacy_payload, legacy_checkpoint)
+    with pytest.raises(ValueError, match="predates normalized reconstruction"):
+        inspect_training_checkpoint(legacy_checkpoint)
+
     target = _integrated_pipeline(
         version="v2",
         num_updates=4,
@@ -1044,7 +1054,7 @@ def test_reconstruction_only_ablation_runs_integrated_update() -> None:
         collector.collect_step()
 
     assert initial_feature.shape == (env.num_envs, interface.reconstruction_target_dim)
-    assert replay.spec.control_feature_dim == interface.reconstruction_target_dim
+    assert replay.spec.reconstruction_dim == interface.reconstruction_target_dim
     assert update_loop.updater.actor.input_dim == interface.reconstruction_target_dim
     assert update_loop.gradient_steps > 0
     env.close()

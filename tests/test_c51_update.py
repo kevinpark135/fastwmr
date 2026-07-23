@@ -111,3 +111,10 @@ def test_full_c51_sac_update_changes_online_models_and_polyak_target() -> None:
         assert torch.allclose(updated_target, torch.lerp(before, online.detach(), 0.25))
     assert all(parameter.grad is None for parameter in target.parameters())
     assert all(torch.isfinite(value) for value in metrics.__dict__.values())
+    assert 0.0 <= metrics.c51_lower_endpoint_mass <= 1.0
+    assert 0.0 <= metrics.c51_upper_endpoint_mass <= 1.0
+    assert 0.0 <= metrics.c51_target_lower_endpoint_mass <= 1.0
+    assert 0.0 <= metrics.c51_target_upper_endpoint_mass <= 1.0
+    assert metrics.q_gap_mean >= 0.0
+    assert metrics.q_gap_max >= metrics.q_gap_mean
+    assert 0.0 <= metrics.policy_action_saturation_fraction <= 1.0

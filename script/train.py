@@ -11,6 +11,8 @@ from cli_args import (
     FASTSAC_BASELINE_TASK,
     FASTWMR_TASK,
     build_train_parser,
+    resolve_max_estimator_feature_age,
+    resolve_network_hidden_dims,
     validate_train_args,
 )
 
@@ -21,6 +23,8 @@ PARSER = build_train_parser()
 AppLauncher.add_app_launcher_args(PARSER)
 ARGS = PARSER.parse_args()
 validate_train_args(ARGS)
+ACTOR_HIDDEN_DIM, CRITIC_HIDDEN_DIM = resolve_network_hidden_dims(ARGS)
+MAX_ESTIMATOR_FEATURE_AGE = resolve_max_estimator_feature_age(ARGS)
 
 APP_LAUNCHER = AppLauncher(ARGS)
 SIMULATION_APP = APP_LAUNCHER.app
@@ -148,7 +152,7 @@ def _build_sac_updater(
     actor = TanhGaussianActor(
         state_dim,
         action_dim,
-        cfg=TanhGaussianActorCfg(hidden_dim=ARGS.hidden_dim),
+        cfg=TanhGaussianActorCfg(hidden_dim=ACTOR_HIDDEN_DIM),
         action_low=action_low,
         action_high=action_high,
     ).to(device)
@@ -157,7 +161,7 @@ def _build_sac_updater(
             state_dim,
             action_dim,
             cfg=DistributionalCriticCfg(
-                hidden_dim=ARGS.hidden_dim,
+                hidden_dim=CRITIC_HIDDEN_DIM,
                 num_atoms=ARGS.num_atoms,
                 value_min=ARGS.value_min,
                 value_max=ARGS.value_max,
@@ -169,7 +173,7 @@ def _build_sac_updater(
         critic = TwinScalarCritic(
             state_dim,
             action_dim,
-            cfg=ScalarCriticCfg(hidden_dim=ARGS.hidden_dim),
+            cfg=ScalarCriticCfg(hidden_dim=CRITIC_HIDDEN_DIM),
         ).to(device)
         target_critic = TargetTwinScalarCritic.from_online(critic)
         updater_type = SACUpdater
@@ -324,6 +328,7 @@ def _build_components(
         burn_in_length=ARGS.burn_in_length,
         learning_length=ARGS.learning_length,
         require_episode_start=ARGS.require_episode_start,
+        episode_start_fraction=ARGS.episode_start_fraction,
         recent_transition_horizon=ARGS.recent_replay_horizon,
     )
     sequence_augmentation = (
@@ -362,15 +367,23 @@ def _build_components(
         v2_cfg = FastWMRV2Cfg(
             estimator_update_interval=ARGS.estimator_update_interval,
             estimator_updates_per_trigger=ARGS.estimator_updates_per_trigger,
-            max_estimator_feature_age=(
-                None
-                if ARGS.disable_feature_age_filter
-                else ARGS.max_estimator_feature_age
-            ),
+            max_estimator_feature_age=MAX_ESTIMATOR_FEATURE_AGE,
             stored_feature_replay_horizon=ARGS.stored_feature_replay_horizon,
             control_estimator_tau=ARGS.control_estimator_tau,
             reconstruction_gate_start_updates=ARGS.reconstruction_gate_start_updates,
             reconstruction_gate_warmup_updates=ARGS.reconstruction_gate_warmup_updates,
+            reconstruction_gate_quality_threshold=(
+                ARGS.reconstruction_gate_quality_threshold
+            ),
+            reconstruction_gate_quality_ema_decay=(
+                ARGS.reconstruction_gate_quality_ema_decay
+            ),
+            reconstruction_gate_quality_patience=(
+                ARGS.reconstruction_gate_quality_patience
+            ),
+            reconstruction_gate_validation_interval=(
+                ARGS.reconstruction_gate_validation_interval
+            ),
         )
         control_estimator = copy.deepcopy(estimator).to(device)
         ema_estimator = EMAControlEstimator(
@@ -448,6 +461,11 @@ def _checkpoint_config(components: TrainingComponents) -> dict[str, object]:
     return {
         "mode": components.mode.value,
         "arguments": vars(ARGS),
+        "resolved": {
+            "actor_hidden_dim": ACTOR_HIDDEN_DIM,
+            "critic_hidden_dim": CRITIC_HIDDEN_DIM,
+            "max_estimator_feature_age": MAX_ESTIMATOR_FEATURE_AGE,
+        },
     }
 
 
@@ -667,6 +685,15 @@ def run() -> None:
                             "runtime/estimator_version": components.runtime.estimator_version,
                         }
                     )
+                    last_rebuild = getattr(
+                        components.update_loop.sequence_feature_processor,
+                        "last_runtime_rebuild",
+                        None,
+                    )
+                    if last_rebuild is not None:
+                        metrics["runtime/rebuild_context_exact_fraction"] = (
+                            last_rebuild.context_exact_fraction
+                        )
                 if components.rollout_cache is not None:
                     metrics["estimator_cache/steps"] = len(components.rollout_cache)
                 if components.normalizer is not None:

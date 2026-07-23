@@ -15,7 +15,7 @@ def _buffer(capacity: int = 32) -> TransitionReplayBuffer:
             observation_dim=3,
             action_dim=2,
             privileged_state_dim=2,
-            control_feature_dim=5,
+            reconstruction_dim=5,
             require_temporal_metadata=True,
         )
     )
@@ -43,8 +43,8 @@ def _add_vector_step(
         truncated=truncated,
         privileged_states=values[:, None].repeat(1, 2),
         next_privileged_states=(values + 1.0)[:, None].repeat(1, 2),
-        control_features=values[:, None].repeat(1, 5),
-        next_control_features=(values + 1.0)[:, None].repeat(1, 5),
+        reconstructions=values[:, None].repeat(1, 5),
+        next_reconstructions=(values + 1.0)[:, None].repeat(1, 5),
         estimator_versions=torch.zeros(num_envs, dtype=torch.int64),
         episode_ids=torch.full((num_envs,), episode_id, dtype=torch.int64),
         env_ids=env_ids,
@@ -68,7 +68,7 @@ def test_vector_env_interleaving_reconstructs_consecutive_sequences() -> None:
 
     assert sequence.observations.shape == (2, 5, 3)
     assert sequence.privileged_states.shape == (2, 5, 2)
-    assert sequence.stored_control_features.shape == (2, 5, 5)
+    assert sequence.stored_reconstructions.shape == (2, 5, 5)
     assert sequence.actions.shape == (2, 4, 2)
     assert sequence.learning_observations.shape == (2, 3, 3)
     assert sequence.learning_actions.shape == (2, 2, 2)
@@ -77,6 +77,30 @@ def test_vector_env_interleaving_reconstructs_consecutive_sequences() -> None:
     assert torch.all(sequence.episode_ids == sequence.episode_ids[:, :1])
     assert torch.all(sequence.context_is_exact)
     assert torch.equal(sequence.observations[:, -1, 0], sequence.observations[:, -2, 0] + 1.0)
+
+
+def test_mixed_sequence_sampling_guarantees_exact_context_fraction() -> None:
+    buffer = _buffer(capacity=64)
+    for episode_id in range(2):
+        for timestep in range(6):
+            _add_vector_step(buffer, timestep, episode_id=episode_id)
+
+    assert buffer.can_sample_sequences(
+        batch_size=8,
+        burn_in_length=1,
+        learning_length=1,
+        episode_start_fraction=0.5,
+    )
+    sequence = buffer.sample_sequences(
+        batch_size=8,
+        burn_in_length=1,
+        learning_length=1,
+        episode_start_fraction=0.5,
+        generator=torch.Generator().manual_seed(17),
+    )
+
+    assert int(sequence.context_is_exact.sum()) >= 4
+    assert torch.unique(sequence.insertion_ids[:, 0]).numel() == 8
 
 
 def test_sequences_never_cross_episode_boundaries() -> None:
@@ -111,8 +135,8 @@ def test_terminal_sequence_uses_pre_reset_final_observation() -> None:
         truncated=torch.tensor([False]),
         privileged_states=value[:, None].repeat(1, 2),
         next_privileged_states=torch.full((1, 2), -1.0),
-        control_features=value[:, None].repeat(1, 5),
-        next_control_features=torch.full((1, 5), -1.0),
+        reconstructions=value[:, None].repeat(1, 5),
+        next_reconstructions=torch.full((1, 5), -1.0),
         estimator_versions=torch.tensor([0]),
         episode_ids=torch.tensor([0]),
         env_ids=torch.tensor([0]),
@@ -120,7 +144,7 @@ def test_terminal_sequence_uses_pre_reset_final_observation() -> None:
         reset_boundaries=torch.tensor([False]),
         final_observations=torch.full((1, 3), 2.0),
         final_privileged_states=torch.full((1, 2), 2.0),
-        final_control_features=torch.full((1, 5), 2.0),
+        final_reconstructions=torch.full((1, 5), 2.0),
     )
 
     sequence = buffer.sample_sequences(
@@ -132,7 +156,7 @@ def test_terminal_sequence_uses_pre_reset_final_observation() -> None:
 
     assert torch.equal(sequence.observations[0, :, 0], torch.tensor([0.0, 1.0, 2.0]))
     assert torch.equal(sequence.privileged_states[0, :, 0], torch.tensor([0.0, 1.0, 2.0]))
-    assert torch.equal(sequence.stored_control_features[0, :, 0], torch.tensor([0.0, 1.0, 2.0]))
+    assert torch.equal(sequence.stored_reconstructions[0, :, 0], torch.tensor([0.0, 1.0, 2.0]))
     assert torch.equal(sequence.terminated, torch.tensor([[False, True]]))
 
 

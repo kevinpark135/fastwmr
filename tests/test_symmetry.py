@@ -37,11 +37,11 @@ def _sequence() -> SequenceReplayBatch:
         privileged[..., -2:].shape,
         dtype=torch.float32,
     )
-    stored = torch.cat((observations, privileged), dim=-1)
+    stored = privileged.clone()
     return SequenceReplayBatch(
         observations=observations,
         privileged_states=privileged,
-        stored_control_features=stored,
+        stored_reconstructions=stored,
         actions=torch.randn(batch_size, transition_length, cfg.action_dim),
         rewards=torch.randn(batch_size, transition_length),
         terminated=torch.zeros(batch_size, transition_length, dtype=torch.bool),

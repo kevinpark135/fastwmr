@@ -126,7 +126,7 @@ def mirror_sequence_batch(
         not in {
             "observations",
             "privileged_states",
-            "stored_control_features",
+            "stored_reconstructions",
             "actions",
             "burn_in_length",
             "learning_length",
@@ -138,8 +138,8 @@ def mirror_sequence_batch(
             sequence.privileged_states,
             interface=interface,
         ),
-        stored_control_features=mirror_control_feature(
-            sequence.stored_control_features,
+        stored_reconstructions=mirror_reconstruction_target(
+            sequence.stored_reconstructions,
             interface=interface,
         ),
         actions=mirror_action(sequence.actions),
@@ -160,7 +160,7 @@ def augment_sequence_batch(
     tensor_names = (
         "observations",
         "privileged_states",
-        "stored_control_features",
+        "stored_reconstructions",
         "actions",
         "rewards",
         "terminated",

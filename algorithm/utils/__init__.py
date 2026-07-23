@@ -26,6 +26,11 @@ from .logging_utils import (
 )
 from .normalization import RunningObservationNormalizer
 from .profiling import StageProfiler
+from .reconstruction import (
+    denormalize_reconstruction,
+    normalize_reconstruction,
+    reconstruction_center_and_scale,
+)
 from .temporal_state import (
     RecurrentState,
     RecurrentStateManager,
@@ -58,6 +63,9 @@ __all__ = [
     "format_console_metrics",
     "format_console_metrics_header",
     "load_evaluation_record",
+    "denormalize_reconstruction",
+    "normalize_reconstruction",
+    "reconstruction_center_and_scale",
     "sac_metrics_dict",
     "symmetric_joint_limit_action_bounds",
     "training_seed_from_config",

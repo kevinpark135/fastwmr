@@ -1,14 +1,15 @@
 """Transition replay shared by the FastSAC baseline and FastWMR.
 
 FastSAC only needs ``(o_t, a_t, r_t, o_{t+1}, terminated, truncated)``.
-FastWMR extends that contract with raw privileged targets, detached diagnostic
-features, estimator versions, and temporal indexing. Its sequence sampler
+FastWMR extends that contract with raw privileged targets, ungated normalized
+reconstructions, estimator versions, and temporal indexing. Its sequence sampler
 reconstructs boundary-safe ``B + L`` windows for current-estimator burn-in and
 learning. Recurrent hidden/cell state is runtime state and is never stored here.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, fields
 
 import torch
@@ -24,7 +25,7 @@ class ReplayBufferSpec:
     observation_dim: int
     action_dim: int
     privileged_state_dim: int = 0
-    control_feature_dim: int = 0
+    reconstruction_dim: int = 0
     require_temporal_metadata: bool = False
 
     def __post_init__(self) -> None:
@@ -34,7 +35,7 @@ class ReplayBufferSpec:
             raise ValueError(f"observation_dim must be positive, got {self.observation_dim}.")
         if self.action_dim <= 0:
             raise ValueError(f"action_dim must be positive, got {self.action_dim}.")
-        if self.privileged_state_dim < 0 or self.control_feature_dim < 0:
+        if self.privileged_state_dim < 0 or self.reconstruction_dim < 0:
             raise ValueError("Optional replay dimensions must be non-negative.")
 
     @classmethod
@@ -50,13 +51,13 @@ class ReplayBufferSpec:
             observation_dim=interface.policy_observation_dim,
             action_dim=interface.action_dim,
             privileged_state_dim=interface.reconstruction_target_dim,
-            control_feature_dim=interface.control_feature_dim,
+            reconstruction_dim=interface.reconstruction_target_dim,
             require_temporal_metadata=True,
         )
 
     @property
     def is_fastwmr(self) -> bool:
-        return self.privileged_state_dim > 0 or self.control_feature_dim > 0
+        return self.privileged_state_dim > 0 or self.reconstruction_dim > 0
 
 
 @dataclass(frozen=True)
@@ -71,8 +72,8 @@ class TransitionReplayBatch:
     truncated: torch.Tensor
     privileged_states: torch.Tensor
     next_privileged_states: torch.Tensor
-    control_features: torch.Tensor
-    next_control_features: torch.Tensor
+    reconstructions: torch.Tensor
+    next_reconstructions: torch.Tensor
     estimator_versions: torch.Tensor
     episode_ids: torch.Tensor
     env_ids: torch.Tensor
@@ -80,7 +81,7 @@ class TransitionReplayBatch:
     reset_boundaries: torch.Tensor
     final_observations: torch.Tensor
     final_privileged_states: torch.Tensor
-    final_control_features: torch.Tensor
+    final_reconstructions: torch.Tensor
     final_observation_mask: torch.Tensor
     insertion_ids: torch.Tensor
 
@@ -121,13 +122,13 @@ class TransitionReplayBatch:
         )
 
     @property
-    def bootstrap_control_features(self) -> torch.Tensor:
-        """Detached control successors aligned with Bellman bootstrapping."""
+    def bootstrap_reconstructions(self) -> torch.Tensor:
+        """Ungated reconstruction successors aligned with Bellman bootstrapping."""
 
         return torch.where(
             self.final_observation_mask.unsqueeze(-1),
-            self.final_control_features,
-            self.next_control_features,
+            self.final_reconstructions,
+            self.next_reconstructions,
         )
 
     def to(self, device: torch.device | str, non_blocking: bool = False) -> "TransitionReplayBatch":
@@ -142,13 +143,15 @@ class TransitionReplayBatch:
 
 
 @dataclass(frozen=True)
-class StoredControlReplayBatch:
+class StoredReconstructionReplayBatch:
     """Minimal replay contract for FastWMR v2's transition SAC learner."""
 
-    control_features: torch.Tensor
+    observations: torch.Tensor
+    reconstructions: torch.Tensor
     actions: torch.Tensor
     rewards: torch.Tensor
-    bootstrap_control_features: torch.Tensor
+    bootstrap_observations: torch.Tensor
+    bootstrap_reconstructions: torch.Tensor
     terminated: torch.Tensor
     truncated: torch.Tensor
     estimator_versions: torch.Tensor
@@ -156,22 +159,22 @@ class StoredControlReplayBatch:
 
     @property
     def batch_size(self) -> int:
-        return self.control_features.shape[0]
+        return self.observations.shape[0]
 
     def feature_ages(self, current_estimator_version: int) -> torch.Tensor:
         if current_estimator_version < 0:
             raise ValueError("current_estimator_version must be non-negative.")
         ages = current_estimator_version - self.estimator_versions
         if torch.any(ages < 0):
-            raise ValueError("Replay contains control features from a future estimator version.")
+            raise ValueError("Replay contains reconstructions from a future estimator version.")
         return ages
 
     def to(
         self,
         device: torch.device | str,
         non_blocking: bool = False,
-    ) -> "StoredControlReplayBatch":
-        return StoredControlReplayBatch(
+    ) -> "StoredReconstructionReplayBatch":
+        return StoredReconstructionReplayBatch(
             **{
                 field.name: getattr(self, field.name).to(
                     device=device,
@@ -193,7 +196,7 @@ class SequenceReplayBatch:
 
     observations: torch.Tensor
     privileged_states: torch.Tensor
-    stored_control_features: torch.Tensor
+    stored_reconstructions: torch.Tensor
     actions: torch.Tensor
     rewards: torch.Tensor
     terminated: torch.Tensor
@@ -217,11 +220,13 @@ class SequenceReplayBatch:
             raise ValueError("observations must have shape (batch, B + L + 1, observation_dim).")
         if (
             self.privileged_states.ndim != 3
-            or self.stored_control_features.ndim != 3
+            or self.stored_reconstructions.ndim != 3
             or self.privileged_states.shape[:2] != observation_shape
-            or self.stored_control_features.shape[:2] != observation_shape
+            or self.stored_reconstructions.shape[:2] != observation_shape
         ):
-            raise ValueError("Privileged states and stored control features must align with observations.")
+            raise ValueError(
+                "Privileged states and stored reconstructions must align with observations."
+            )
         if self.actions.ndim != 3 or self.actions.shape[:2] != transition_shape:
             raise ValueError("actions must have shape (batch, B + L, action_dim).")
 
@@ -257,7 +262,7 @@ class SequenceReplayBatch:
         floating_fields = (
             self.observations,
             self.privileged_states,
-            self.stored_control_features,
+            self.stored_reconstructions,
             self.actions,
             self.rewards,
         )
@@ -287,8 +292,8 @@ class SequenceReplayBatch:
         return self.privileged_states[:, self.burn_in_length :]
 
     @property
-    def learning_stored_control_features(self) -> torch.Tensor:
-        return self.stored_control_features[:, self.burn_in_length :]
+    def learning_stored_reconstructions(self) -> torch.Tensor:
+        return self.stored_reconstructions[:, self.burn_in_length :]
 
     @property
     def learning_actions(self) -> torch.Tensor:
@@ -316,7 +321,7 @@ class SequenceReplayBatch:
         tensor_names = (
             "observations",
             "privileged_states",
-            "stored_control_features",
+            "stored_reconstructions",
             "actions",
             "rewards",
             "terminated",
@@ -370,8 +375,8 @@ class TransitionReplayBuffer:
         # Width-zero tensors keep the sampled batch API uniform for FastSAC.
         self._privileged_states = vector(spec.privileged_state_dim)
         self._next_privileged_states = vector(spec.privileged_state_dim)
-        self._control_features = vector(spec.control_feature_dim)
-        self._next_control_features = vector(spec.control_feature_dim)
+        self._reconstructions = vector(spec.reconstruction_dim)
+        self._next_reconstructions = vector(spec.reconstruction_dim)
 
         self._estimator_versions = scalar(torch.int64)
         self._episode_ids = scalar(torch.int64)
@@ -380,7 +385,7 @@ class TransitionReplayBuffer:
         self._reset_boundaries = scalar(torch.bool)
         self._final_observations = vector(spec.observation_dim)
         self._final_privileged_states = vector(spec.privileged_state_dim)
-        self._final_control_features = vector(spec.control_feature_dim)
+        self._final_reconstructions = vector(spec.reconstruction_dim)
         self._final_observation_mask = scalar(torch.bool)
         self._insertion_ids = scalar(torch.int64)
         temporal_capacity = spec.capacity if spec.require_temporal_metadata else 0
@@ -441,7 +446,7 @@ class TransitionReplayBuffer:
     def oldest_estimator_version(self) -> int | None:
         """Estimator version attached to the oldest retained transition."""
 
-        if self.spec.control_feature_dim == 0:
+        if self.spec.reconstruction_dim == 0:
             return None
         index = self._oldest_physical_index()
         return None if index is None else int(self._estimator_versions[index].item())
@@ -450,7 +455,7 @@ class TransitionReplayBuffer:
     def newest_estimator_version(self) -> int | None:
         """Estimator version attached to the newest retained transition."""
 
-        if self.spec.control_feature_dim == 0:
+        if self.spec.reconstruction_dim == 0:
             return None
         index = self._newest_physical_index()
         return None if index is None else int(self._estimator_versions[index].item())
@@ -460,24 +465,24 @@ class TransitionReplayBuffer:
             raise ValueError(f"batch_size must be positive, got {batch_size}.")
         return self._size >= batch_size
 
-    def eligible_control_feature_count(
+    def eligible_reconstruction_count(
         self,
         *,
         current_estimator_version: int,
         max_estimator_feature_age: int | None,
         recent_transition_horizon: int | None,
     ) -> int:
-        """Count retained stored features satisfying v2 staleness controls."""
+        """Count retained reconstructions satisfying v2 staleness controls."""
 
         return int(
-            self._control_feature_candidates(
+            self._reconstruction_candidates(
                 current_estimator_version=current_estimator_version,
                 max_estimator_feature_age=max_estimator_feature_age,
                 recent_transition_horizon=recent_transition_horizon,
             ).numel()
         )
 
-    def can_sample_control_features(
+    def can_sample_reconstructions(
         self,
         batch_size: int,
         *,
@@ -487,7 +492,7 @@ class TransitionReplayBuffer:
     ) -> bool:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive.")
-        return self.eligible_control_feature_count(
+        return self.eligible_reconstruction_count(
             current_estimator_version=current_estimator_version,
             max_estimator_feature_age=max_estimator_feature_age,
             recent_transition_horizon=recent_transition_horizon,
@@ -504,8 +509,8 @@ class TransitionReplayBuffer:
         *,
         privileged_states: torch.Tensor | None = None,
         next_privileged_states: torch.Tensor | None = None,
-        control_features: torch.Tensor | None = None,
-        next_control_features: torch.Tensor | None = None,
+        reconstructions: torch.Tensor | None = None,
+        next_reconstructions: torch.Tensor | None = None,
         estimator_versions: torch.Tensor | None = None,
         episode_ids: torch.Tensor | None = None,
         env_ids: torch.Tensor | None = None,
@@ -513,7 +518,7 @@ class TransitionReplayBuffer:
         reset_boundaries: torch.Tensor | None = None,
         final_observations: torch.Tensor | None = None,
         final_privileged_states: torch.Tensor | None = None,
-        final_control_features: torch.Tensor | None = None,
+        final_reconstructions: torch.Tensor | None = None,
         final_observation_mask: torch.Tensor | None = None,
     ) -> None:
         """Append one transition or a leading batch of vector-env transitions.
@@ -549,24 +554,24 @@ class TransitionReplayBuffer:
             batch_size,
             required=self.spec.privileged_state_dim > 0,
         )
-        control_features = self._optional_matrix(
-            control_features,
-            self.spec.control_feature_dim,
-            "control_features",
+        reconstructions = self._optional_matrix(
+            reconstructions,
+            self.spec.reconstruction_dim,
+            "reconstructions",
             batch_size,
-            required=self.spec.control_feature_dim > 0,
+            required=self.spec.reconstruction_dim > 0,
         )
-        next_control_features = self._optional_matrix(
-            next_control_features,
-            self.spec.control_feature_dim,
-            "next_control_features",
+        next_reconstructions = self._optional_matrix(
+            next_reconstructions,
+            self.spec.reconstruction_dim,
+            "next_reconstructions",
             batch_size,
-            required=self.spec.control_feature_dim > 0,
+            required=self.spec.reconstruction_dim > 0,
         )
 
         metadata_required = self.spec.require_temporal_metadata
         estimator_versions = self._optional_integer_vector(
-            estimator_versions, "estimator_versions", batch_size, required=self.spec.control_feature_dim > 0
+            estimator_versions, "estimator_versions", batch_size, required=self.spec.reconstruction_dim > 0
         )
         episode_ids = self._optional_integer_vector(
             episode_ids, "episode_ids", batch_size, required=metadata_required
@@ -581,18 +586,18 @@ class TransitionReplayBuffer:
                 raise ValueError("FastWMR episode_ids, env_ids, and timesteps must be non-negative.")
             if torch.any(reset_boundaries != (timesteps == 0)):
                 raise ValueError("reset_boundaries must be true exactly when an episode timestep is zero.")
-        if self.spec.control_feature_dim > 0 and torch.any(estimator_versions < 0):
+        if self.spec.reconstruction_dim > 0 and torch.any(estimator_versions < 0):
             raise ValueError("FastWMR estimator_versions must be non-negative.")
 
         if final_observations is None:
             if any(
                 value is not None
-                for value in (final_privileged_states, final_control_features, final_observation_mask)
+                for value in (final_privileged_states, final_reconstructions, final_observation_mask)
             ):
                 raise ValueError("Final-state fields and mask require final_observations.")
             final_observations = torch.zeros_like(observations)
             final_privileged_states = torch.zeros_like(privileged_states)
-            final_control_features = torch.zeros_like(control_features)
+            final_reconstructions = torch.zeros_like(reconstructions)
             final_observation_mask = torch.zeros(batch_size, dtype=torch.bool, device=observations.device)
         else:
             final_observations = self._as_matrix(
@@ -615,11 +620,11 @@ class TransitionReplayBuffer:
                 batch_size,
                 final_observation_mask,
             )
-            final_control_features = self._optional_final_matrix(
-                final_control_features,
-                control_features,
-                self.spec.control_feature_dim,
-                "final_control_features",
+            final_reconstructions = self._optional_final_matrix(
+                final_reconstructions,
+                reconstructions,
+                self.spec.reconstruction_dim,
+                "final_reconstructions",
                 batch_size,
                 final_observation_mask,
             )
@@ -631,11 +636,11 @@ class TransitionReplayBuffer:
             next_observations,
             privileged_states,
             next_privileged_states,
-            control_features,
-            next_control_features,
+            reconstructions,
+            next_reconstructions,
             final_observations,
             final_privileged_states,
-            final_control_features,
+            final_reconstructions,
         )
         if any(not torch.isfinite(tensor).all() for tensor in tensors):
             raise ValueError("Replay transitions must not contain NaN or infinite floating-point values.")
@@ -658,8 +663,8 @@ class TransitionReplayBuffer:
             truncated = truncated[start:]
             privileged_states = privileged_states[start:]
             next_privileged_states = next_privileged_states[start:]
-            control_features = control_features[start:]
-            next_control_features = next_control_features[start:]
+            reconstructions = reconstructions[start:]
+            next_reconstructions = next_reconstructions[start:]
             estimator_versions = estimator_versions[start:]
             episode_ids = episode_ids[start:]
             env_ids = env_ids[start:]
@@ -667,7 +672,7 @@ class TransitionReplayBuffer:
             reset_boundaries = reset_boundaries[start:]
             final_observations = final_observations[start:]
             final_privileged_states = final_privileged_states[start:]
-            final_control_features = final_control_features[start:]
+            final_reconstructions = final_reconstructions[start:]
             final_observation_mask = final_observation_mask[start:]
             insertion_ids = insertion_ids[start:]
         indices = (torch.arange(batch_size, device=self.storage_device) + self._position) % self.capacity
@@ -683,8 +688,8 @@ class TransitionReplayBuffer:
             "truncated": truncated,
             "privileged_states": privileged_states,
             "next_privileged_states": next_privileged_states,
-            "control_features": control_features,
-            "next_control_features": next_control_features,
+            "reconstructions": reconstructions,
+            "next_reconstructions": next_reconstructions,
             "estimator_versions": estimator_versions,
             "episode_ids": episode_ids,
             "env_ids": env_ids,
@@ -692,7 +697,7 @@ class TransitionReplayBuffer:
             "reset_boundaries": reset_boundaries,
             "final_observations": final_observations,
             "final_privileged_states": final_privileged_states,
-            "final_control_features": final_control_features,
+            "final_reconstructions": final_reconstructions,
             "final_observation_mask": final_observation_mask,
             "insertion_ids": insertion_ids,
         }
@@ -723,7 +728,7 @@ class TransitionReplayBuffer:
         batch = self._batch_at(indices)
         return batch if device is None else batch.to(device)
 
-    def sample_control_features(
+    def sample_reconstructions(
         self,
         batch_size: int,
         *,
@@ -732,21 +737,21 @@ class TransitionReplayBuffer:
         recent_transition_horizon: int | None,
         device: torch.device | str | None = None,
         generator: torch.Generator | None = None,
-    ) -> StoredControlReplayBatch:
-        """Sample only stored control features accepted by the v2 age policy."""
+    ) -> StoredReconstructionReplayBatch:
+        """Sample raw observations and ungated reconstructions accepted by the age policy."""
 
         if batch_size <= 0:
             raise ValueError("batch_size must be positive.")
-        if self.spec.control_feature_dim <= 0:
-            raise RuntimeError("Stored control-feature sampling requires FastWMR replay.")
-        candidates = self._control_feature_candidates(
+        if self.spec.reconstruction_dim <= 0:
+            raise RuntimeError("Stored reconstruction sampling requires FastWMR replay.")
+        candidates = self._reconstruction_candidates(
             current_estimator_version=current_estimator_version,
             max_estimator_feature_age=max_estimator_feature_age,
             recent_transition_horizon=recent_transition_horizon,
         )
         if candidates.numel() < batch_size:
             raise RuntimeError(
-                f"Need {batch_size} eligible stored features, found {candidates.numel()}."
+                f"Need {batch_size} eligible reconstructions, found {candidates.numel()}."
             )
         choices = torch.randint(
             candidates.numel(),
@@ -755,7 +760,7 @@ class TransitionReplayBuffer:
             device="cpu",
         )
         indices = candidates[choices.to(candidates.device)]
-        batch = self._stored_control_batch_at(indices)
+        batch = self._stored_reconstruction_batch_at(indices)
         return batch if device is None else batch.to(device)
 
     def can_sample_sequences(
@@ -765,17 +770,26 @@ class TransitionReplayBuffer:
         learning_length: int,
         *,
         require_episode_start: bool = False,
+        episode_start_fraction: float = 0.0,
         minimum_insertion_id: int | None = None,
     ) -> bool:
         """Return whether enough distinct boundary-safe windows are retained."""
 
         self._validate_sequence_request(batch_size, burn_in_length, learning_length)
+        exact_count = self._required_exact_sequences(
+            batch_size,
+            require_episode_start=require_episode_start,
+            episode_start_fraction=episode_start_fraction,
+        )
         starts = self._sequence_candidates(
             burn_in_length + learning_length,
-            require_episode_start=require_episode_start,
+            require_episode_start=False,
             minimum_insertion_id=minimum_insertion_id,
         )
-        return starts.numel() >= batch_size
+        if starts.numel() < batch_size:
+            return False
+        exact_starts = starts[self._is_exact_sequence_start(starts)]
+        return exact_starts.numel() >= exact_count
 
     def sample_sequences(
         self,
@@ -784,6 +798,7 @@ class TransitionReplayBuffer:
         learning_length: int,
         *,
         require_episode_start: bool = False,
+        episode_start_fraction: float = 0.0,
         minimum_insertion_id: int | None = None,
         device: torch.device | str | None = None,
         generator: torch.Generator | None = None,
@@ -791,10 +806,15 @@ class TransitionReplayBuffer:
         """Sample ``B + L`` consecutive transitions without crossing resets."""
 
         self._validate_sequence_request(batch_size, burn_in_length, learning_length)
+        exact_count = self._required_exact_sequences(
+            batch_size,
+            require_episode_start=require_episode_start,
+            episode_start_fraction=episode_start_fraction,
+        )
         transition_length = burn_in_length + learning_length
         starts = self._sequence_candidates(
             transition_length,
-            require_episode_start=require_episode_start,
+            require_episode_start=False,
             minimum_insertion_id=minimum_insertion_id,
         )
         if starts.numel() < batch_size:
@@ -803,8 +823,43 @@ class TransitionReplayBuffer:
                 f"found {starts.numel()}."
             )
 
-        choices = torch.randperm(starts.numel(), generator=generator)[:batch_size]
-        selected_starts = starts[choices.to(starts.device)]
+        exact_positions = torch.nonzero(
+            self._is_exact_sequence_start(starts),
+            as_tuple=False,
+        ).squeeze(-1)
+        if exact_positions.numel() < exact_count:
+            raise RuntimeError(
+                f"Need {exact_count} exact-context sequences, found {exact_positions.numel()}."
+            )
+        exact_choices = torch.randperm(
+            exact_positions.numel(),
+            generator=generator,
+        )[:exact_count]
+        selected_positions = exact_positions[
+            exact_choices.to(exact_positions.device)
+        ]
+        selected_exact = starts[selected_positions]
+        remaining_count = batch_size - exact_count
+        if remaining_count > 0:
+            remaining_mask = torch.ones(
+                starts.numel(),
+                dtype=torch.bool,
+                device=starts.device,
+            )
+            remaining_mask[selected_positions] = False
+            remaining_starts = starts[remaining_mask]
+            remaining_choices = torch.randperm(
+                remaining_starts.numel(),
+                generator=generator,
+            )[:remaining_count]
+            selected_remaining = remaining_starts[
+                remaining_choices.to(remaining_starts.device)
+            ]
+            selected_starts = torch.cat((selected_exact, selected_remaining))
+            shuffle = torch.randperm(batch_size, generator=generator)
+            selected_starts = selected_starts[shuffle.to(selected_starts.device)]
+        else:
+            selected_starts = selected_exact
         indices = torch.empty(
             (batch_size, transition_length),
             dtype=torch.int64,
@@ -827,10 +882,10 @@ class TransitionReplayBuffer:
                 ),
                 dim=1,
             ),
-            stored_control_features=torch.cat(
+            stored_reconstructions=torch.cat(
                 (
-                    transitions.control_features,
-                    final_transitions.bootstrap_control_features.unsqueeze(1),
+                    transitions.reconstructions,
+                    final_transitions.bootstrap_reconstructions.unsqueeze(1),
                 ),
                 dim=1,
             ),
@@ -847,6 +902,21 @@ class TransitionReplayBuffer:
             learning_length=learning_length,
         )
         return sequence if device is None else sequence.to(device)
+
+    def _required_exact_sequences(
+        self,
+        batch_size: int,
+        *,
+        require_episode_start: bool,
+        episode_start_fraction: float,
+    ) -> int:
+        if not 0.0 <= episode_start_fraction <= 1.0:
+            raise ValueError("episode_start_fraction must be in [0, 1].")
+        fraction = 1.0 if require_episode_start else episode_start_fraction
+        return math.ceil(batch_size * fraction)
+
+    def _is_exact_sequence_start(self, starts: torch.Tensor) -> torch.Tensor:
+        return self._reset_boundaries[starts] & (self._timesteps[starts] == 0)
 
     def chronological(self, *, device: torch.device | str | None = None) -> TransitionReplayBatch:
         """Return retained transitions from oldest to newest for tests/debugging."""
@@ -899,8 +969,8 @@ class TransitionReplayBuffer:
             truncated=self._truncated[indices],
             privileged_states=self._privileged_states[indices],
             next_privileged_states=self._next_privileged_states[indices],
-            control_features=self._control_features[indices],
-            next_control_features=self._next_control_features[indices],
+            reconstructions=self._reconstructions[indices],
+            next_reconstructions=self._next_reconstructions[indices],
             estimator_versions=self._estimator_versions[indices],
             episode_ids=self._episode_ids[indices],
             env_ids=self._env_ids[indices],
@@ -908,37 +978,44 @@ class TransitionReplayBuffer:
             reset_boundaries=self._reset_boundaries[indices],
             final_observations=self._final_observations[indices],
             final_privileged_states=self._final_privileged_states[indices],
-            final_control_features=self._final_control_features[indices],
+            final_reconstructions=self._final_reconstructions[indices],
             final_observation_mask=self._final_observation_mask[indices],
             insertion_ids=self._insertion_ids[indices],
         )
 
-    def _stored_control_batch_at(self, indices: torch.Tensor) -> StoredControlReplayBatch:
-        bootstrap_control_features = torch.where(
+    def _stored_reconstruction_batch_at(self, indices: torch.Tensor) -> StoredReconstructionReplayBatch:
+        bootstrap_observations = torch.where(
             self._final_observation_mask[indices].unsqueeze(-1),
-            self._final_control_features[indices],
-            self._next_control_features[indices],
+            self._final_observations[indices],
+            self._next_observations[indices],
         )
-        return StoredControlReplayBatch(
-            control_features=self._control_features[indices],
+        bootstrap_reconstructions = torch.where(
+            self._final_observation_mask[indices].unsqueeze(-1),
+            self._final_reconstructions[indices],
+            self._next_reconstructions[indices],
+        )
+        return StoredReconstructionReplayBatch(
+            observations=self._observations[indices],
+            reconstructions=self._reconstructions[indices],
             actions=self._actions[indices],
             rewards=self._rewards[indices],
-            bootstrap_control_features=bootstrap_control_features,
+            bootstrap_observations=bootstrap_observations,
+            bootstrap_reconstructions=bootstrap_reconstructions,
             terminated=self._terminated[indices],
             truncated=self._truncated[indices],
             estimator_versions=self._estimator_versions[indices],
             insertion_ids=self._insertion_ids[indices],
         )
 
-    def _control_feature_candidates(
+    def _reconstruction_candidates(
         self,
         *,
         current_estimator_version: int,
         max_estimator_feature_age: int | None,
         recent_transition_horizon: int | None,
     ) -> torch.Tensor:
-        if self.spec.control_feature_dim <= 0:
-            raise RuntimeError("Control-feature candidates require FastWMR replay.")
+        if self.spec.reconstruction_dim <= 0:
+            raise RuntimeError("Reconstruction candidates require FastWMR replay.")
         if current_estimator_version < 0:
             raise ValueError("current_estimator_version must be non-negative.")
         if max_estimator_feature_age is not None and max_estimator_feature_age < 0:
@@ -953,7 +1030,7 @@ class TransitionReplayBuffer:
             retained[self._size :] = False
         ages = current_estimator_version - self._estimator_versions
         if torch.any(ages[retained] < 0):
-            raise ValueError("Replay contains control features from a future estimator version.")
+            raise ValueError("Replay contains reconstructions from a future estimator version.")
         if max_estimator_feature_age is not None:
             retained &= ages <= max_estimator_feature_age
         if recent_transition_horizon is not None:

@@ -8,7 +8,7 @@ from .estimator_rollout_cache import (
 from .transition_replay_buffer import (
     ReplayBufferSpec,
     SequenceReplayBatch,
-    StoredControlReplayBatch,
+    StoredReconstructionReplayBatch,
     TransitionReplayBatch,
     TransitionReplayBuffer,
 )
@@ -19,7 +19,7 @@ __all__ = [
     "EstimatorRolloutCacheSpec",
     "ReplayBufferSpec",
     "SequenceReplayBatch",
-    "StoredControlReplayBatch",
+    "StoredReconstructionReplayBatch",
     "TransitionReplayBatch",
     "TransitionReplayBuffer",
 ]

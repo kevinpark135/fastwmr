@@ -57,6 +57,7 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.u
     IsaacLabEnvAdapter,
     RunningObservationNormalizer,
     build_control_feature,
+    denormalize_reconstruction,
     training_seed_from_config,
     write_evaluation_record,
 )
@@ -105,6 +106,14 @@ class _OnlineCorrelation:
             covariance = count * sum_xy - sum_x * sum_y
             variance = (count * sum_xx - sum_x**2) * (count * sum_yy - sum_y**2)
             output[name] = covariance / math.sqrt(variance) if variance > 1e-18 else 0.0
+        return output
+
+    def rmse(self) -> dict[str, float]:
+        output: dict[str, float] = {}
+        for name, values in self.statistics.items():
+            count, _, _, sum_xx, sum_yy, sum_xy = values.tolist()
+            squared_error = max(0.0, sum_xx + sum_yy - 2.0 * sum_xy)
+            output[name] = math.sqrt(squared_error / max(1.0, count))
         return output
 
 
@@ -200,6 +209,15 @@ def run() -> Path:
     try:
         observation_dim = int(raw_env.observation_space["policy"].shape[-1])
         action_dim = int(raw_env.unwrapped.action_manager.total_action_dim)
+        resolved = metadata.config.get("resolved", {})
+        if not isinstance(resolved, dict):
+            resolved = {}
+        actor_hidden_dim = int(
+            resolved.get(
+                "actor_hidden_dim",
+                arguments.get("actor_hidden_dim", arguments.get("hidden_dim", 768)),
+            )
+        )
         control_mode = ControlFeatureMode(
             str(arguments.get("control_feature_mode", "obs_and_reconstruction"))
         )
@@ -220,7 +238,7 @@ def run() -> Path:
         actor = TanhGaussianActor(
             actor_input_dim,
             action_dim,
-            cfg=TanhGaussianActorCfg(hidden_dim=int(arguments.get("hidden_dim", 768))),
+            cfg=TanhGaussianActorCfg(hidden_dim=actor_hidden_dim),
             action_low=action_low,
             action_high=action_high,
         ).to(env.device)
@@ -274,11 +292,20 @@ def run() -> Path:
         terminated_episodes = 0
         tracking_linear_sum = 0.0
         tracking_yaw_sum = 0.0
+        tracking_linear_squared_sum = 0.0
+        tracking_yaw_squared_sum = 0.0
+        action_rate_squared_sum = 0.0
+        mechanical_power_sum = 0.0
         stable_samples = 0
         recovery_steps_sum = 0
         recovery_count = 0
         tilt_peak = 0.0
         hidden_norm_sum = 0.0
+        previous_actions = torch.zeros(
+            env.num_envs,
+            action_dim,
+            device=env.device,
+        )
         generator = torch.Generator(device=env.device).manual_seed(ARGS.seed)
         if env.device.type == "cuda":
             torch.cuda.synchronize(env.device)
@@ -291,7 +318,13 @@ def run() -> Path:
                 runtime_step = runtime.step(policy, reset_boundaries=reset_boundaries)
                 privileged = env.privileged_observation(observations)
                 assert correlations is not None
-                correlations.update(runtime_step.reconstruction, privileged)
+                correlations.update(
+                    denormalize_reconstruction(
+                        runtime_step.reconstruction,
+                        interface=interface,
+                    ),
+                    privileged,
+                )
                 hidden_norm_sum += runtime_step.hidden_norm
                 feature = build_control_feature(
                     policy,
@@ -302,6 +335,9 @@ def run() -> Path:
             else:
                 feature = normalizer(policy) if normalizer is not None else policy
             actions = actor.act(feature, deterministic=not ARGS.stochastic)
+            action_rate_squared_sum += float(
+                (actions - previous_actions).square().sum().item()
+            )
             step = env.step(actions)
             returns += step.rewards
             lengths += 1
@@ -314,6 +350,14 @@ def run() -> Path:
             yaw_error = (robot.data.root_ang_vel_b.torch[:, 2] - command[:, 2]).abs()
             tracking_linear_sum += float(linear_error.sum().item())
             tracking_yaw_sum += float(yaw_error.sum().item())
+            tracking_linear_squared_sum += float(linear_error.square().sum().item())
+            tracking_yaw_squared_sum += float(yaw_error.square().sum().item())
+            mechanical_power_sum += float(
+                (
+                    robot.data.applied_torque.torch
+                    * robot.data.joint_vel.torch
+                ).abs().sum().item()
+            )
             stable = (linear_error < 0.25) & (yaw_error < 0.25)
             stable_samples += int(stable.sum().item())
             newly_recovered = stable & ~recovered
@@ -335,6 +379,8 @@ def run() -> Path:
                 recovered[done] = False
             observations = step.observations
             reset_boundaries = done
+            previous_actions = actions.detach().clone()
+            previous_actions[done] = 0.0
 
         if env.device.type == "cuda":
             torch.cuda.synchronize(env.device)
@@ -356,6 +402,18 @@ def run() -> Path:
             "fall_rate": terminated_episodes / float(env.num_envs + completed_episodes),
             "linear_tracking_error": tracking_linear_sum / samples,
             "yaw_tracking_error": tracking_yaw_sum / samples,
+            "linear_tracking_rmse": math.sqrt(
+                tracking_linear_squared_sum / samples
+            ),
+            "yaw_tracking_rmse": math.sqrt(
+                tracking_yaw_squared_sum / samples
+            ),
+            "action_rate_rms": math.sqrt(
+                action_rate_squared_sum / (samples * action_dim)
+            ),
+            "mechanical_power_mean": (
+                mechanical_power_sum / (samples * action_dim)
+            ),
             "tracking_success_fraction": stable_samples / samples,
             "recovery_steps_mean": recovery_steps_sum / float(max(1, recovery_count)),
             "peak_tilt": tilt_peak,
@@ -363,6 +421,13 @@ def run() -> Path:
             "environment_steps_per_second": samples / wallclock,
             "runtime_hidden_norm_mean": hidden_norm_sum / float(ARGS.steps),
         }
+        if correlations is not None:
+            metrics.update(
+                {
+                    f"estimator/{name}_rmse": value
+                    for name, value in correlations.rmse().items()
+                }
+            )
         record = EvaluationRecord(
             mode=metadata.mode.value,
             variant=ARGS.variant,

@@ -62,7 +62,7 @@ def _sequence() -> SequenceReplayBatch:
     return SequenceReplayBatch(
         observations=torch.randn(2, 5, 3),
         privileged_states=torch.randn(2, 5, 2),
-        stored_control_features=torch.randn(2, 5, 4),
+        stored_reconstructions=torch.randn(2, 5, 4),
         actions=torch.randn(2, 4, 2),
         rewards=torch.randn(2, 4),
         terminated=torch.zeros(2, 4, dtype=torch.bool),
@@ -196,7 +196,7 @@ def test_fastwmr_loop_samples_sequences_and_updates_only_learning_window() -> No
             observation_dim=3,
             action_dim=2,
             privileged_state_dim=2,
-            control_feature_dim=4,
+            reconstruction_dim=4,
             require_temporal_metadata=True,
         )
     )
@@ -211,8 +211,8 @@ def test_fastwmr_loop_samples_sequences_and_updates_only_learning_window() -> No
             truncated=torch.tensor([False]),
             privileged_states=value[:, None].repeat(1, 2),
             next_privileged_states=(value + 1.0)[:, None].repeat(1, 2),
-            control_features=value[:, None].repeat(1, 4),
-            next_control_features=(value + 1.0)[:, None].repeat(1, 4),
+            reconstructions=value[:, None].repeat(1, 4),
+            next_reconstructions=(value + 1.0)[:, None].repeat(1, 4),
             estimator_versions=torch.tensor([0]),
             episode_ids=torch.tensor([0]),
             env_ids=torch.tensor([0]),
@@ -224,7 +224,7 @@ def test_fastwmr_loop_samples_sequences_and_updates_only_learning_window() -> No
 
     def process_sequence(sequence: SequenceReplayBatch) -> torch.Tensor:
         sampled_sequences.append(sequence)
-        return sequence.learning_stored_control_features.detach()
+        return sequence.learning_stored_reconstructions.detach()
 
     loop = FastWMRSequenceUpdateLoop(
         replay,

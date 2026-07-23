@@ -170,10 +170,25 @@ def sac_metrics_dict(metrics: object, *, prefix: str = "sac/") -> dict[str, floa
         "q2_std",
         "policy_entropy",
     )
-    return {
+    output = {
         f"{prefix}{name}": _scalar(getattr(metrics, name), name)
         for name in names
     }
+    optional_names = (
+        "q_gap_mean",
+        "q_gap_max",
+        "policy_action_saturation_fraction",
+        "c51_lower_endpoint_mass",
+        "c51_upper_endpoint_mass",
+        "c51_target_lower_endpoint_mass",
+        "c51_target_upper_endpoint_mass",
+        "c51_distribution_entropy",
+    )
+    for name in optional_names:
+        value = getattr(metrics, name, None)
+        if value is not None:
+            output[f"{prefix}{name}"] = _scalar(value, name)
+    return output
 
 
 def fastwmr_agent_metrics_dict(update: object) -> dict[str, float | int]:
@@ -220,7 +235,17 @@ def estimator_metrics_dict(update: object) -> dict[str, float | int]:
         "estimator/version": int(estimator.estimator_version),
     }
     for name, value in estimator.field_losses.items():
-        output[f"estimator/field/{name}"] = float(value)
+        output[f"estimator/field_normalized/{name}"] = float(value)
+        if name.endswith("_mse"):
+            output[f"estimator/field_normalized/{name[:-4]}_rmse"] = math.sqrt(
+                max(0.0, float(value))
+            )
+    for name, value in getattr(estimator, "physical_field_losses", {}).items():
+        output[f"estimator/field_physical/{name}"] = float(value)
+        if name.endswith("_mse"):
+            output[f"estimator/field_physical/{name[:-4]}_rmse"] = math.sqrt(
+                max(0.0, float(value))
+            )
     return output
 
 
@@ -235,9 +260,22 @@ def fastwmr_v2_metrics_dict(update_loop: object) -> dict[str, float | int]:
         "v2/control_estimator_version": int(controller.control_estimator_version),
         "v2/sac_updates_since_estimator": int(update_loop.sac_updates_since_estimator),
         "v2/reconstruction_gate": float(controller.reconstruction_gate),
+        "v2/gate_state": {
+            "closed": 0,
+            "ramping": 1,
+            "open": 2,
+        }[controller.gate_state.value],
+        "v2/gate_quality_passes": int(controller.gate_quality_passes),
+        "v2/gate_validation_checks": int(controller.gate_validation_checks),
         "v2/eligible_features": int(update_loop.last_eligible_features),
         "v2/rejected_features": int(update_loop.last_rejected_features),
     }
+    if controller.gate_quality_ema is not None:
+        metrics["v2/gate_quality_ema"] = float(controller.gate_quality_ema)
+    if controller.last_gate_validation is not None:
+        metrics["v2/gate_validation_loss"] = float(
+            controller.last_gate_validation.metrics.total_loss
+        )
     if update_loop.last_feature_age_mean is not None:
         metrics["v2/feature_age_mean"] = float(update_loop.last_feature_age_mean)
     if update_loop.last_feature_age_max is not None:

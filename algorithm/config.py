@@ -293,16 +293,19 @@ class SequenceReplayCfg:
     """FastWMR R2D2-style replay window dimensions."""
 
     batch_size: int = 256
-    burn_in_length: int = 16
+    burn_in_length: int = 32
     learning_length: int = 8
     require_episode_start: bool = False
-    recent_transition_horizon: int | None = None
+    episode_start_fraction: float = 0.25
+    recent_transition_horizon: int | None = 200_000
 
     def __post_init__(self) -> None:
         if self.batch_size <= 0 or self.learning_length <= 0:
             raise ValueError("Sequence batch_size and learning_length must be positive.")
         if self.burn_in_length < 0:
             raise ValueError("burn_in_length must be non-negative.")
+        if not 0.0 <= self.episode_start_fraction <= 1.0:
+            raise ValueError("episode_start_fraction must be in [0, 1].")
         if self.recent_transition_horizon is not None and self.recent_transition_horizon <= 0:
             raise ValueError("recent_transition_horizon must be positive when provided.")
 
@@ -320,7 +323,11 @@ class FastWMRV2Cfg:
     stored_feature_replay_horizon: int | None = 200_000
     control_estimator_tau: float = 0.005
     reconstruction_gate_start_updates: int = 0
-    reconstruction_gate_warmup_updates: int = 1_000
+    reconstruction_gate_warmup_updates: int = 200
+    reconstruction_gate_quality_threshold: float = 1.0
+    reconstruction_gate_quality_ema_decay: float = 0.9
+    reconstruction_gate_quality_patience: int = 3
+    reconstruction_gate_validation_interval: int = 8
 
     def __post_init__(self) -> None:
         if self.estimator_update_interval <= 0:
@@ -343,27 +350,63 @@ class FastWMRV2Cfg:
             raise ValueError("reconstruction_gate_start_updates must be non-negative.")
         if self.reconstruction_gate_warmup_updates < 0:
             raise ValueError("reconstruction_gate_warmup_updates must be non-negative.")
+        if self.reconstruction_gate_quality_threshold <= 0.0:
+            raise ValueError("reconstruction_gate_quality_threshold must be positive.")
+        if not 0.0 <= self.reconstruction_gate_quality_ema_decay < 1.0:
+            raise ValueError("reconstruction_gate_quality_ema_decay must be in [0, 1).")
+        if self.reconstruction_gate_quality_patience <= 0:
+            raise ValueError("reconstruction_gate_quality_patience must be positive.")
+        if self.reconstruction_gate_validation_interval <= 0:
+            raise ValueError("reconstruction_gate_validation_interval must be positive.")
 
 
 DEFAULT_FASTWMR_V2_CFG = FastWMRV2Cfg()
 
 
 @dataclass(frozen=True)
+class ReconstructionNormalizationCfg:
+    """Fixed physical scales used by the FastWMR reconstruction space."""
+
+    base_velocity_scale: float = 2.0
+    friction_center: float = 0.8
+    friction_scale: float = 0.7
+    payload_mass_scale: float = 5.0
+    force_scale: float = 50.0
+    torque_scale: float = 10.0
+
+    def __post_init__(self) -> None:
+        scales = (
+            self.base_velocity_scale,
+            self.friction_scale,
+            self.payload_mass_scale,
+            self.force_scale,
+            self.torque_scale,
+        )
+        if any(scale <= 0.0 for scale in scales):
+            raise ValueError("Reconstruction normalization scales must be positive.")
+
+
+DEFAULT_RECONSTRUCTION_NORMALIZATION_CFG = ReconstructionNormalizationCfg()
+
+
+@dataclass(frozen=True)
 class EstimatorLossCfg:
-    """WMR reconstruction-loss weights.
+    """Field weights applied after reconstruction targets are normalized."""
 
-    The defaults follow WMR's continuous reconstruction, discrete contact, and
-    latent sparsity coefficients respectively.
-    """
-
-    continuous_weight: float = 1.0
-    discrete_weight: float = 0.3
+    base_velocity_weight: float = 1.0
+    friction_weight: float = 1.0
+    payload_mass_weight: float = 0.5
+    wrench_weight: float = 0.1
+    contact_weight: float = 0.3
     latent_l1_weight: float = 0.005
 
     def __post_init__(self) -> None:
         weights = (
-            self.continuous_weight,
-            self.discrete_weight,
+            self.base_velocity_weight,
+            self.friction_weight,
+            self.payload_mass_weight,
+            self.wrench_weight,
+            self.contact_weight,
             self.latent_l1_weight,
         )
         if any(weight < 0.0 for weight in weights):
@@ -394,6 +437,9 @@ class FastWMRAlgoCfg:
     sequence_replay: SequenceReplayCfg = DEFAULT_SEQUENCE_REPLAY_CFG
     learner_mode: FastWMRLearnerMode = FastWMRLearnerMode.TWO_TIMESCALE
     v2: FastWMRV2Cfg = DEFAULT_FASTWMR_V2_CFG
+    reconstruction_normalization: ReconstructionNormalizationCfg = (
+        DEFAULT_RECONSTRUCTION_NORMALIZATION_CFG
+    )
     estimator_loss: EstimatorLossCfg = DEFAULT_ESTIMATOR_LOSS_CFG
     discount: float = 0.97
     target_update_rate: float = 0.005

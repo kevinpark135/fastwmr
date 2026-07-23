@@ -97,7 +97,15 @@ def test_fastwmr_metrics_include_estimator_and_gradient_boundary_fields() -> Non
         q1_std=torch.tensor(0.5),
         q2_mean=torch.tensor(6.0),
         q2_std=torch.tensor(0.6),
+        q_gap_mean=torch.tensor(0.2),
+        q_gap_max=torch.tensor(0.8),
         policy_entropy=torch.tensor(7.0),
+        policy_action_saturation_fraction=torch.tensor(0.1),
+        c51_lower_endpoint_mass=torch.tensor(0.02),
+        c51_upper_endpoint_mass=torch.tensor(0.03),
+        c51_target_lower_endpoint_mass=torch.tensor(0.04),
+        c51_target_upper_endpoint_mass=torch.tensor(0.05),
+        c51_distribution_entropy=torch.tensor(2.0),
     )
     estimator_metrics = SimpleNamespace(
         total_loss=8.0,
@@ -107,7 +115,8 @@ def test_fastwmr_metrics_include_estimator_and_gradient_boundary_fields() -> Non
         gradient_norm=12.0,
         context_exact_fraction=1.0,
         estimator_version=13,
-        field_losses={"base_linear_velocity": 0.25},
+        field_losses={"base_linear_velocity_mse": 0.25},
+        physical_field_losses={"base_linear_velocity_mse": 4.0},
     )
     update = SimpleNamespace(
         sac_update=sac_update,
@@ -124,6 +133,12 @@ def test_fastwmr_metrics_include_estimator_and_gradient_boundary_fields() -> Non
     assert metrics["sac/critic_loss"] == pytest.approx(1.0)
     assert metrics["sac/q1_std"] == pytest.approx(0.5)
     assert metrics["estimator/version"] == 13
-    assert metrics["estimator/field/base_linear_velocity"] == pytest.approx(0.25)
+    assert metrics["estimator/field_normalized/base_linear_velocity_mse"] == pytest.approx(
+        0.25
+    )
+    assert metrics["estimator/field_normalized/base_linear_velocity_rmse"] == 0.5
+    assert metrics["estimator/field_physical/base_linear_velocity_rmse"] == 2.0
+    assert metrics["sac/q_gap_mean"] == pytest.approx(0.2)
+    assert metrics["sac/c51_lower_endpoint_mass"] == pytest.approx(0.02)
     assert metrics["gradient_boundary/enabled"] == 1
     assert metrics["gradient_boundary/estimator_gradient_norm"] == pytest.approx(0.0)

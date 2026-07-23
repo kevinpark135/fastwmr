@@ -41,7 +41,7 @@ def test_fastsac_replay_wraps_and_keeps_newest_transitions() -> None:
     assert torch.equal(retained.rewards, torch.arange(2, 7, dtype=torch.float32))
     assert torch.equal(retained.insertion_ids, torch.arange(2, 7))
     assert retained.privileged_states.shape == (5, 0)
-    assert retained.control_features.shape == (5, 0)
+    assert retained.reconstructions.shape == (5, 0)
 
 
 def test_add_detaches_inputs_and_sampling_has_stable_shapes() -> None:
@@ -66,7 +66,7 @@ def test_fastwmr_replay_preserves_every_extended_field() -> None:
         observation_dim=3,
         action_dim=2,
         privileged_state_dim=2,
-        control_feature_dim=5,
+        reconstruction_dim=5,
         require_temporal_metadata=True,
     )
     buffer = TransitionReplayBuffer(spec)
@@ -75,14 +75,14 @@ def test_fastwmr_replay_preserves_every_extended_field() -> None:
     transition["truncated"][1] = True
     final_observations = transition["next_observations"] + 10.0
     final_privileged_states = torch.tensor([[11.0, 12.0], [13.0, 14.0]])
-    final_control_features = torch.arange(20, 30, dtype=torch.float32).reshape(2, 5)
+    final_reconstructions = torch.arange(20, 30, dtype=torch.float32).reshape(2, 5)
 
     buffer.add(
         **transition,
         privileged_states=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
         next_privileged_states=torch.tensor([[1.5, 2.5], [3.5, 4.5]]),
-        control_features=torch.arange(10, dtype=torch.float32).reshape(2, 5),
-        next_control_features=torch.arange(10, 20, dtype=torch.float32).reshape(2, 5),
+        reconstructions=torch.arange(10, dtype=torch.float32).reshape(2, 5),
+        next_reconstructions=torch.arange(10, 20, dtype=torch.float32).reshape(2, 5),
         estimator_versions=torch.tensor([7, 8]),
         episode_ids=torch.tensor([11, 12]),
         env_ids=torch.tensor([0, 1]),
@@ -90,15 +90,15 @@ def test_fastwmr_replay_preserves_every_extended_field() -> None:
         reset_boundaries=torch.tensor([False, False]),
         final_observations=final_observations,
         final_privileged_states=final_privileged_states,
-        final_control_features=final_control_features,
+        final_reconstructions=final_reconstructions,
         final_observation_mask=torch.tensor([True, True]),
     )
     retained = buffer.chronological()
 
     assert torch.equal(retained.privileged_states, torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
     assert torch.equal(retained.next_privileged_states, torch.tensor([[1.5, 2.5], [3.5, 4.5]]))
-    assert retained.control_features.shape == (2, 5)
-    assert retained.next_control_features.shape == (2, 5)
+    assert retained.reconstructions.shape == (2, 5)
+    assert retained.next_reconstructions.shape == (2, 5)
     assert torch.equal(retained.estimator_versions, torch.tensor([7, 8]))
     assert buffer.oldest_estimator_version == 7
     assert buffer.newest_estimator_version == 8
@@ -107,7 +107,7 @@ def test_fastwmr_replay_preserves_every_extended_field() -> None:
     assert torch.equal(retained.timesteps, torch.tensor([4, 9]))
     assert torch.equal(retained.bootstrap_observations, final_observations)
     assert torch.equal(retained.bootstrap_privileged_states, final_privileged_states)
-    assert torch.equal(retained.bootstrap_control_features, final_control_features)
+    assert torch.equal(retained.bootstrap_reconstructions, final_reconstructions)
     assert torch.equal(retained.episode_end, torch.tensor([True, True]))
     assert torch.equal(retained.bootstrap_mask, torch.tensor([0.0, 1.0]))
 
@@ -119,7 +119,7 @@ def test_stored_control_sampling_filters_feature_age_and_transfers_minimal_field
             observation_dim=3,
             action_dim=2,
             privileged_state_dim=2,
-            control_feature_dim=5,
+            reconstruction_dim=5,
             require_temporal_metadata=True,
         )
     )
@@ -129,8 +129,8 @@ def test_stored_control_sampling_filters_feature_age_and_transfers_minimal_field
         **transition,
         privileged_states=values[:, None].repeat(1, 2),
         next_privileged_states=(values + 1)[:, None].repeat(1, 2),
-        control_features=values[:, None].repeat(1, 5),
-        next_control_features=(values + 1)[:, None].repeat(1, 5),
+        reconstructions=values[:, None].repeat(1, 5),
+        next_reconstructions=(values + 1)[:, None].repeat(1, 5),
         estimator_versions=torch.arange(4),
         episode_ids=torch.zeros(4, dtype=torch.int64),
         env_ids=torch.arange(4),
@@ -138,12 +138,12 @@ def test_stored_control_sampling_filters_feature_age_and_transfers_minimal_field
         reset_boundaries=torch.ones(4, dtype=torch.bool),
     )
 
-    assert buffer.eligible_control_feature_count(
+    assert buffer.eligible_reconstruction_count(
         current_estimator_version=3,
         max_estimator_feature_age=1,
         recent_transition_horizon=3,
     ) == 2
-    batch = buffer.sample_control_features(
+    batch = buffer.sample_reconstructions(
         2,
         current_estimator_version=3,
         max_estimator_feature_age=1,
@@ -151,7 +151,9 @@ def test_stored_control_sampling_filters_feature_age_and_transfers_minimal_field
         generator=torch.Generator().manual_seed(4),
     )
 
-    assert batch.control_features.shape == (2, 5)
+    assert batch.reconstructions.shape == (2, 5)
+    assert batch.observations.shape == (2, 3)
+    assert batch.bootstrap_observations.shape == (2, 3)
     assert torch.all(batch.estimator_versions >= 2)
     assert torch.all(batch.feature_ages(3) <= 1)
     assert not hasattr(batch, "privileged_states")
@@ -163,7 +165,7 @@ def test_fastwmr_spec_requires_extension_fields_and_temporal_metadata() -> None:
         observation_dim=3,
         action_dim=2,
         privileged_state_dim=2,
-        control_feature_dim=5,
+        reconstruction_dim=5,
         require_temporal_metadata=True,
     )
     buffer = TransitionReplayBuffer(spec)

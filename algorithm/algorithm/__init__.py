@@ -24,6 +24,7 @@ from .fastwmr_agent import (
     FastWMRV2UpdateLoop,
     GradientBoundaryError,
     GradientBoundaryReport,
+    ReconstructionGateState,
     SequenceFeatureProcessor,
 )
 from .symmetry_utils import (
@@ -110,6 +111,7 @@ __all__ = [
     "GradientBoundaryError",
     "GradientBoundaryReport",
     "RecurrentSequenceEstimator",
+    "ReconstructionGateState",
     "RolloutStepResult",
     "SACFeatureSource",
     "SACTransitionBatch",
