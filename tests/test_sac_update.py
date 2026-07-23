@@ -177,6 +177,7 @@ def test_v2_replay_rebuilds_features_with_current_normalizer_and_gate() -> None:
         replay,
         normalizer=lambda observations: observations + 10.0,
         reconstruction_gate=0.5,
+        reconstruction_freshness=torch.tensor([1.0, 0.0]),
     )
 
     torch.testing.assert_close(
@@ -184,17 +185,36 @@ def test_v2_replay_rebuilds_features_with_current_normalizer_and_gate() -> None:
         torch.full((2, interface.policy_observation_dim), 11.0),
     )
     torch.testing.assert_close(
-        batch.states[:, interface.policy_observation_dim :],
-        torch.full((2, interface.reconstruction_target_dim), 2.0),
+        batch.states[
+            :,
+            interface.policy_observation_dim :
+            interface.policy_observation_dim + interface.reconstruction_target_dim,
+        ],
+        torch.stack(
+            (
+                torch.full((interface.reconstruction_target_dim,), 2.0),
+                torch.zeros(interface.reconstruction_target_dim),
+            )
+        ),
     )
     torch.testing.assert_close(
         batch.next_states[:, : interface.policy_observation_dim],
         torch.full((2, interface.policy_observation_dim), 12.0),
     )
     torch.testing.assert_close(
-        batch.next_states[:, interface.policy_observation_dim :],
-        torch.full((2, interface.reconstruction_target_dim), 3.0),
+        batch.next_states[
+            :,
+            interface.policy_observation_dim :
+            interface.policy_observation_dim + interface.reconstruction_target_dim,
+        ],
+        torch.stack(
+            (
+                torch.full((interface.reconstruction_target_dim,), 3.0),
+                torch.zeros(interface.reconstruction_target_dim),
+            )
+        ),
     )
+    torch.testing.assert_close(batch.states[:, -1], torch.tensor([0.5, 0.0]))
 
 
 def test_full_sac_update_changes_online_alpha_and_polyak_target_parameters() -> None:

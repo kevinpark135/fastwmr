@@ -142,6 +142,12 @@ class FastWMRInterfaceCfg:
         return self.reconstruction_layout.dim
 
     @property
+    def reconstruction_confidence_dim(self) -> int:
+        """Scalar confidence appended to every FastWMR control feature."""
+
+        return 1
+
+    @property
     def continuous_target_dim(self) -> int:
         return self.reconstruction_layout.select_kind(TargetKind.CONTINUOUS).dim
 
@@ -152,8 +158,12 @@ class FastWMRInterfaceCfg:
     @property
     def control_feature_dim(self) -> int:
         if self.control_feature_mode is ControlFeatureMode.RECONSTRUCTION_ONLY:
-            return self.reconstruction_target_dim
-        return self.policy_observation_dim + self.reconstruction_target_dim
+            return self.reconstruction_target_dim + self.reconstruction_confidence_dim
+        return (
+            self.policy_observation_dim
+            + self.reconstruction_target_dim
+            + self.reconstruction_confidence_dim
+        )
 
     @property
     def actor_input_dim(self) -> int:
@@ -169,7 +179,7 @@ class FastWMRInterfaceCfg:
 
 
 DEFAULT_INTERFACE_CFG = FastWMRInterfaceCfg()
-"""Default 29-DoF contract: 96D policy obs, 13D target, 109D feature."""
+"""Default 29-DoF contract: 96D policy obs, 13D target, 1D confidence."""
 
 
 @dataclass(frozen=True)
@@ -315,16 +325,18 @@ DEFAULT_SEQUENCE_REPLAY_CFG = SequenceReplayCfg()
 
 @dataclass(frozen=True)
 class FastWMRV2Cfg:
-    """Two-timescale learner, EMA, gate, and feature-age settings."""
+    """Two-timescale learner, EMA, gate, and reconstruction-freshness settings."""
 
     estimator_update_interval: int = 8
     estimator_updates_per_trigger: int = 1
     max_estimator_feature_age: int | None = 100
-    stored_feature_replay_horizon: int | None = 200_000
+    fresh_reconstruction_fraction: float = 0.5
+    stored_feature_replay_horizon: int | None = None
     control_estimator_tau: float = 0.005
     reconstruction_gate_start_updates: int = 0
     reconstruction_gate_warmup_updates: int = 200
-    reconstruction_gate_quality_threshold: float = 1.0
+    reconstruction_gate_quality_threshold: float = 0.45
+    reconstruction_gate_close_threshold: float = 0.55
     reconstruction_gate_quality_ema_decay: float = 0.9
     reconstruction_gate_quality_patience: int = 3
     reconstruction_gate_validation_interval: int = 8
@@ -339,6 +351,8 @@ class FastWMRV2Cfg:
             and self.max_estimator_feature_age < 0
         ):
             raise ValueError("max_estimator_feature_age must be non-negative when provided.")
+        if not 0.0 <= self.fresh_reconstruction_fraction <= 1.0:
+            raise ValueError("fresh_reconstruction_fraction must be in [0, 1].")
         if (
             self.stored_feature_replay_horizon is not None
             and self.stored_feature_replay_horizon <= 0
@@ -352,6 +366,13 @@ class FastWMRV2Cfg:
             raise ValueError("reconstruction_gate_warmup_updates must be non-negative.")
         if self.reconstruction_gate_quality_threshold <= 0.0:
             raise ValueError("reconstruction_gate_quality_threshold must be positive.")
+        if (
+            self.reconstruction_gate_close_threshold
+            <= self.reconstruction_gate_quality_threshold
+        ):
+            raise ValueError(
+                "reconstruction_gate_close_threshold must exceed the open threshold."
+            )
         if not 0.0 <= self.reconstruction_gate_quality_ema_decay < 1.0:
             raise ValueError("reconstruction_gate_quality_ema_decay must be in [0, 1).")
         if self.reconstruction_gate_quality_patience <= 0:

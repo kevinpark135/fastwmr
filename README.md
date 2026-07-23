@@ -18,8 +18,8 @@ deployable proprioceptive observation and the estimator's reconstruction.
   and a separate estimator rollout cache.
 - A two-timescale FastWMR v2 learner with stored SAC features, a low-frequency
   online estimator, an EMA control estimator, reconstruction gating, and
-  feature-age filtering. Strict-current FastWMR v1 remains available as a
-  reference mode.
+  confidence-aware feature freshness without transition rejection. Strict-current
+  FastWMR v1 remains available as a reference mode.
 - Recurrent history encoder with continuous regression and discrete contact
   decoding heads.
 - Tanh-Gaussian actor, automatic entropy temperature optimization, and twin C51
@@ -94,10 +94,12 @@ The default `--fastwmr-version v2` runs eight reconstruction-replay SAC updates
 per estimator trigger, performs one sequence estimator update, synchronizes the
 EMA control estimator, and rebuilds recurrent runtime state once. Replay keeps
 raw observations and ungated normalized reconstructions; each learner minibatch
-is rebuilt with the current observation normalizer and reconstruction gate. The main controls
-are `--estimator-update-interval`, `--estimator-updates-per-trigger`,
+is rebuilt with the current observation normalizer, reconstruction gate, and a
+freshness confidence. Stale estimator outputs are masked without removing their
+raw transitions from SAC replay. The main controls are
+`--estimator-update-interval`, `--estimator-updates-per-trigger`,
 `--control-estimator-tau`, `--max-estimator-feature-age`,
-`--stored-feature-replay-horizon`, and the reconstruction-gate options.
+`--fresh-reconstruction-fraction`, and the reconstruction-gate options.
 
 Run the strict-current v1 reference path with:
 
@@ -145,16 +147,24 @@ FastWMR v2 adds the following two-timescale controls:
 | --- | --- | --- |
 | `--estimator-update-interval` | `8` | Trigger estimator learning after this many SAC updates. |
 | `--estimator-updates-per-trigger` | `1` | Run this many sequence updates per estimator trigger. |
-| `--max-estimator-feature-age` | auto | Override the reconstruction age limit; auto mode derives a safe value from env/update throughput. |
-| `--disable-feature-age-filter` | disabled | Allow stored reconstructions regardless of estimator-version age. |
-| `--stored-feature-replay-horizon` | `200000` | Restrict SAC sampling to this many recent reconstruction transitions. |
+| `--max-estimator-feature-age` | auto | Set the estimator-version age that receives non-zero reconstruction confidence. |
+| `--disable-feature-age-filter` | disabled | Treat every stored reconstruction as fresh; intended for ablation. |
+| `--fresh-reconstruction-fraction` | `0.5` | Reserve this fresh-feature fraction when the reconstruction gate is fully open. |
+| `--stored-feature-replay-horizon` | unset | Optionally restrict SAC transition replay; unset uses the full buffer. |
 | `--control-estimator-tau` | `0.005` | Set the EMA update rate for the control estimator. |
 | `--reconstruction-gate-start-updates` | `0` | Require at least this many estimator updates before quality can open the gate. |
 | `--reconstruction-gate-warmup-updates` | `200` | Ramp the gate after its quality checks pass. |
-| `--reconstruction-gate-quality-threshold` | `1.0` | Maximum normalized validation loss accepted by the gate. |
+| `--reconstruction-gate-quality-threshold` | `0.45` | Open the gate below this normalized validation-loss EMA. |
+| `--reconstruction-gate-close-threshold` | `0.55` | Close the gate above this EMA, leaving hysteresis around the open threshold. |
 | `--reconstruction-gate-quality-ema-decay` | `0.9` | Smooth independently sampled gate-validation losses. |
 | `--reconstruction-gate-quality-patience` | `3` | Require this many consecutive EMA threshold passes. |
-| `--reconstruction-gate-validation-interval` | `8` | Validate gate quality every N estimator attempts while closed. |
+| `--reconstruction-gate-validation-interval` | `8` | Validate gate quality every N estimator attempts in every gate state. |
+
+FastWMR control features contain normalized proprioception, 13 reconstructed
+world-state values, and one reconstruction-confidence value. The confidence is
+the product of the global quality gate and the per-transition freshness mask.
+When confidence is zero, only the reconstruction is masked; the transition's
+proprioception, action, reward, and bootstrap state remain in SAC replay.
 
 The actor and critic use separate width controls: `--actor-hidden-dim 512` and
 `--critic-hidden-dim 768`. The legacy `--hidden-dim` option still overrides
@@ -298,7 +308,10 @@ Run these experiments sequentially to avoid GPU contention. Pin
 `v2/gate_quality_ema`, `v2/gate_state`, `sac/q_gap_mean`,
 `sac/c51_lower_endpoint_mass`, `sac/c51_upper_endpoint_mass`,
 `sac/c51_distribution_entropy`, `sac/policy_action_saturation_fraction`, and
-`estimator/context_exact_fraction` in TensorBoard.
+`estimator/context_exact_fraction` in TensorBoard. For confidence-aware replay,
+also pin `replay/full_transition_count`, `replay/fresh_reconstruction_count`,
+`replay/stale_reconstruction_count`, `replay/sampled_fresh_fraction`, and
+`representation/confidence_mean`.
 
 ### Ablations
 
@@ -314,7 +327,7 @@ python script/train.py --freeze-estimator --viz none
 # Remove the estimator-to-controller gradient cutoff in strict v1
 python script/train.py --fastwmr-version v1 --disable-gradient-cutoff --viz none
 
-# Disable v2 feature-age rejection while retaining the recent replay horizon
+# Treat every stored v2 reconstruction as fresh
 python script/train.py --disable-feature-age-filter --viz none
 
 # Restrict sequence sampling to recent replay and enable symmetry augmentation

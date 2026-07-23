@@ -19,6 +19,38 @@ def _check_last_dim(tensor: torch.Tensor, expected: int, name: str) -> None:
         raise ValueError(f"{name} must end in dimension {expected}, got shape {tuple(tensor.shape)}.")
 
 
+def _reconstruction_confidence(
+    reconstructed_state: torch.Tensor,
+    confidence: float | torch.Tensor,
+    gate: float,
+) -> torch.Tensor:
+    """Return one detached confidence value per reconstruction sample."""
+
+    if not 0.0 <= gate <= 1.0:
+        raise ValueError("reconstruction_gate must be in [0, 1].")
+    value = torch.as_tensor(
+        confidence,
+        device=reconstructed_state.device,
+        dtype=reconstructed_state.dtype,
+    )
+    batch_shape = reconstructed_state.shape[:-1]
+    if value.shape == batch_shape:
+        value = value.unsqueeze(-1)
+    expected_shape = (*batch_shape, 1)
+    try:
+        value = torch.broadcast_to(value, expected_shape)
+    except RuntimeError as error:
+        raise ValueError(
+            "reconstruction_confidence must be scalar or broadcast to "
+            f"{expected_shape}, got {tuple(value.shape)}."
+        ) from error
+    if not torch.isfinite(value).all():
+        raise ValueError("reconstruction_confidence must be finite.")
+    if torch.any((value < 0.0) | (value > 1.0)):
+        raise ValueError("reconstruction_confidence must lie in [0, 1].")
+    return (gate * value).detach()
+
+
 def build_control_feature(
     policy_observation: torch.Tensor,
     reconstructed_state: torch.Tensor,
@@ -27,18 +59,17 @@ def build_control_feature(
     normalizer: ObservationNormalizer | None = None,
     detach_reconstruction: bool = True,
     reconstruction_gate: float = 1.0,
+    reconstruction_confidence: float | torch.Tensor = 1.0,
 ) -> torch.Tensor:
     """Build ``x_t`` while enforcing the estimator gradient cutoff.
 
-    The default is ``concat(normalize(o_t), stop_grad(shat_t))``. The privileged
-    target ``s_t`` is intentionally not accepted by this API, preventing it from
-    leaking into deployable actor or primary-critic features.
+    The default is ``concat(normalize(o_t), stop_grad(shat_t), confidence)``.
+    The privileged target ``s_t`` is intentionally not accepted by this API,
+    preventing it from leaking into deployable actor or primary-critic features.
     """
 
     _check_last_dim(policy_observation, cfg.policy_observation_dim, "policy_observation")
     _check_last_dim(reconstructed_state, cfg.reconstruction_target_dim, "reconstructed_state")
-    if not 0.0 <= reconstruction_gate <= 1.0:
-        raise ValueError("reconstruction_gate must be in [0, 1].")
     if policy_observation.shape[:-1] != reconstructed_state.shape[:-1]:
         raise ValueError(
             "policy_observation and reconstructed_state batch shapes must match, got "
@@ -52,11 +83,19 @@ def build_control_feature(
     routed_reconstruction = (
         reconstructed_state.detach() if detach_reconstruction else reconstructed_state
     )
-    routed_reconstruction = reconstruction_gate * routed_reconstruction
+    confidence = _reconstruction_confidence(
+        reconstructed_state,
+        reconstruction_confidence,
+        reconstruction_gate,
+    )
+    routed_reconstruction = confidence * routed_reconstruction
     if cfg.control_feature_mode is ControlFeatureMode.RECONSTRUCTION_ONLY:
-        feature = routed_reconstruction
+        feature = torch.cat((routed_reconstruction, confidence), dim=-1)
     else:
-        feature = torch.cat((normalized_observation, routed_reconstruction), dim=-1)
+        feature = torch.cat(
+            (normalized_observation, routed_reconstruction, confidence),
+            dim=-1,
+        )
 
     _check_last_dim(feature, cfg.control_feature_dim, "control_feature")
     return feature

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -390,6 +391,7 @@ def test_v2_splits_sac_and_estimator_with_ema_gate_and_one_rebuild() -> None:
         control_estimator_tau=0.25,
         reconstruction_gate_warmup_updates=2,
         reconstruction_gate_quality_threshold=1.0e9,
+        reconstruction_gate_close_threshold=1.0e9 + 1.0,
         reconstruction_gate_quality_patience=1,
         reconstruction_gate_validation_interval=1,
     )
@@ -463,6 +465,46 @@ def test_v2_splits_sac_and_estimator_with_ema_gate_and_one_rebuild() -> None:
     env.close()
 
 
+def test_v2_quality_gate_opens_and_closes_with_hysteresis(monkeypatch) -> None:
+    v2_cfg = FastWMRV2Cfg(
+        reconstruction_gate_warmup_updates=2,
+        reconstruction_gate_quality_threshold=0.45,
+        reconstruction_gate_close_threshold=0.55,
+        reconstruction_gate_quality_ema_decay=0.0,
+        reconstruction_gate_quality_patience=1,
+        reconstruction_gate_validation_interval=1,
+    )
+    pipeline = _integrated_pipeline(version="v2", v2_cfg=v2_cfg)
+    env = pipeline[0]
+    controller = pipeline[6]
+    assert isinstance(controller, FastWMRV2EstimatorController)
+    quality = torch.tensor(0.4)
+    monkeypatch.setattr(
+        controller.estimator_updater,
+        "evaluate_sequence",
+        lambda _sequence: SimpleNamespace(
+            metrics=SimpleNamespace(total_loss=quality)
+        ),
+    )
+    controller.estimator_updates = 1
+
+    controller.validate_reconstruction_gate(None)
+    assert controller.gate_state.value == "ramping"
+    controller._advance_gate_state()
+    assert controller.reconstruction_gate == pytest.approx(0.5)
+    controller._advance_gate_state()
+    assert controller.gate_state.value == "open"
+
+    quality.fill_(0.6)
+    controller.validate_reconstruction_gate(None)
+    assert controller.gate_state.value == "closing"
+    controller._advance_gate_state()
+    assert controller.reconstruction_gate == pytest.approx(0.5)
+    controller._advance_gate_state()
+    assert controller.gate_state.value == "closed"
+    env.close()
+
+
 def test_replayed_sac_features_use_current_estimator_and_cut_its_gradients() -> None:
     torch.manual_seed(32)
     (
@@ -490,7 +532,12 @@ def test_replayed_sac_features_use_current_estimator_and_cut_its_gradients() -> 
     features = processor(sequence)
     current_reconstruction = estimator_updater.reconstruct_sequence(sequence)
     torch.testing.assert_close(
-        features[..., -DEFAULT_INTERFACE_CFG.reconstruction_target_dim :],
+        features[
+            ...,
+            DEFAULT_INTERFACE_CFG.policy_observation_dim :
+            DEFAULT_INTERFACE_CFG.policy_observation_dim
+            + DEFAULT_INTERFACE_CFG.reconstruction_target_dim,
+        ],
         current_reconstruction,
     )
     assert not features.requires_grad
@@ -818,7 +865,7 @@ def test_v2_checkpoint_restores_online_ema_scheduler_gate_and_policy_state(tmp_p
     legacy_payload["architecture"].pop("critic_hidden_dim")
     legacy_checkpoint = tmp_path / "legacy_v2.pt"
     torch.save(legacy_payload, legacy_checkpoint)
-    with pytest.raises(ValueError, match="predates normalized reconstruction"):
+    with pytest.raises(ValueError, match="predates confidence-aware reconstruction"):
         inspect_training_checkpoint(legacy_checkpoint)
 
     target = _integrated_pipeline(
@@ -1053,9 +1100,9 @@ def test_reconstruction_only_ablation_runs_integrated_update() -> None:
     for _ in range(5):
         collector.collect_step()
 
-    assert initial_feature.shape == (env.num_envs, interface.reconstruction_target_dim)
+    assert initial_feature.shape == (env.num_envs, interface.control_feature_dim)
     assert replay.spec.reconstruction_dim == interface.reconstruction_target_dim
-    assert update_loop.updater.actor.input_dim == interface.reconstruction_target_dim
+    assert update_loop.updater.actor.input_dim == interface.control_feature_dim
     assert update_loop.gradient_steps > 0
     env.close()
 

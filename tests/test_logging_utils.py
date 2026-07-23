@@ -13,6 +13,7 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.u
     EpisodeStatisticsTracker,
     TrainingMetricsLogger,
     fastwmr_agent_metrics_dict,
+    fastwmr_v2_metrics_dict,
     format_console_metrics,
     format_console_metrics_header,
 )
@@ -142,3 +143,44 @@ def test_fastwmr_metrics_include_estimator_and_gradient_boundary_fields() -> Non
     assert metrics["sac/c51_lower_endpoint_mass"] == pytest.approx(0.02)
     assert metrics["gradient_boundary/enabled"] == 1
     assert metrics["gradient_boundary/estimator_gradient_norm"] == pytest.approx(0.0)
+
+
+def test_v2_metrics_report_full_replay_freshness_and_confidence() -> None:
+    controller = SimpleNamespace(
+        estimator_updates=3,
+        estimator_attempts=4,
+        estimator_triggers=2,
+        control_estimator_version=3,
+        reconstruction_gate=0.5,
+        gate_state=SimpleNamespace(value="ramping"),
+        gate_quality_passes=2,
+        gate_quality_failures=0,
+        gate_validation_checks=4,
+        gate_quality_ema=0.4,
+        last_gate_validation=None,
+    )
+    update_loop = SimpleNamespace(
+        estimator_controller=controller,
+        sac_updates_since_estimator=0,
+        last_eligible_features=64_000,
+        last_rejected_features=0,
+        last_full_transition_count=64_000,
+        last_fresh_features=16_384,
+        last_stale_features=47_616,
+        last_feature_age_mean=torch.tensor(500.0),
+        last_feature_age_max=torch.tensor(900),
+        last_sampled_fresh_fraction=torch.tensor(0.5),
+        last_reconstruction_masked_fraction=torch.tensor(0.5),
+        last_reconstruction_confidence_mean=torch.tensor(0.25),
+        last_reconstruction_confidence_min=torch.tensor(0.0),
+        last_reconstruction_confidence_max=torch.tensor(0.5),
+    )
+
+    metrics = fastwmr_v2_metrics_dict(update_loop)
+
+    assert metrics["replay/full_transition_count"] == 64_000
+    assert metrics["replay/fresh_reconstruction_count"] == 16_384
+    assert metrics["replay/stale_reconstruction_count"] == 47_616
+    assert metrics["replay/sampled_fresh_fraction"] == pytest.approx(0.5)
+    assert metrics["replay/sampled_stale_fraction"] == pytest.approx(0.5)
+    assert metrics["representation/confidence_mean"] == pytest.approx(0.25)

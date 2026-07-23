@@ -27,7 +27,7 @@ from .sac_update import SACUpdater
 
 CHECKPOINT_FORMAT_VERSION = 3
 SUPPORTED_CHECKPOINT_FORMAT_VERSIONS = (1, 2, CHECKPOINT_FORMAT_VERSION)
-FASTWMR_REPRESENTATION_VERSION = 2
+FASTWMR_REPRESENTATION_VERSION = 3
 
 
 class TrainingMode(str, Enum):
@@ -57,6 +57,7 @@ class CheckpointLoadResult:
     mode: TrainingMode
     counters: CheckpointCounters
     config: Mapping[str, Any]
+    reconstruction_gate: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -359,6 +360,7 @@ def load_training_checkpoint(
         mode=resolved_mode,
         counters=counters,
         config=dict(config),
+        reconstruction_gate=_checkpoint_reconstruction_gate(payload, resolved_mode),
     )
 
 
@@ -441,6 +443,7 @@ def load_policy_checkpoint(
         mode=resolved_mode,
         counters=_checkpoint_counters(payload),
         config=dict(_require_mapping(payload, "config")),
+        reconstruction_gate=_checkpoint_reconstruction_gate(payload, resolved_mode),
     )
 
 
@@ -531,9 +534,24 @@ def _validate_representation(
         return
     if payload.get("fastwmr_representation_version") != FASTWMR_REPRESENTATION_VERSION:
         raise ValueError(
-            "This FastWMR checkpoint predates normalized reconstruction replay and "
+            "This FastWMR checkpoint predates confidence-aware reconstruction replay and "
             "cannot be resumed or evaluated with the current representation."
         )
+
+
+def _checkpoint_reconstruction_gate(
+    payload: Mapping[str, Any],
+    mode: TrainingMode,
+) -> float:
+    if mode is not TrainingMode.FASTWMR:
+        return 1.0
+    learner_state = payload.get("learner_state")
+    if not isinstance(learner_state, Mapping):
+        return 1.0
+    gate = float(learner_state.get("reconstruction_gate", 1.0))
+    if not 0.0 <= gate <= 1.0:
+        raise ValueError("Checkpoint reconstruction gate must lie in [0, 1].")
+    return gate
 
 
 def _checkpoint_counters(payload: Mapping[str, Any]) -> CheckpointCounters:

@@ -271,7 +271,7 @@ def run() -> Path:
                 estimator_version=metadata.counters.control_estimator_version,
             )
             correlations = _OnlineCorrelation(interface)
-        load_policy_checkpoint(
+        loaded = load_policy_checkpoint(
             metadata.path,
             mode=metadata.mode,
             actor=actor,
@@ -331,6 +331,7 @@ def run() -> Path:
                     runtime_step.reconstruction,
                     cfg=interface,
                     normalizer=normalizer,
+                    reconstruction_gate=loaded.reconstruction_gate,
                 )
             else:
                 feature = normalizer(policy) if normalizer is not None else policy

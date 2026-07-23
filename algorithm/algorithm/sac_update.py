@@ -120,9 +120,20 @@ class SACTransitionBatch:
         interface: FastWMRInterfaceCfg = DEFAULT_INTERFACE_CFG,
         normalizer: ObservationNormalizer | None = None,
         reconstruction_gate: float = 1.0,
+        reconstruction_freshness: torch.Tensor | None = None,
     ) -> "SACTransitionBatch":
         """Rebuild one v2 SAC batch under the current learner representation."""
 
+        freshness = (
+            torch.ones_like(replay.rewards)
+            if reconstruction_freshness is None
+            else reconstruction_freshness
+        )
+        if freshness.shape != replay.rewards.shape:
+            raise ValueError(
+                "reconstruction_freshness must match replay rewards, got "
+                f"{tuple(freshness.shape)} and {tuple(replay.rewards.shape)}."
+            )
         return cls(
             states=build_control_feature(
                 replay.observations,
@@ -130,6 +141,7 @@ class SACTransitionBatch:
                 cfg=interface,
                 normalizer=normalizer,
                 reconstruction_gate=reconstruction_gate,
+                reconstruction_confidence=freshness,
             ).detach(),
             actions=replay.actions.detach(),
             rewards=replay.rewards.detach(),
@@ -139,6 +151,7 @@ class SACTransitionBatch:
                 cfg=interface,
                 normalizer=normalizer,
                 reconstruction_gate=reconstruction_gate,
+                reconstruction_confidence=freshness,
             ).detach(),
             terminated=replay.terminated.detach(),
             truncated=replay.truncated.detach(),

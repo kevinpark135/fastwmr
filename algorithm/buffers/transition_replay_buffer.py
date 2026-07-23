@@ -472,12 +472,25 @@ class TransitionReplayBuffer:
         max_estimator_feature_age: int | None,
         recent_transition_horizon: int | None,
     ) -> int:
-        """Count retained reconstructions satisfying v2 staleness controls."""
+        """Count reconstructions fresh enough to receive non-zero confidence."""
 
         return int(
             self._reconstruction_candidates(
                 current_estimator_version=current_estimator_version,
                 max_estimator_feature_age=max_estimator_feature_age,
+                recent_transition_horizon=recent_transition_horizon,
+            ).numel()
+        )
+
+    def available_reconstruction_count(
+        self,
+        *,
+        recent_transition_horizon: int | None,
+    ) -> int:
+        """Count transitions available to SAC regardless of reconstruction age."""
+
+        return int(
+            self._replay_candidates(
                 recent_transition_horizon=recent_transition_horizon,
             ).numel()
         )
@@ -492,9 +505,11 @@ class TransitionReplayBuffer:
     ) -> bool:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive.")
-        return self.eligible_reconstruction_count(
-            current_estimator_version=current_estimator_version,
-            max_estimator_feature_age=max_estimator_feature_age,
+        if current_estimator_version < 0:
+            raise ValueError("current_estimator_version must be non-negative.")
+        if max_estimator_feature_age is not None and max_estimator_feature_age < 0:
+            raise ValueError("max_estimator_feature_age must be non-negative when provided.")
+        return self.available_reconstruction_count(
             recent_transition_horizon=recent_transition_horizon,
         ) >= batch_size
 
@@ -735,31 +750,56 @@ class TransitionReplayBuffer:
         current_estimator_version: int,
         max_estimator_feature_age: int | None,
         recent_transition_horizon: int | None,
+        minimum_fresh_fraction: float = 0.0,
         device: torch.device | str | None = None,
         generator: torch.Generator | None = None,
     ) -> StoredReconstructionReplayBatch:
-        """Sample raw observations and ungated reconstructions accepted by the age policy."""
+        """Sample the full replay while optionally reserving a fresh-feature quota."""
 
         if batch_size <= 0:
             raise ValueError("batch_size must be positive.")
+        if not 0.0 <= minimum_fresh_fraction <= 1.0:
+            raise ValueError("minimum_fresh_fraction must be in [0, 1].")
         if self.spec.reconstruction_dim <= 0:
             raise RuntimeError("Stored reconstruction sampling requires FastWMR replay.")
-        candidates = self._reconstruction_candidates(
-            current_estimator_version=current_estimator_version,
-            max_estimator_feature_age=max_estimator_feature_age,
+        candidates = self._replay_candidates(
             recent_transition_horizon=recent_transition_horizon,
         )
         if candidates.numel() < batch_size:
             raise RuntimeError(
-                f"Need {batch_size} eligible reconstructions, found {candidates.numel()}."
+                f"Need {batch_size} replay transitions, found {candidates.numel()}."
             )
-        choices = torch.randint(
-            candidates.numel(),
-            (batch_size,),
-            generator=generator,
-            device="cpu",
+        fresh_count = int(math.ceil(batch_size * minimum_fresh_fraction))
+        fresh_candidates = (
+            self._reconstruction_candidates(
+                current_estimator_version=current_estimator_version,
+                max_estimator_feature_age=max_estimator_feature_age,
+                recent_transition_horizon=recent_transition_horizon,
+            )
+            if fresh_count > 0
+            else candidates.new_empty(0)
         )
-        indices = candidates[choices.to(candidates.device)]
+        if fresh_candidates.numel() == 0:
+            fresh_count = 0
+
+        full_count = batch_size - fresh_count
+        sampled_parts: list[torch.Tensor] = []
+        for pool, count in (
+            (fresh_candidates, fresh_count),
+            (candidates, full_count),
+        ):
+            if count == 0:
+                continue
+            choices = torch.randint(
+                pool.numel(),
+                (count,),
+                generator=generator,
+                device="cpu",
+            )
+            sampled_parts.append(pool[choices.to(pool.device)])
+        indices = torch.cat(sampled_parts)
+        permutation = torch.randperm(batch_size, generator=generator, device="cpu")
+        indices = indices[permutation.to(indices.device)]
         batch = self._stored_reconstruction_batch_at(indices)
         return batch if device is None else batch.to(device)
 
@@ -1020,23 +1060,33 @@ class TransitionReplayBuffer:
             raise ValueError("current_estimator_version must be non-negative.")
         if max_estimator_feature_age is not None and max_estimator_feature_age < 0:
             raise ValueError("max_estimator_feature_age must be non-negative when provided.")
+        candidates = self._replay_candidates(
+            recent_transition_horizon=recent_transition_horizon,
+        )
+        ages = current_estimator_version - self._estimator_versions[candidates]
+        if torch.any(ages < 0):
+            raise ValueError("Replay contains reconstructions from a future estimator version.")
+        if max_estimator_feature_age is not None:
+            candidates = candidates[ages <= max_estimator_feature_age]
+        return candidates
+
+    def _replay_candidates(
+        self,
+        *,
+        recent_transition_horizon: int | None,
+    ) -> torch.Tensor:
         if recent_transition_horizon is not None and recent_transition_horizon <= 0:
             raise ValueError("recent_transition_horizon must be positive when provided.")
         if self._size == 0:
             return torch.empty(0, dtype=torch.int64, device=self.storage_device)
-
-        retained = torch.ones(self.capacity, dtype=torch.bool, device=self.storage_device)
-        if not self.is_full:
-            retained[self._size :] = False
-        ages = current_estimator_version - self._estimator_versions
-        if torch.any(ages[retained] < 0):
-            raise ValueError("Replay contains reconstructions from a future estimator version.")
-        if max_estimator_feature_age is not None:
-            retained &= ages <= max_estimator_feature_age
+        size = self.capacity if self.is_full else self._size
+        candidates = torch.arange(size, dtype=torch.int64, device=self.storage_device)
         if recent_transition_horizon is not None:
             minimum_insertion_id = max(0, self._total_inserted - recent_transition_horizon)
-            retained &= self._insertion_ids >= minimum_insertion_id
-        return torch.nonzero(retained, as_tuple=False).squeeze(-1)
+            candidates = candidates[
+                self._insertion_ids[candidates] >= minimum_insertion_id
+            ]
+        return candidates
 
     def _remove_temporal_links(self, indices: torch.Tensor) -> None:
         """Unlink overwritten replay slots without scanning temporal keys."""

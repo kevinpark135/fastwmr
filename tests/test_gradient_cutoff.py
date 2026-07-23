@@ -36,3 +36,36 @@ def test_actor_and_critic_share_the_same_control_feature() -> None:
     assert actor_input.shape[-1] == cfg.control_feature_dim
     assert critic_input.shape[-1] == cfg.critic_input_dim
     assert torch.equal(critic_input[:, : cfg.control_feature_dim], actor_input)
+
+
+def test_reconstruction_confidence_masks_only_estimator_features() -> None:
+    cfg = DEFAULT_INTERFACE_CFG
+    observation = torch.ones(2, cfg.policy_observation_dim)
+    reconstruction = torch.full((2, cfg.reconstruction_target_dim), 4.0)
+
+    feature = build_control_feature(
+        observation,
+        reconstruction,
+        cfg=cfg,
+        reconstruction_gate=0.5,
+        reconstruction_confidence=torch.tensor([1.0, 0.0]),
+    )
+    reconstruction_slice = slice(
+        cfg.policy_observation_dim,
+        cfg.policy_observation_dim + cfg.reconstruction_target_dim,
+    )
+
+    torch.testing.assert_close(
+        feature[:, reconstruction_slice],
+        torch.stack(
+            (
+                torch.full((cfg.reconstruction_target_dim,), 2.0),
+                torch.zeros(cfg.reconstruction_target_dim),
+            )
+        ),
+    )
+    torch.testing.assert_close(feature[:, -1], torch.tensor([0.5, 0.0]))
+    torch.testing.assert_close(
+        feature[:, : cfg.policy_observation_dim],
+        observation,
+    )

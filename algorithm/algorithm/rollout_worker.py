@@ -507,7 +507,7 @@ class FastWMRRolloutCollector:
     """Collect full FastWMR transitions and keep online memory synchronized.
 
     Raw proprioception and privileged targets are recorded for replay-time
-    estimator training. Actor and critics only receive the detached 109D
+    estimator training. Actor and critics only receive the detached 110D
     control feature. On auto-reset, terminal reconstruction is previewed from
     the old recurrent context before completed environment slices are reset.
     """

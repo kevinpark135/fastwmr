@@ -112,7 +112,7 @@ def test_fastwmr_replay_preserves_every_extended_field() -> None:
     assert torch.equal(retained.bootstrap_mask, torch.tensor([0.0, 1.0]))
 
 
-def test_stored_control_sampling_filters_feature_age_and_transfers_minimal_fields() -> None:
+def test_stored_control_sampling_reserves_fresh_features_without_rejecting_replay() -> None:
     buffer = TransitionReplayBuffer(
         ReplayBufferSpec(
             capacity=8,
@@ -143,11 +143,13 @@ def test_stored_control_sampling_filters_feature_age_and_transfers_minimal_field
         max_estimator_feature_age=1,
         recent_transition_horizon=3,
     ) == 2
+    assert buffer.available_reconstruction_count(recent_transition_horizon=3) == 3
     batch = buffer.sample_reconstructions(
         2,
         current_estimator_version=3,
         max_estimator_feature_age=1,
         recent_transition_horizon=3,
+        minimum_fresh_fraction=1.0,
         generator=torch.Generator().manual_seed(4),
     )
 

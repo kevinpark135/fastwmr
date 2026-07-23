@@ -106,14 +106,26 @@ def build_train_parser() -> argparse.ArgumentParser:
         "--max-estimator-feature-age",
         type=int,
         default=None,
-        help="Explicit reconstruction age limit; default derives a safe value from throughput.",
+        help="Maximum age receiving non-zero reconstruction confidence.",
     )
     parser.add_argument("--disable-feature-age-filter", action="store_true")
-    parser.add_argument("--stored-feature-replay-horizon", type=int, default=200_000)
+    parser.add_argument(
+        "--fresh-reconstruction-fraction",
+        type=float,
+        default=0.5,
+        help="Minimum fresh-feature quota once the reconstruction gate is fully open.",
+    )
+    parser.add_argument(
+        "--stored-feature-replay-horizon",
+        type=int,
+        default=None,
+        help="Optional SAC replay horizon; unset samples the full replay.",
+    )
     parser.add_argument("--control-estimator-tau", type=float, default=0.005)
     parser.add_argument("--reconstruction-gate-start-updates", type=int, default=0)
     parser.add_argument("--reconstruction-gate-warmup-updates", type=int, default=200)
-    parser.add_argument("--reconstruction-gate-quality-threshold", type=float, default=1.0)
+    parser.add_argument("--reconstruction-gate-quality-threshold", type=float, default=0.45)
+    parser.add_argument("--reconstruction-gate-close-threshold", type=float, default=0.55)
     parser.add_argument("--reconstruction-gate-quality-ema-decay", type=float, default=0.9)
     parser.add_argument("--reconstruction-gate-quality-patience", type=int, default=3)
     parser.add_argument("--reconstruction-gate-validation-interval", type=int, default=8)
@@ -199,7 +211,6 @@ def validate_train_args(args: argparse.Namespace) -> None:
         "estimator_cache_steps",
         "estimator_update_interval",
         "estimator_updates_per_trigger",
-        "stored_feature_replay_horizon",
         "reconstruction_gate_quality_patience",
         "reconstruction_gate_validation_interval",
         "sequence_batch_size",
@@ -227,6 +238,13 @@ def validate_train_args(args: argparse.Namespace) -> None:
         raise ValueError("--normalizer-freeze-iteration must be non-negative.")
     if args.max_estimator_feature_age is not None and args.max_estimator_feature_age < 0:
         raise ValueError("--max-estimator-feature-age must be non-negative.")
+    if not 0.0 <= args.fresh_reconstruction_fraction <= 1.0:
+        raise ValueError("--fresh-reconstruction-fraction must be in [0, 1].")
+    if (
+        args.stored_feature_replay_horizon is not None
+        and args.stored_feature_replay_horizon <= 0
+    ):
+        raise ValueError("--stored-feature-replay-horizon must be positive when provided.")
     if not 0.0 < args.control_estimator_tau <= 1.0:
         raise ValueError("--control-estimator-tau must be in (0, 1].")
     if args.reconstruction_gate_start_updates < 0:
@@ -235,6 +253,13 @@ def validate_train_args(args: argparse.Namespace) -> None:
         raise ValueError("--reconstruction-gate-warmup-updates must be non-negative.")
     if args.reconstruction_gate_quality_threshold <= 0.0:
         raise ValueError("--reconstruction-gate-quality-threshold must be positive.")
+    if (
+        args.reconstruction_gate_close_threshold
+        <= args.reconstruction_gate_quality_threshold
+    ):
+        raise ValueError(
+            "--reconstruction-gate-close-threshold must exceed the open threshold."
+        )
     if not 0.0 <= args.reconstruction_gate_quality_ema_decay < 1.0:
         raise ValueError("--reconstruction-gate-quality-ema-decay must be in [0, 1).")
     if args.checkpoint_interval < 0:
@@ -315,7 +340,7 @@ def resolve_network_hidden_dims(args: argparse.Namespace) -> tuple[int, int]:
 
 
 def resolve_max_estimator_feature_age(args: argparse.Namespace) -> int | None:
-    """Derive enough estimator-version history to fill one SAC minibatch."""
+    """Resolve the freshness horizon without restricting SAC replay support."""
 
     if (
         args.task != FASTWMR_TASK
@@ -323,19 +348,14 @@ def resolve_max_estimator_feature_age(args: argparse.Namespace) -> int | None:
         or args.disable_feature_age_filter
     ):
         return None
-    required_age = math.ceil(
+    if args.max_estimator_feature_age is not None:
+        return int(args.max_estimator_feature_age)
+    throughput_age = math.ceil(
         args.batch_size
         * args.num_updates
         / (args.num_envs * args.estimator_update_interval)
     )
-    if args.max_estimator_feature_age is None:
-        return max(100, 2 * required_age)
-    if args.max_estimator_feature_age < required_age:
-        raise ValueError(
-            "--max-estimator-feature-age is too small for the requested replay "
-            f"throughput; use at least {required_age} or leave it unset for auto mode."
-        )
-    return int(args.max_estimator_feature_age)
+    return max(100, 2 * throughput_age)
 
 
 def build_play_parser() -> argparse.ArgumentParser:

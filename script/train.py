@@ -368,12 +368,16 @@ def _build_components(
             estimator_update_interval=ARGS.estimator_update_interval,
             estimator_updates_per_trigger=ARGS.estimator_updates_per_trigger,
             max_estimator_feature_age=MAX_ESTIMATOR_FEATURE_AGE,
+            fresh_reconstruction_fraction=ARGS.fresh_reconstruction_fraction,
             stored_feature_replay_horizon=ARGS.stored_feature_replay_horizon,
             control_estimator_tau=ARGS.control_estimator_tau,
             reconstruction_gate_start_updates=ARGS.reconstruction_gate_start_updates,
             reconstruction_gate_warmup_updates=ARGS.reconstruction_gate_warmup_updates,
             reconstruction_gate_quality_threshold=(
                 ARGS.reconstruction_gate_quality_threshold
+            ),
+            reconstruction_gate_close_threshold=(
+                ARGS.reconstruction_gate_close_threshold
             ),
             reconstruction_gate_quality_ema_decay=(
                 ARGS.reconstruction_gate_quality_ema_decay

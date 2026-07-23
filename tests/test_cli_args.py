@@ -29,6 +29,10 @@ def test_train_cli_defaults_to_fastwmr_and_validates() -> None:
     assert args.estimator_update_interval == 8
     assert args.max_estimator_feature_age is None
     assert resolve_max_estimator_feature_age(args) == 256
+    assert args.fresh_reconstruction_fraction == pytest.approx(0.5)
+    assert args.stored_feature_replay_horizon is None
+    assert args.reconstruction_gate_quality_threshold == pytest.approx(0.45)
+    assert args.reconstruction_gate_close_threshold == pytest.approx(0.55)
     assert resolve_network_hidden_dims(args) == (512, 768)
     assert args.normalizer_freeze_iteration is None
     assert args.burn_in_length == 32
@@ -63,7 +67,7 @@ def test_train_cli_accepts_resume_and_sequence_overrides(tmp_path) -> None:
     assert args.burn_in_length == 0
 
 
-def test_train_cli_rejects_explicit_feature_age_below_replay_throughput() -> None:
+def test_train_cli_accepts_narrow_feature_freshness_horizon() -> None:
     args = build_train_parser().parse_args(
         [
             "--num-envs",
@@ -79,8 +83,9 @@ def test_train_cli_rejects_explicit_feature_age_below_replay_throughput() -> Non
         ]
     )
 
-    with pytest.raises(ValueError, match="too small"):
-        validate_train_args(args)
+    validate_train_args(args)
+
+    assert resolve_max_estimator_feature_age(args) == 127
 
 
 def test_train_cli_accepts_fastwmr_ablation_matrix() -> None:

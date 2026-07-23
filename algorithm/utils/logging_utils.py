@@ -264,11 +264,17 @@ def fastwmr_v2_metrics_dict(update_loop: object) -> dict[str, float | int]:
             "closed": 0,
             "ramping": 1,
             "open": 2,
+            "closing": 3,
         }[controller.gate_state.value],
         "v2/gate_quality_passes": int(controller.gate_quality_passes),
+        "v2/gate_quality_failures": int(controller.gate_quality_failures),
         "v2/gate_validation_checks": int(controller.gate_validation_checks),
         "v2/eligible_features": int(update_loop.last_eligible_features),
         "v2/rejected_features": int(update_loop.last_rejected_features),
+        "replay/full_transition_count": int(update_loop.last_full_transition_count),
+        "replay/sac_candidate_count": int(update_loop.last_eligible_features),
+        "replay/fresh_reconstruction_count": int(update_loop.last_fresh_features),
+        "replay/stale_reconstruction_count": int(update_loop.last_stale_features),
     }
     if controller.gate_quality_ema is not None:
         metrics["v2/gate_quality_ema"] = float(controller.gate_quality_ema)
@@ -280,6 +286,29 @@ def fastwmr_v2_metrics_dict(update_loop: object) -> dict[str, float | int]:
         metrics["v2/feature_age_mean"] = float(update_loop.last_feature_age_mean)
     if update_loop.last_feature_age_max is not None:
         metrics["v2/feature_age_max"] = int(update_loop.last_feature_age_max)
+    optional_metrics = {
+        "replay/sampled_fresh_fraction": update_loop.last_sampled_fresh_fraction,
+        "replay/sampled_stale_fraction": (
+            None
+            if update_loop.last_sampled_fresh_fraction is None
+            else 1.0 - update_loop.last_sampled_fresh_fraction
+        ),
+        "replay/reconstruction_masked_fraction": (
+            update_loop.last_reconstruction_masked_fraction
+        ),
+        "representation/confidence_mean": (
+            update_loop.last_reconstruction_confidence_mean
+        ),
+        "representation/confidence_min": (
+            update_loop.last_reconstruction_confidence_min
+        ),
+        "representation/confidence_max": (
+            update_loop.last_reconstruction_confidence_max
+        ),
+    }
+    for name, value in optional_metrics.items():
+        if value is not None:
+            metrics[name] = float(value)
     return metrics
 
 

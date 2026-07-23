@@ -99,14 +99,25 @@ def mirror_control_feature(
 
     if feature.shape[-1] != interface.control_feature_dim:
         raise ValueError(f"feature must end in dimension {interface.control_feature_dim}.")
+    confidence = feature[..., -interface.reconstruction_confidence_dim :]
     if interface.control_feature_mode is ControlFeatureMode.RECONSTRUCTION_ONLY:
-        return mirror_reconstruction_target(feature, interface=interface)
+        reconstruction = feature[..., : interface.reconstruction_target_dim]
+        return torch.cat(
+            (
+                mirror_reconstruction_target(reconstruction, interface=interface),
+                confidence,
+            ),
+            dim=-1,
+        )
     observation = feature[..., : interface.policy_observation_dim]
-    reconstruction = feature[..., interface.policy_observation_dim :]
+    reconstruction_start = interface.policy_observation_dim
+    reconstruction_stop = reconstruction_start + interface.reconstruction_target_dim
+    reconstruction = feature[..., reconstruction_start:reconstruction_stop]
     return torch.cat(
         (
             mirror_policy_observation(observation, interface=interface),
             mirror_reconstruction_target(reconstruction, interface=interface),
+            confidence,
         ),
         dim=-1,
     )
