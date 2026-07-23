@@ -232,6 +232,56 @@ within each training seed first; the reported mean and standard deviation are th
 computed across independent training seeds. Aggregated JSON, CSV, and Markdown
 summaries are written under `evaluations/suite/` by default.
 
+### Representation Diagnostics
+
+The observation normalizer can be frozen without disabling normalization:
+
+```bash
+python script/train.py \
+  --task Isaac-Velocity-G1-FastWMR-v0 \
+  --num-envs 64 \
+  --steps 1000 \
+  --seed 42 \
+  --max-estimator-feature-age 256 \
+  --normalizer-freeze-iteration 128 \
+  --run-name fastwmr_v2_normalizer_freeze \
+  --viz none
+```
+
+At iteration 128, statistics stop changing while rollout and learner inputs
+continue to use the frozen transform. Compare that run against a v2 controller
+whose reconstruction remains gated off:
+
+```bash
+python script/train.py \
+  --task Isaac-Velocity-G1-FastWMR-v0 \
+  --num-envs 64 \
+  --steps 1000 \
+  --seed 42 \
+  --max-estimator-feature-age 256 \
+  --reconstruction-gate-start-updates 100000 \
+  --run-name fastwmr_v2_gate0 \
+  --viz none
+```
+
+Then run the strict-current reference, which rebuilds learning features with
+the current estimator instead of using stored v2 features:
+
+```bash
+python script/train.py \
+  --task Isaac-Velocity-G1-FastWMR-v0 \
+  --fastwmr-version v1 \
+  --num-envs 64 \
+  --steps 1000 \
+  --seed 42 \
+  --run-name fastwmr_v1_strict_current \
+  --viz none
+```
+
+Run these experiments sequentially to avoid GPU contention. Pin
+`episode/return_mean`, `sac/policy_entropy`, `normalizer/frozen`,
+`normalizer/samples_seen`, and `v2/reconstruction_gate` in TensorBoard.
+
 ### Ablations
 
 The main FastWMR ablations are exposed directly by the training entry point:

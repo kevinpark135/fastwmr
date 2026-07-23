@@ -135,6 +135,7 @@ def _integrated_pipeline(
     initial_validation_updates: int = 0,
     version: str = "v1",
     v2_cfg: FastWMRV2Cfg | None = None,
+    normalizer_freeze_iteration: int | None = None,
 ) -> tuple[
     IsaacLabEnvAdapter,
     TransitionReplayBuffer,
@@ -220,6 +221,7 @@ def _integrated_pipeline(
             verify_gradient_boundaries=gradient_cutoff,
             validation_interval=validation_interval,
             initial_validation_updates=initial_validation_updates,
+            normalizer_freeze_iteration=normalizer_freeze_iteration,
         )
     elif version == "v2":
         resolved_v2_cfg = v2_cfg or FastWMRV2Cfg()
@@ -250,6 +252,7 @@ def _integrated_pipeline(
             processor,
             learner_device="cpu",
             v2_cfg=resolved_v2_cfg,
+            normalizer_freeze_iteration=normalizer_freeze_iteration,
         )
     else:
         raise ValueError(f"Unknown FastWMR test version {version!r}.")
@@ -265,6 +268,34 @@ def _integrated_pipeline(
         update_loop,
         collector,
     )
+
+
+@pytest.mark.parametrize("version", ("v1", "v2"))
+def test_fastwmr_collection_honors_normalizer_freeze_iteration(
+    version: str,
+) -> None:
+    (
+        env,
+        _replay,
+        normalizer,
+        _estimator,
+        _estimator_updater,
+        _runtime,
+        _processor,
+        update_loop,
+        collector,
+    ) = _integrated_pipeline(
+        version=version,
+        normalizer_freeze_iteration=2,
+    )
+
+    collector.reset(seed=30)
+    for _ in range(3):
+        collector.collect_step()
+
+    assert update_loop.normalization_frozen
+    assert normalizer.samples_seen == env.num_envs * 3
+    env.close()
 
 
 def test_integrated_collection_updates_estimator_runtime_and_c51_sac() -> None:
@@ -636,7 +667,7 @@ def test_checkpoint_resume_restores_models_optimizers_normalizer_and_counters(tm
         _source_processor,
         source_loop,
         source_collector,
-    ) = _integrated_pipeline()
+    ) = _integrated_pipeline(normalizer_freeze_iteration=2)
     source_collector.reset(seed=35)
     for _ in range(6):
         source_collector.collect_step()
@@ -709,6 +740,8 @@ def test_checkpoint_resume_restores_models_optimizers_normalizer_and_counters(tm
     assert torch.count_nonzero(target_runtime.state.cell) == 0
     assert len(target_replay) == 0
     assert target_replay.total_inserted == 0
+    assert target_loop.normalizer_freeze_iteration == 2
+    assert target_loop.normalization_frozen
     assert len(target_loop.sequence_feature_processor.rollout_cache) == 0
     assert target_loop.sequence_feature_processor.updates == loaded.counters.agent_updates
     assert target_loop.sequence_feature_processor.last_estimator_update is None

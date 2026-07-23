@@ -26,6 +26,7 @@ def test_train_cli_defaults_to_fastwmr_and_validates() -> None:
     assert args.fastwmr_version == "v2"
     assert args.estimator_update_interval == 8
     assert args.max_estimator_feature_age == 100
+    assert args.normalizer_freeze_iteration is None
     assert args.burn_in_length > 0
     assert args.learning_length > 0
 
@@ -93,6 +94,16 @@ def test_train_cli_accepts_positive_wallclock_budget() -> None:
     assert args.wallclock_limit_s == 3600.0
 
 
+def test_train_cli_accepts_normalizer_freeze_from_start() -> None:
+    args = build_train_parser().parse_args(
+        ["--normalizer-freeze-iteration", "0"]
+    )
+
+    validate_train_args(args)
+
+    assert args.normalizer_freeze_iteration == 0
+
+
 def test_play_cli_validates_fixed_budget(tmp_path) -> None:
     args = build_play_parser().parse_args(
         ["--checkpoint", str(tmp_path / "checkpoint.pt"), "--variant", "no_cutoff"]
@@ -111,6 +122,11 @@ def test_play_cli_validates_fixed_budget(tmp_path) -> None:
         ("--burn-in-length", "-1", "--burn-in-length"),
         ("--validation-interval", "0", "--validation-interval"),
         ("--initial-validation-updates", "-1", "--initial-validation-updates"),
+        (
+            "--normalizer-freeze-iteration",
+            "-1",
+            "--normalizer-freeze-iteration",
+        ),
         ("--estimator-update-interval", "0", "--estimator-update-interval"),
         ("--max-estimator-feature-age", "-1", "--max-estimator-feature-age"),
         ("--control-estimator-tau", "0", "--control-estimator-tau"),

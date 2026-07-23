@@ -154,6 +154,7 @@ def save_training_checkpoint(
         },
         "normalizer": normalizer.state_dict() if normalizer is not None else None,
         "normalizer_training": normalizer.training if normalizer is not None else None,
+        "normalizer_freeze_iteration": update_loop.normalizer_freeze_iteration,
         "learner_state": dict(learner_state) if learner_state is not None else None,
         "counters": asdict(counters),
         "config": _plain_data(config or {}),
@@ -283,6 +284,24 @@ def load_training_checkpoint(
     if normalizer is not None:
         normalizer.load_state_dict(normalizer_state)
         normalizer.train(bool(payload.get("normalizer_training", True)))
+
+    if "normalizer_freeze_iteration" in payload:
+        saved_freeze_iteration = payload["normalizer_freeze_iteration"]
+        if saved_freeze_iteration is not None:
+            saved_freeze_iteration = int(saved_freeze_iteration)
+            if saved_freeze_iteration < 0:
+                raise ValueError(
+                    "Checkpoint normalizer freeze iteration must be non-negative."
+                )
+        requested_freeze_iteration = update_loop.normalizer_freeze_iteration
+        if (
+            requested_freeze_iteration is not None
+            and requested_freeze_iteration != saved_freeze_iteration
+        ):
+            raise ValueError(
+                "Checkpoint normalizer freeze iteration does not match the runtime."
+            )
+        update_loop.normalizer_freeze_iteration = saved_freeze_iteration
 
     update_loop.environment_steps = counters.environment_steps
     update_loop.gradient_steps = counters.gradient_steps

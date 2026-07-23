@@ -723,7 +723,7 @@ class FastWMRRolloutCollector:
 
     def _update_observation_statistics(self, observations: torch.Tensor) -> None:
         normalizer = self.processor.observation_normalizer
-        if normalizer is not None:
+        if normalizer is not None and not self.update_loop.normalization_frozen:
             normalizer.update(observations)
 
     def _build_control_feature(

@@ -252,6 +252,7 @@ def _build_components(
             update_cfg,
             learner_device=device,
             observation_normalizer=normalizer,
+            normalizer_freeze_iteration=ARGS.normalizer_freeze_iteration,
         )
         return TrainingComponents(
             mode=TrainingMode.FASTSAC,
@@ -355,6 +356,7 @@ def _build_components(
             validation_interval=ARGS.validation_interval,
             initial_validation_updates=ARGS.initial_validation_updates,
             sequence_augmentation=sequence_augmentation,
+            normalizer_freeze_iteration=ARGS.normalizer_freeze_iteration,
         )
     else:
         v2_cfg = FastWMRV2Cfg(
@@ -398,6 +400,7 @@ def _build_components(
             learner_device=device,
             v2_cfg=v2_cfg,
             sequence_augmentation=sequence_augmentation,
+            normalizer_freeze_iteration=ARGS.normalizer_freeze_iteration,
         )
     return TrainingComponents(
         mode=TrainingMode.FASTWMR,
@@ -666,6 +669,23 @@ def run() -> None:
                     )
                 if components.rollout_cache is not None:
                     metrics["estimator_cache/steps"] = len(components.rollout_cache)
+                if components.normalizer is not None:
+                    metrics.update(
+                        {
+                            "normalizer/frozen": int(
+                                components.update_loop.normalization_frozen
+                            ),
+                            "normalizer/samples_seen": (
+                                components.normalizer.samples_seen
+                            ),
+                            "normalizer/mean_abs": float(
+                                components.normalizer.mean.abs().mean().item()
+                            ),
+                            "normalizer/std_mean": float(
+                                components.normalizer.variance.sqrt().mean().item()
+                            ),
+                        }
+                    )
                 metrics.update(components.update_loop.drain_profile_metrics())
                 if getattr(cfg.curriculum, "terrain_levels", None) is not None:
                     terrain_state = terrain_curriculum_state(raw_env.unwrapped)

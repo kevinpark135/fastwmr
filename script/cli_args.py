@@ -61,6 +61,15 @@ def build_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--normalization-epsilon", type=float, default=1e-5)
     parser.add_argument("--normalization-clip", type=float, default=10.0)
     parser.add_argument("--disable-observation-normalization", action="store_true")
+    parser.add_argument(
+        "--normalizer-freeze-iteration",
+        type=int,
+        default=None,
+        help=(
+            "Stop updating observation-normalization statistics at this environment "
+            "iteration while continuing to apply the frozen transform."
+        ),
+    )
     parser.add_argument("--disable-joint-limit-action-bounds", action="store_true")
     parser.add_argument(
         "--use-soft-joint-limits",
@@ -183,6 +192,11 @@ def validate_train_args(args: argparse.Namespace) -> None:
         raise ValueError("--burn-in-length must be non-negative.")
     if args.initial_validation_updates < 0:
         raise ValueError("--initial-validation-updates must be non-negative.")
+    if (
+        args.normalizer_freeze_iteration is not None
+        and args.normalizer_freeze_iteration < 0
+    ):
+        raise ValueError("--normalizer-freeze-iteration must be non-negative.")
     if args.max_estimator_feature_age < 0:
         raise ValueError("--max-estimator-feature-age must be non-negative.")
     if not 0.0 < args.control_estimator_tau <= 1.0:

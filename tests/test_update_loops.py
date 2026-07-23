@@ -26,6 +26,9 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.n
     TanhGaussianActor,
     TwinScalarCritic,
 )
+from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.utils import (
+    RunningObservationNormalizer,
+)
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.utils.temporal_state import (
     RecurrentState,
 )
@@ -150,6 +153,40 @@ def test_fastsac_loop_obeys_random_warmup_minimum_replay_and_num_updates() -> No
     assert not loop.warming_up
     assert len(metrics) == 2
     assert loop.gradient_steps == 2
+
+
+def test_normalizer_freeze_stops_statistics_but_keeps_transform_active() -> None:
+    replay = TransitionReplayBuffer(
+        ReplayBufferSpec(capacity=8, observation_dim=4, action_dim=2)
+    )
+    normalizer = RunningObservationNormalizer(4)
+    loop = FastSACReplayUpdateLoop(
+        replay,
+        _updater(),
+        ReplayUpdateCfg(
+            random_action_steps=0,
+            minimum_replay_size=1,
+            batch_size=1,
+            num_updates=1,
+        ),
+        learner_device="cpu",
+        observation_normalizer=normalizer,
+        normalizer_freeze_iteration=2,
+    )
+
+    loop.update_observation_statistics(torch.ones(3, 4))
+    loop.advance_environment()
+    loop.update_observation_statistics(torch.full((2, 4), 3.0))
+    mean_at_freeze = normalizer.mean.clone()
+    count_at_freeze = normalizer.samples_seen
+
+    loop.advance_environment()
+    assert loop.normalization_frozen
+    loop.update_observation_statistics(torch.full((5, 4), 100.0))
+
+    assert normalizer.samples_seen == count_at_freeze == 5
+    assert torch.equal(normalizer.mean, mean_at_freeze)
+    assert torch.isfinite(loop.normalize_observations(torch.ones(1, 4))).all()
 
 
 def test_fastwmr_loop_samples_sequences_and_updates_only_learning_window() -> None:

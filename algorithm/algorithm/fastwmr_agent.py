@@ -725,12 +725,16 @@ class FastSACReplayUpdateLoop:
         *,
         learner_device: torch.device | str,
         observation_normalizer: RunningObservationNormalizer | None = None,
+        normalizer_freeze_iteration: int | None = None,
     ) -> None:
+        if normalizer_freeze_iteration is not None and normalizer_freeze_iteration < 0:
+            raise ValueError("normalizer_freeze_iteration must be non-negative.")
         self.replay = replay
         self.updater = updater
         self.cfg = cfg
         self.learner_device = torch.device(learner_device)
         self.observation_normalizer = observation_normalizer
+        self.normalizer_freeze_iteration = normalizer_freeze_iteration
         if observation_normalizer is not None:
             if observation_normalizer.observation_dim != updater.actor.input_dim:
                 raise ValueError("Observation normalizer and actor input dimensions must match.")
@@ -752,6 +756,15 @@ class FastSACReplayUpdateLoop:
             and self.replay.can_sample(self.cfg.batch_size)
         )
 
+    @property
+    def normalization_frozen(self) -> bool:
+        """Whether rollout statistics have reached their configured freeze point."""
+
+        return (
+            self.normalizer_freeze_iteration is not None
+            and self.environment_steps >= self.normalizer_freeze_iteration
+        )
+
     def advance_environment(self, steps: int = 1) -> None:
         if steps <= 0:
             raise ValueError("Environment step increment must be positive.")
@@ -760,7 +773,7 @@ class FastSACReplayUpdateLoop:
     def update_observation_statistics(self, observations: torch.Tensor) -> None:
         """Record raw rollout observations exactly once at collection time."""
 
-        if self.observation_normalizer is not None:
+        if self.observation_normalizer is not None and not self.normalization_frozen:
             self.observation_normalizer.update(observations)
 
     def normalize_observations(self, observations: torch.Tensor) -> torch.Tensor:
@@ -837,8 +850,15 @@ class FastWMRSequenceUpdateLoop(FastSACReplayUpdateLoop):
         validation_interval: int = 1,
         initial_validation_updates: int = 0,
         sequence_augmentation: SequenceAugmentation | None = None,
+        normalizer_freeze_iteration: int | None = None,
     ) -> None:
-        super().__init__(replay, updater, cfg, learner_device=learner_device)
+        super().__init__(
+            replay,
+            updater,
+            cfg,
+            learner_device=learner_device,
+            normalizer_freeze_iteration=normalizer_freeze_iteration,
+        )
         self.sequence_cfg = sequence_cfg
         self.sequence_feature_processor = sequence_feature_processor
         self.sequence_augmentation = sequence_augmentation
@@ -941,8 +961,15 @@ class FastWMRV2UpdateLoop(FastSACReplayUpdateLoop):
         learner_device: torch.device | str,
         v2_cfg: FastWMRV2Cfg = DEFAULT_FASTWMR_V2_CFG,
         sequence_augmentation: SequenceAugmentation | None = None,
+        normalizer_freeze_iteration: int | None = None,
     ) -> None:
-        super().__init__(replay, updater, cfg, learner_device=learner_device)
+        super().__init__(
+            replay,
+            updater,
+            cfg,
+            learner_device=learner_device,
+            normalizer_freeze_iteration=normalizer_freeze_iteration,
+        )
         if estimator_controller.cfg != v2_cfg:
             raise ValueError("V2 update loop and estimator controller configs must match.")
         if replay.spec.control_feature_dim != updater.actor.input_dim:
