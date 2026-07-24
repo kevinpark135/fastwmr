@@ -86,8 +86,7 @@ Train FastWMR with the default C51 critic:
 ```bash
 python script/train.py \
   --task Isaac-Velocity-G1-FastWMR-v0 \
-  --run-name g1_fastwmr \
-  --viz none
+  --run-name g1_fastwmr
 ```
 
 The default `--fastwmr-version v2` runs eight reconstruction-replay SAC updates
@@ -106,8 +105,7 @@ Run the strict-current v1 reference path with:
 ```bash
 python script/train.py \
   --fastwmr-version v1 \
-  --run-name g1_fastwmr_v1 \
-  --viz none
+  --run-name g1_fastwmr_v1
 ```
 
 Train the FastSAC baseline under the shared environment, reward, action, and
@@ -116,8 +114,7 @@ randomization configuration:
 ```bash
 python script/train.py \
   --task Isaac-Velocity-G1-FastSAC-Baseline-v0 \
-  --run-name g1_fastsac_baseline \
-  --viz none
+  --run-name g1_fastsac_baseline
 ```
 
 #### FastWMR-specific options
@@ -209,8 +206,7 @@ normalization, estimator, and learner-counter state:
 python script/train.py \
   --task Isaac-Velocity-G1-FastWMR-v0 \
   --resume ~/IsaacLab/logs/fastwmr/g1_fastwmr/checkpoints/step_000001000.pt \
-  --steps 1000 \
-  --viz none
+  --steps 1000
 ```
 
 Replay contents, the estimator rollout cache, and recurrent runtime state are
@@ -223,8 +219,7 @@ Run a deterministic nominal evaluation for one checkpoint:
 ```bash
 python script/play.py \
   --checkpoint ~/IsaacLab/logs/fastwmr/g1_fastwmr/checkpoints/final_step_000001000.pt \
-  --condition nominal_rough \
-  --viz none
+  --condition nominal_rough
 ```
 
 The evaluator infers FastWMR or FastSAC mode from the checkpoint. Available
@@ -268,8 +263,7 @@ python script/train.py \
   --seed 42 \
   --max-estimator-feature-age 256 \
   --normalizer-freeze-iteration 128 \
-  --run-name fastwmr_v2_normalizer_freeze \
-  --viz none
+  --run-name fastwmr_v2_normalizer_freeze
 ```
 
 At iteration 128, statistics stop changing while rollout and learner inputs
@@ -284,8 +278,7 @@ python script/train.py \
   --seed 42 \
   --max-estimator-feature-age 256 \
   --reconstruction-gate-start-updates 100000 \
-  --run-name fastwmr_v2_gate0 \
-  --viz none
+  --run-name fastwmr_v2_gate0
 ```
 
 Then run the strict-current reference, which rebuilds learning features with
@@ -298,8 +291,7 @@ python script/train.py \
   --num-envs 64 \
   --steps 1000 \
   --seed 42 \
-  --run-name fastwmr_v1_strict_current \
-  --viz none
+  --run-name fastwmr_v1_strict_current
 ```
 
 Run these experiments sequentially to avoid GPU contention. Pin
@@ -319,19 +311,19 @@ The main FastWMR ablations are exposed directly by the training entry point:
 
 ```bash
 # Reconstructed state only as the actor/critic control feature
-python script/train.py --control-feature-mode reconstruction_only --viz none
+python script/train.py --control-feature-mode reconstruction_only
 
 # Freeze the estimator while training the controller
-python script/train.py --freeze-estimator --viz none
+python script/train.py --freeze-estimator
 
 # Remove the estimator-to-controller gradient cutoff in strict v1
-python script/train.py --fastwmr-version v1 --disable-gradient-cutoff --viz none
+python script/train.py --fastwmr-version v1 --disable-gradient-cutoff
 
 # Treat every stored v2 reconstruction as fresh
-python script/train.py --disable-feature-age-filter --viz none
+python script/train.py --disable-feature-age-filter
 
 # Restrict sequence sampling to recent replay and enable symmetry augmentation
-python script/train.py --recent-replay-horizon 131072 --use-symmetry --viz none
+python script/train.py --recent-replay-horizon 131072 --use-symmetry
 ```
 
 ## References and Attribution
