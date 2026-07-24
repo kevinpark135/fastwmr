@@ -9,6 +9,9 @@ import pytest
 import torch
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
+from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.config import (
+    DEFAULT_INTERFACE_CFG,
+)
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.utils import (
     EpisodeStatisticsTracker,
     TrainingMetricsLogger,
@@ -157,6 +160,15 @@ def test_v2_metrics_report_full_replay_freshness_and_confidence() -> None:
         gate_quality_failures=0,
         gate_validation_checks=4,
         gate_quality_ema=0.4,
+        gate_base_velocity_rmse_ema=0.3,
+        gate_contact_bce_ema=0.2,
+        snapshot_active=True,
+        snapshot_estimator_version=3,
+        snapshot_replay_resets=1,
+        snapshot_gate_updates=5,
+        online_estimator_frozen=True,
+        interface=DEFAULT_INTERFACE_CFG,
+        control_reconstruction_fields=("base_lin_vel", "foot_contacts"),
         last_gate_validation=None,
     )
     update_loop = SimpleNamespace(
@@ -174,6 +186,7 @@ def test_v2_metrics_report_full_replay_freshness_and_confidence() -> None:
         last_reconstruction_confidence_mean=torch.tensor(0.25),
         last_reconstruction_confidence_min=torch.tensor(0.0),
         last_reconstruction_confidence_max=torch.tensor(0.5),
+        last_snapshot_replay_reset=True,
     )
 
     metrics = fastwmr_v2_metrics_dict(update_loop)
@@ -184,3 +197,11 @@ def test_v2_metrics_report_full_replay_freshness_and_confidence() -> None:
     assert metrics["replay/sampled_fresh_fraction"] == pytest.approx(0.5)
     assert metrics["replay/sampled_stale_fraction"] == pytest.approx(0.5)
     assert metrics["representation/confidence_mean"] == pytest.approx(0.25)
+    assert metrics["v2/snapshot_active"] == 1
+    assert metrics["v2/snapshot_replay_resets"] == 1
+    assert metrics["replay/snapshot_reset"] == 1
+    assert metrics["v2/gate_base_velocity_rmse_ema"] == pytest.approx(0.3)
+    assert metrics["v2/gate_contact_bce_ema"] == pytest.approx(0.2)
+    assert metrics["representation/active_reconstruction_fraction"] == pytest.approx(
+        5.0 / 13.0
+    )

@@ -391,7 +391,8 @@ def test_v2_splits_sac_and_estimator_with_ema_gate_and_one_rebuild() -> None:
         control_estimator_tau=0.25,
         reconstruction_gate_warmup_updates=2,
         reconstruction_gate_quality_threshold=1.0e9,
-        reconstruction_gate_close_threshold=1.0e9 + 1.0,
+        reconstruction_gate_base_velocity_rmse_threshold=1.0e9,
+        reconstruction_gate_contact_bce_threshold=1.0e9,
         reconstruction_gate_quality_patience=1,
         reconstruction_gate_validation_interval=1,
     )
@@ -431,10 +432,16 @@ def test_v2_splits_sac_and_estimator_with_ema_gate_and_one_rebuild() -> None:
     assert controller.control_estimator_version == 1
     assert controller.reconstruction_gate == pytest.approx(0.0)
     assert controller.gate_state.value == "ramping"
+    assert controller.snapshot_active
+    assert controller.snapshot_estimator_version == 1
+    assert controller.snapshot_replay_resets == 1
+    assert controller.online_estimator_frozen
     assert controller.gate_validation_checks == 1
     assert runtime.estimator_version == 1
     assert runtime.rebuilds == 1
     assert len(update_loop.last_estimator_updates) == 1
+    assert update_loop.last_snapshot_replay_reset
+    assert len(replay) == 0
     assert update_loop.last_rejected_features == 0
     for initial, online, control in zip(
         initial_control_parameters,
@@ -465,11 +472,12 @@ def test_v2_splits_sac_and_estimator_with_ema_gate_and_one_rebuild() -> None:
     env.close()
 
 
-def test_v2_quality_gate_opens_and_closes_with_hysteresis(monkeypatch) -> None:
+def test_v2_qualifies_target_fields_and_never_closes_snapshot_gate(monkeypatch) -> None:
     v2_cfg = FastWMRV2Cfg(
         reconstruction_gate_warmup_updates=2,
         reconstruction_gate_quality_threshold=0.45,
-        reconstruction_gate_close_threshold=0.55,
+        reconstruction_gate_base_velocity_rmse_threshold=0.65,
+        reconstruction_gate_contact_bce_threshold=0.55,
         reconstruction_gate_quality_ema_decay=0.0,
         reconstruction_gate_quality_patience=1,
         reconstruction_gate_validation_interval=1,
@@ -479,29 +487,45 @@ def test_v2_quality_gate_opens_and_closes_with_hysteresis(monkeypatch) -> None:
     controller = pipeline[6]
     assert isinstance(controller, FastWMRV2EstimatorController)
     quality = torch.tensor(0.4)
+    base_velocity_mse = torch.tensor(1.0)
+    contact_bce = torch.tensor(0.5)
     monkeypatch.setattr(
         controller.estimator_updater,
         "evaluate_sequence",
         lambda _sequence: SimpleNamespace(
-            metrics=SimpleNamespace(total_loss=quality)
+            metrics=SimpleNamespace(
+                total_loss=quality,
+                physical_field_losses={
+                    "base_lin_vel_mse": base_velocity_mse,
+                    "foot_contacts_bce": contact_bce,
+                },
+            )
         ),
     )
     controller.estimator_updates = 1
 
     controller.validate_reconstruction_gate(None)
+    assert controller.gate_state.value == "closed"
+    assert controller.gate_quality_failures == 1
+
+    base_velocity_mse.fill_(0.36)
+    controller.validate_reconstruction_gate(None)
     assert controller.gate_state.value == "ramping"
-    controller._advance_gate_state()
+    controller.synchronize_control_estimator()
+    assert controller.snapshot_active
+    assert controller.consume_snapshot_activation()
+    controller.advance_frozen_snapshot()
     assert controller.reconstruction_gate == pytest.approx(0.5)
-    controller._advance_gate_state()
+    controller.advance_frozen_snapshot()
     assert controller.gate_state.value == "open"
 
-    quality.fill_(0.6)
+    quality.fill_(1.0)
+    base_velocity_mse.fill_(4.0)
+    contact_bce.fill_(1.0)
     controller.validate_reconstruction_gate(None)
-    assert controller.gate_state.value == "closing"
-    controller._advance_gate_state()
-    assert controller.reconstruction_gate == pytest.approx(0.5)
-    controller._advance_gate_state()
-    assert controller.gate_state.value == "closed"
+    assert controller.gate_state.value == "open"
+    assert controller.reconstruction_gate == pytest.approx(1.0)
+    assert controller.snapshot_estimator_version == controller.control_estimator_version
     env.close()
 
 
@@ -831,6 +855,11 @@ def test_v2_checkpoint_restores_online_ema_scheduler_gate_and_policy_state(tmp_p
         estimator_updates_per_trigger=1,
         stored_feature_replay_horizon=64,
         reconstruction_gate_warmup_updates=2,
+        reconstruction_gate_quality_threshold=1.0e9,
+        reconstruction_gate_base_velocity_rmse_threshold=1.0e9,
+        reconstruction_gate_contact_bce_threshold=1.0e9,
+        reconstruction_gate_quality_patience=1,
+        reconstruction_gate_validation_interval=1,
     )
     source = _integrated_pipeline(
         version="v2",
@@ -848,6 +877,8 @@ def test_v2_checkpoint_restores_online_ema_scheduler_gate_and_policy_state(tmp_p
     source_collector.reset(seed=43)
     for _ in range(3):
         source_collector.collect_step()
+    assert source_controller.snapshot_active
+    assert source_controller.snapshot_replay_resets == 1
 
     checkpoint = save_training_checkpoint(
         tmp_path / "v2.pt",
@@ -865,7 +896,7 @@ def test_v2_checkpoint_restores_online_ema_scheduler_gate_and_policy_state(tmp_p
     legacy_payload["architecture"].pop("critic_hidden_dim")
     legacy_checkpoint = tmp_path / "legacy_v2.pt"
     torch.save(legacy_payload, legacy_checkpoint)
-    with pytest.raises(ValueError, match="predates confidence-aware reconstruction"):
+    with pytest.raises(ValueError, match="predates qualified stationary estimator"):
         inspect_training_checkpoint(legacy_checkpoint)
 
     target = _integrated_pipeline(

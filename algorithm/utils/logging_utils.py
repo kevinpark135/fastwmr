@@ -250,9 +250,16 @@ def estimator_metrics_dict(update: object) -> dict[str, float | int]:
 
 
 def fastwmr_v2_metrics_dict(update_loop: object) -> dict[str, float | int]:
-    """Expose two-timescale scheduling, gate, and feature-age diagnostics."""
+    """Expose snapshot qualification, routing, and replay diagnostics."""
 
     controller = update_loop.estimator_controller
+    active_reconstruction_width = sum(
+        field_slice.stop - field_slice.start
+        for field_slice in (
+            controller.interface.reconstruction_layout.field_slice(name)
+            for name in controller.control_reconstruction_fields
+        )
+    )
     metrics: dict[str, float | int] = {
         "v2/estimator_updates": int(controller.estimator_updates),
         "v2/estimator_attempts": int(controller.estimator_attempts),
@@ -264,20 +271,41 @@ def fastwmr_v2_metrics_dict(update_loop: object) -> dict[str, float | int]:
             "closed": 0,
             "ramping": 1,
             "open": 2,
-            "closing": 3,
         }[controller.gate_state.value],
         "v2/gate_quality_passes": int(controller.gate_quality_passes),
         "v2/gate_quality_failures": int(controller.gate_quality_failures),
         "v2/gate_validation_checks": int(controller.gate_validation_checks),
+        "v2/snapshot_active": int(controller.snapshot_active),
+        "v2/snapshot_estimator_version": int(
+            -1
+            if controller.snapshot_estimator_version is None
+            else controller.snapshot_estimator_version
+        ),
+        "v2/snapshot_replay_resets": int(controller.snapshot_replay_resets),
+        "v2/snapshot_gate_updates": int(controller.snapshot_gate_updates),
+        "v2/online_estimator_frozen": int(controller.online_estimator_frozen),
         "v2/eligible_features": int(update_loop.last_eligible_features),
         "v2/rejected_features": int(update_loop.last_rejected_features),
         "replay/full_transition_count": int(update_loop.last_full_transition_count),
         "replay/sac_candidate_count": int(update_loop.last_eligible_features),
         "replay/fresh_reconstruction_count": int(update_loop.last_fresh_features),
         "replay/stale_reconstruction_count": int(update_loop.last_stale_features),
+        "replay/snapshot_reset": int(update_loop.last_snapshot_replay_reset),
+        "representation/active_reconstruction_fraction": (
+            active_reconstruction_width
+            / controller.interface.reconstruction_target_dim
+        ),
     }
     if controller.gate_quality_ema is not None:
         metrics["v2/gate_quality_ema"] = float(controller.gate_quality_ema)
+    if controller.gate_base_velocity_rmse_ema is not None:
+        metrics["v2/gate_base_velocity_rmse_ema"] = float(
+            controller.gate_base_velocity_rmse_ema
+        )
+    if controller.gate_contact_bce_ema is not None:
+        metrics["v2/gate_contact_bce_ema"] = float(
+            controller.gate_contact_bce_ema
+        )
     if controller.last_gate_validation is not None:
         metrics["v2/gate_validation_loss"] = float(
             controller.last_gate_validation.metrics.total_loss

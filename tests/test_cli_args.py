@@ -33,7 +33,16 @@ def test_train_cli_defaults_to_fastwmr_and_validates() -> None:
     assert args.fresh_reconstruction_fraction == pytest.approx(0.5)
     assert args.stored_feature_replay_horizon is None
     assert args.reconstruction_gate_quality_threshold == pytest.approx(0.45)
-    assert args.reconstruction_gate_close_threshold == pytest.approx(0.55)
+    assert args.reconstruction_gate_base_velocity_rmse_threshold == pytest.approx(
+        0.65
+    )
+    assert args.reconstruction_gate_contact_bce_threshold == pytest.approx(0.55)
+    assert tuple(args.control_reconstruction_fields) == (
+        "base_lin_vel",
+        "foot_contacts",
+    )
+    assert not args.continue_online_estimator_after_snapshot
+    assert not args.keep_pre_snapshot_replay
     assert resolve_network_hidden_dims(args) == (512, 768)
     assert args.normalizer_freeze_iteration is None
     assert args.burn_in_length == 32
@@ -191,6 +200,16 @@ def test_play_cli_validates_fixed_budget(tmp_path) -> None:
         ("--estimator-update-interval", "0", "--estimator-update-interval"),
         ("--max-estimator-feature-age", "-1", "--max-estimator-feature-age"),
         ("--control-estimator-tau", "0", "--control-estimator-tau"),
+        (
+            "--reconstruction-gate-base-velocity-rmse-threshold",
+            "0",
+            "--reconstruction-gate-base-velocity-rmse-threshold",
+        ),
+        (
+            "--reconstruction-gate-contact-bce-threshold",
+            "0",
+            "--reconstruction-gate-contact-bce-threshold",
+        ),
         ("--estimator-cache-steps", "0", "--estimator-cache-steps"),
         ("--episode-start-fraction", "1.1", "--episode-start-fraction"),
         ("--run-name", "nested/run", "--run-name"),

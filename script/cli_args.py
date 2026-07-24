@@ -13,6 +13,14 @@ FASTSAC_BASELINE_PLAY_TASK = "Isaac-Velocity-G1-FastSAC-Baseline-Play-v0"
 FASTWMR_PLAY_TASK = "Isaac-Velocity-G1-FastWMR-Play-v0"
 TRAIN_TASKS = (FASTSAC_BASELINE_TASK, FASTWMR_TASK)
 DEFAULT_RECENT_REPLAY_HORIZON = 200_000
+DEFAULT_CONTROL_RECONSTRUCTION_FIELDS = ("base_lin_vel", "foot_contacts")
+RECONSTRUCTION_FIELD_NAMES = (
+    "base_lin_vel",
+    "friction",
+    "payload_mass",
+    "push_force_torque",
+    "foot_contacts",
+)
 EVALUATION_CONDITIONS = (
     "nominal_rough",
     "friction_low",
@@ -123,13 +131,39 @@ def build_train_parser() -> argparse.ArgumentParser:
         help="Optional SAC replay horizon; unset samples the full replay.",
     )
     parser.add_argument("--control-estimator-tau", type=float, default=0.005)
+    parser.add_argument(
+        "--control-reconstruction-fields",
+        nargs="+",
+        choices=RECONSTRUCTION_FIELD_NAMES,
+        default=DEFAULT_CONTROL_RECONSTRUCTION_FIELDS,
+        help="Estimator fields routed to the v2 actor and critic after snapshot qualification.",
+    )
     parser.add_argument("--reconstruction-gate-start-updates", type=int, default=0)
     parser.add_argument("--reconstruction-gate-warmup-updates", type=int, default=200)
     parser.add_argument("--reconstruction-gate-quality-threshold", type=float, default=0.45)
-    parser.add_argument("--reconstruction-gate-close-threshold", type=float, default=0.55)
+    parser.add_argument(
+        "--reconstruction-gate-base-velocity-rmse-threshold",
+        type=float,
+        default=0.65,
+    )
+    parser.add_argument(
+        "--reconstruction-gate-contact-bce-threshold",
+        type=float,
+        default=0.55,
+    )
     parser.add_argument("--reconstruction-gate-quality-ema-decay", type=float, default=0.9)
     parser.add_argument("--reconstruction-gate-quality-patience", type=int, default=3)
     parser.add_argument("--reconstruction-gate-validation-interval", type=int, default=8)
+    parser.add_argument(
+        "--continue-online-estimator-after-snapshot",
+        action="store_true",
+        help="Keep training the online estimator while the qualified control snapshot stays frozen.",
+    )
+    parser.add_argument(
+        "--keep-pre-snapshot-replay",
+        action="store_true",
+        help="Do not clear pre-gate transitions when the control snapshot is qualified.",
+    )
     parser.add_argument("--sequence-batch-size", type=int, default=256)
     parser.add_argument("--burn-in-length", type=int, default=32)
     parser.add_argument("--learning-length", type=int, default=8)
@@ -258,12 +292,13 @@ def validate_train_args(args: argparse.Namespace) -> None:
         raise ValueError("--reconstruction-gate-warmup-updates must be non-negative.")
     if args.reconstruction_gate_quality_threshold <= 0.0:
         raise ValueError("--reconstruction-gate-quality-threshold must be positive.")
-    if (
-        args.reconstruction_gate_close_threshold
-        <= args.reconstruction_gate_quality_threshold
-    ):
+    if args.reconstruction_gate_base_velocity_rmse_threshold <= 0.0:
         raise ValueError(
-            "--reconstruction-gate-close-threshold must exceed the open threshold."
+            "--reconstruction-gate-base-velocity-rmse-threshold must be positive."
+        )
+    if args.reconstruction_gate_contact_bce_threshold <= 0.0:
+        raise ValueError(
+            "--reconstruction-gate-contact-bce-threshold must be positive."
         )
     if not 0.0 <= args.reconstruction_gate_quality_ema_decay < 1.0:
         raise ValueError("--reconstruction-gate-quality-ema-decay must be in [0, 1).")
@@ -281,6 +316,10 @@ def validate_train_args(args: argparse.Namespace) -> None:
         or args.disable_gradient_cutoff
         or args.recent_replay_horizon != DEFAULT_RECENT_REPLAY_HORIZON
         or args.use_symmetry
+        or tuple(args.control_reconstruction_fields)
+        != DEFAULT_CONTROL_RECONSTRUCTION_FIELDS
+        or args.continue_online_estimator_after_snapshot
+        or args.keep_pre_snapshot_replay
     )
     if args.task == FASTSAC_BASELINE_TASK and fastwmr_ablation_requested:
         raise ValueError("FastWMR estimator and sequence ablations require the FastWMR task.")

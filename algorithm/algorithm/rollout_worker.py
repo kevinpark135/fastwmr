@@ -733,6 +733,11 @@ class FastWMRRolloutCollector:
             cfg=self.interface,
             normalizer=self.processor.observation_normalizer,
             reconstruction_gate=getattr(self.processor, "reconstruction_gate", 1.0),
+            reconstruction_fields=getattr(
+                self.processor,
+                "control_reconstruction_fields",
+                None,
+            ),
         ).detach()
         if not torch.isfinite(features).all():
             raise FloatingPointError("FastWMR rollout control features must remain finite.")

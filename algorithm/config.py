@@ -114,6 +114,9 @@ MVP_RECONSTRUCTION_LAYOUT = TensorLayoutSpec(
 )
 """MVP privileged target ``s_t``: 11 continuous values and 2 contact bits."""
 
+DEFAULT_CONTROL_RECONSTRUCTION_FIELDS = ("base_lin_vel", "foot_contacts")
+"""Estimator fields routed to the default controller after snapshot qualification."""
+
 
 @dataclass(frozen=True)
 class FastWMRInterfaceCfg:
@@ -325,7 +328,7 @@ DEFAULT_SEQUENCE_REPLAY_CFG = SequenceReplayCfg()
 
 @dataclass(frozen=True)
 class FastWMRV2Cfg:
-    """Two-timescale learner, EMA, gate, and reconstruction-freshness settings."""
+    """Two-timescale learner with a qualified stationary control snapshot."""
 
     estimator_update_interval: int = 8
     estimator_updates_per_trigger: int = 1
@@ -333,13 +336,17 @@ class FastWMRV2Cfg:
     fresh_reconstruction_fraction: float = 0.5
     stored_feature_replay_horizon: int | None = None
     control_estimator_tau: float = 0.005
+    control_reconstruction_fields: tuple[str, ...] = DEFAULT_CONTROL_RECONSTRUCTION_FIELDS
     reconstruction_gate_start_updates: int = 0
     reconstruction_gate_warmup_updates: int = 200
     reconstruction_gate_quality_threshold: float = 0.45
-    reconstruction_gate_close_threshold: float = 0.55
+    reconstruction_gate_base_velocity_rmse_threshold: float = 0.65
+    reconstruction_gate_contact_bce_threshold: float = 0.55
     reconstruction_gate_quality_ema_decay: float = 0.9
     reconstruction_gate_quality_patience: int = 3
     reconstruction_gate_validation_interval: int = 8
+    freeze_online_estimator_after_snapshot: bool = True
+    reset_replay_on_snapshot: bool = True
 
     def __post_init__(self) -> None:
         if self.estimator_update_interval <= 0:
@@ -360,18 +367,33 @@ class FastWMRV2Cfg:
             raise ValueError("stored_feature_replay_horizon must be positive when provided.")
         if not 0.0 < self.control_estimator_tau <= 1.0:
             raise ValueError("control_estimator_tau must be in (0, 1].")
+        if not self.control_reconstruction_fields:
+            raise ValueError("control_reconstruction_fields must not be empty.")
+        if len(self.control_reconstruction_fields) != len(
+            set(self.control_reconstruction_fields)
+        ):
+            raise ValueError("control_reconstruction_fields must be unique.")
+        unknown_fields = set(self.control_reconstruction_fields).difference(
+            MVP_RECONSTRUCTION_LAYOUT.names
+        )
+        if unknown_fields:
+            raise ValueError(
+                "Unknown control reconstruction fields: "
+                + ", ".join(sorted(unknown_fields))
+            )
         if self.reconstruction_gate_start_updates < 0:
             raise ValueError("reconstruction_gate_start_updates must be non-negative.")
         if self.reconstruction_gate_warmup_updates < 0:
             raise ValueError("reconstruction_gate_warmup_updates must be non-negative.")
         if self.reconstruction_gate_quality_threshold <= 0.0:
             raise ValueError("reconstruction_gate_quality_threshold must be positive.")
-        if (
-            self.reconstruction_gate_close_threshold
-            <= self.reconstruction_gate_quality_threshold
-        ):
+        if self.reconstruction_gate_base_velocity_rmse_threshold <= 0.0:
             raise ValueError(
-                "reconstruction_gate_close_threshold must exceed the open threshold."
+                "reconstruction_gate_base_velocity_rmse_threshold must be positive."
+            )
+        if self.reconstruction_gate_contact_bce_threshold <= 0.0:
+            raise ValueError(
+                "reconstruction_gate_contact_bce_threshold must be positive."
             )
         if not 0.0 <= self.reconstruction_gate_quality_ema_decay < 1.0:
             raise ValueError("reconstruction_gate_quality_ema_decay must be in [0, 1).")

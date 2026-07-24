@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import torch
 
@@ -51,6 +51,32 @@ def _reconstruction_confidence(
     return (gate * value).detach()
 
 
+def reconstruction_field_mask(
+    reference: torch.Tensor,
+    field_names: Sequence[str] | None,
+    *,
+    cfg: FastWMRInterfaceCfg = DEFAULT_INTERFACE_CFG,
+) -> torch.Tensor:
+    """Build a last-dimension mask for controller-approved estimator fields."""
+
+    _check_last_dim(reference, cfg.reconstruction_target_dim, "reconstruction_reference")
+    if field_names is None:
+        return reference.new_ones(cfg.reconstruction_target_dim)
+    names = tuple(field_names)
+    if not names:
+        raise ValueError("reconstruction_fields must not be empty.")
+    if len(names) != len(set(names)):
+        raise ValueError("reconstruction_fields must be unique.")
+    mask = reference.new_zeros(cfg.reconstruction_target_dim)
+    for name in names:
+        try:
+            field_slice = cfg.reconstruction_layout.field_slice(name)
+        except KeyError as error:
+            raise ValueError(str(error)) from error
+        mask[field_slice] = 1.0
+    return mask
+
+
 def build_control_feature(
     policy_observation: torch.Tensor,
     reconstructed_state: torch.Tensor,
@@ -60,6 +86,7 @@ def build_control_feature(
     detach_reconstruction: bool = True,
     reconstruction_gate: float = 1.0,
     reconstruction_confidence: float | torch.Tensor = 1.0,
+    reconstruction_fields: Sequence[str] | None = None,
 ) -> torch.Tensor:
     """Build ``x_t`` while enforcing the estimator gradient cutoff.
 
@@ -82,6 +109,11 @@ def build_control_feature(
 
     routed_reconstruction = (
         reconstructed_state.detach() if detach_reconstruction else reconstructed_state
+    )
+    routed_reconstruction = routed_reconstruction * reconstruction_field_mask(
+        routed_reconstruction,
+        reconstruction_fields,
+        cfg=cfg,
     )
     confidence = _reconstruction_confidence(
         reconstructed_state,

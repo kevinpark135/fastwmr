@@ -222,6 +222,18 @@ def run() -> Path:
             str(arguments.get("control_feature_mode", "obs_and_reconstruction"))
         )
         interface = FastWMRInterfaceCfg(control_feature_mode=control_mode)
+        control_reconstruction_fields = None
+        if (
+            metadata.mode is TrainingMode.FASTWMR
+            and str(arguments.get("fastwmr_version", "v2")) == "v2"
+        ):
+            control_reconstruction_fields = tuple(
+                str(name)
+                for name in arguments.get(
+                    "control_reconstruction_fields",
+                    ("base_lin_vel", "foot_contacts"),
+                )
+            )
         actor_input_dim = (
             interface.control_feature_dim
             if metadata.mode is TrainingMode.FASTWMR
@@ -332,6 +344,7 @@ def run() -> Path:
                     cfg=interface,
                     normalizer=normalizer,
                     reconstruction_gate=loaded.reconstruction_gate,
+                    reconstruction_fields=control_reconstruction_fields,
                 )
             else:
                 feature = normalizer(policy) if normalizer is not None else policy

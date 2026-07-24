@@ -11,7 +11,7 @@ https://github.com/amazon-far/holosoma
 from __future__ import annotations
 
 import math
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -121,6 +121,7 @@ class SACTransitionBatch:
         normalizer: ObservationNormalizer | None = None,
         reconstruction_gate: float = 1.0,
         reconstruction_freshness: torch.Tensor | None = None,
+        reconstruction_fields: Sequence[str] | None = None,
     ) -> "SACTransitionBatch":
         """Rebuild one v2 SAC batch under the current learner representation."""
 
@@ -142,6 +143,7 @@ class SACTransitionBatch:
                 normalizer=normalizer,
                 reconstruction_gate=reconstruction_gate,
                 reconstruction_confidence=freshness,
+                reconstruction_fields=reconstruction_fields,
             ).detach(),
             actions=replay.actions.detach(),
             rewards=replay.rewards.detach(),
@@ -152,6 +154,7 @@ class SACTransitionBatch:
                 normalizer=normalizer,
                 reconstruction_gate=reconstruction_gate,
                 reconstruction_confidence=freshness,
+                reconstruction_fields=reconstruction_fields,
             ).detach(),
             terminated=replay.terminated.detach(),
             truncated=replay.truncated.detach(),

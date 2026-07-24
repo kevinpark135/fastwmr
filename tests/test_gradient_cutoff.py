@@ -69,3 +69,28 @@ def test_reconstruction_confidence_masks_only_estimator_features() -> None:
         feature[:, : cfg.policy_observation_dim],
         observation,
     )
+
+
+def test_reconstruction_field_mask_preserves_contract_and_selected_targets() -> None:
+    cfg = DEFAULT_INTERFACE_CFG
+    observation = torch.ones(2, cfg.policy_observation_dim)
+    reconstruction = torch.ones(2, cfg.reconstruction_target_dim)
+
+    feature = build_control_feature(
+        observation,
+        reconstruction,
+        cfg=cfg,
+        reconstruction_fields=("base_lin_vel", "foot_contacts"),
+    )
+    routed = feature[
+        :,
+        cfg.policy_observation_dim :
+        cfg.policy_observation_dim + cfg.reconstruction_target_dim,
+    ]
+    expected = torch.zeros_like(routed)
+    expected[:, cfg.reconstruction_layout.field_slice("base_lin_vel")] = 1.0
+    expected[:, cfg.reconstruction_layout.field_slice("foot_contacts")] = 1.0
+
+    assert feature.shape[-1] == cfg.control_feature_dim
+    torch.testing.assert_close(routed, expected)
+    torch.testing.assert_close(feature[:, -1], torch.ones(2))

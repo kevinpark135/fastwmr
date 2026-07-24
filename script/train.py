@@ -371,13 +371,19 @@ def _build_components(
             fresh_reconstruction_fraction=ARGS.fresh_reconstruction_fraction,
             stored_feature_replay_horizon=ARGS.stored_feature_replay_horizon,
             control_estimator_tau=ARGS.control_estimator_tau,
+            control_reconstruction_fields=tuple(
+                ARGS.control_reconstruction_fields
+            ),
             reconstruction_gate_start_updates=ARGS.reconstruction_gate_start_updates,
             reconstruction_gate_warmup_updates=ARGS.reconstruction_gate_warmup_updates,
             reconstruction_gate_quality_threshold=(
                 ARGS.reconstruction_gate_quality_threshold
             ),
-            reconstruction_gate_close_threshold=(
-                ARGS.reconstruction_gate_close_threshold
+            reconstruction_gate_base_velocity_rmse_threshold=(
+                ARGS.reconstruction_gate_base_velocity_rmse_threshold
+            ),
+            reconstruction_gate_contact_bce_threshold=(
+                ARGS.reconstruction_gate_contact_bce_threshold
             ),
             reconstruction_gate_quality_ema_decay=(
                 ARGS.reconstruction_gate_quality_ema_decay
@@ -388,6 +394,10 @@ def _build_components(
             reconstruction_gate_validation_interval=(
                 ARGS.reconstruction_gate_validation_interval
             ),
+            freeze_online_estimator_after_snapshot=(
+                not ARGS.continue_online_estimator_after_snapshot
+            ),
+            reset_replay_on_snapshot=not ARGS.keep_pre_snapshot_replay,
         )
         control_estimator = copy.deepcopy(estimator).to(device)
         ema_estimator = EMAControlEstimator(

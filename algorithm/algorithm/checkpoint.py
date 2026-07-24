@@ -25,9 +25,9 @@ from .rollout_worker import FastWMREstimatorRuntime
 from .sac_update import SACUpdater
 
 
-CHECKPOINT_FORMAT_VERSION = 3
-SUPPORTED_CHECKPOINT_FORMAT_VERSIONS = (1, 2, CHECKPOINT_FORMAT_VERSION)
-FASTWMR_REPRESENTATION_VERSION = 3
+CHECKPOINT_FORMAT_VERSION = 4
+SUPPORTED_CHECKPOINT_FORMAT_VERSIONS = (1, 2, 3, CHECKPOINT_FORMAT_VERSION)
+FASTWMR_REPRESENTATION_VERSION = 4
 
 
 class TrainingMode(str, Enum):
@@ -534,7 +534,7 @@ def _validate_representation(
         return
     if payload.get("fastwmr_representation_version") != FASTWMR_REPRESENTATION_VERSION:
         raise ValueError(
-            "This FastWMR checkpoint predates confidence-aware reconstruction replay and "
+            "This FastWMR checkpoint predates qualified stationary estimator snapshots and "
             "cannot be resumed or evaluated with the current representation."
         )
 

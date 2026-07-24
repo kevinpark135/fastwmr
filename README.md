@@ -149,19 +149,34 @@ FastWMR v2 adds the following two-timescale controls:
 | `--fresh-reconstruction-fraction` | `0.5` | Reserve this fresh-feature fraction when the reconstruction gate is fully open. |
 | `--stored-feature-replay-horizon` | unset | Optionally restrict SAC transition replay; unset uses the full buffer. |
 | `--control-estimator-tau` | `0.005` | Set the EMA update rate for the control estimator. |
+| `--control-reconstruction-fields` | `base_lin_vel foot_contacts` | Select estimator targets routed to the actor and critic; unselected target slots remain zero. |
 | `--reconstruction-gate-start-updates` | `0` | Require at least this many estimator updates before quality can open the gate. |
-| `--reconstruction-gate-warmup-updates` | `200` | Ramp the gate after its quality checks pass. |
-| `--reconstruction-gate-quality-threshold` | `0.45` | Open the gate below this normalized validation-loss EMA. |
-| `--reconstruction-gate-close-threshold` | `0.55` | Close the gate above this EMA, leaving hysteresis around the open threshold. |
+| `--reconstruction-gate-warmup-updates` | `200` | Ramp the one-way gate after a control snapshot qualifies. |
+| `--reconstruction-gate-quality-threshold` | `0.45` | Require the normalized validation-loss EMA to be at or below this value. |
+| `--reconstruction-gate-base-velocity-rmse-threshold` | `0.65` | Require physical base-linear-velocity RMSE EMA to be at or below this value. |
+| `--reconstruction-gate-contact-bce-threshold` | `0.55` | Require foot-contact BCE EMA to be at or below this value. |
 | `--reconstruction-gate-quality-ema-decay` | `0.9` | Smooth independently sampled gate-validation losses. |
-| `--reconstruction-gate-quality-patience` | `3` | Require this many consecutive EMA threshold passes. |
-| `--reconstruction-gate-validation-interval` | `8` | Validate gate quality every N estimator attempts in every gate state. |
+| `--reconstruction-gate-quality-patience` | `3` | Require this many consecutive passes across all qualification thresholds. |
+| `--reconstruction-gate-validation-interval` | `8` | Validate snapshot quality every N estimator attempts before qualification. |
+| `--continue-online-estimator-after-snapshot` | disabled | Continue training the online estimator after qualification while keeping the control snapshot fixed. |
+| `--keep-pre-snapshot-replay` | disabled | Retain pre-qualification replay instead of clearing it when the snapshot activates. |
 
 FastWMR control features contain normalized proprioception, 13 reconstructed
 world-state values, and one reconstruction-confidence value. The confidence is
-the product of the global quality gate and the per-transition freshness mask.
-When confidence is zero, only the reconstruction is masked; the transition's
-proprioception, action, reward, and bootstrap state remain in SAC replay.
+the product of the one-way quality gate and the per-transition freshness mask.
+By default, only base linear velocity and foot contacts occupy their original
+reconstruction slots; the other reconstructed fields are zero-masked while the
+110-dimensional actor/critic contract stays unchanged.
+
+FastWMR v2 first trains SAC with proprioception while the online recurrent
+estimator learns from replay. A separately sampled validation sequence must pass
+the total-loss, physical base-velocity RMSE, and contact-BCE thresholds for the
+configured patience. FastWMR then hard-copies one qualified estimator snapshot
+to the control path, freezes that snapshot, clears pre-snapshot replay, and
+ramps reconstruction into SAC monotonically. New transitions retain the fixed
+snapshot representation, so estimator drift no longer changes replay semantics.
+When confidence is zero, only reconstruction is masked; proprioception, action,
+reward, and bootstrap state remain usable.
 
 The actor and critic use separate width controls: `--actor-hidden-dim 512` and
 `--critic-hidden-dim 768`. The legacy `--hidden-dim` option still overrides
@@ -300,10 +315,12 @@ Run these experiments sequentially to avoid GPU contention. Pin
 `v2/gate_quality_ema`, `v2/gate_state`, `sac/q_gap_mean`,
 `sac/c51_lower_endpoint_mass`, `sac/c51_upper_endpoint_mass`,
 `sac/c51_distribution_entropy`, `sac/policy_action_saturation_fraction`, and
-`estimator/context_exact_fraction` in TensorBoard. For confidence-aware replay,
-also pin `replay/full_transition_count`, `replay/fresh_reconstruction_count`,
-`replay/stale_reconstruction_count`, `replay/sampled_fresh_fraction`, and
-`representation/confidence_mean`.
+`estimator/context_exact_fraction` in TensorBoard. For snapshot qualification,
+also pin `v2/gate_base_velocity_rmse_ema`, `v2/gate_contact_bce_ema`,
+`v2/snapshot_active`, `v2/snapshot_replay_resets`,
+`replay/full_transition_count`, `replay/sampled_fresh_fraction`,
+`representation/confidence_mean`, and
+`representation/active_reconstruction_fraction`.
 
 ### Ablations
 

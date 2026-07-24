@@ -12,7 +12,11 @@ from .evaluation_utils import (
     write_evaluation_record,
     write_evaluation_summary,
 )
-from .feature_builder import build_control_feature, build_critic_input
+from .feature_builder import (
+    build_control_feature,
+    build_critic_input,
+    reconstruction_field_mask,
+)
 from .logging_utils import (
     CompletedEpisodeStatistics,
     EpisodeStatisticsTracker,
@@ -56,6 +60,7 @@ __all__ = [
     "bellman_bootstrap_mask",
     "build_control_feature",
     "build_critic_input",
+    "reconstruction_field_mask",
     "episode_end_mask",
     "estimator_metrics_dict",
     "fastwmr_agent_metrics_dict",
