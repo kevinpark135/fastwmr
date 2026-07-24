@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from script.cli_args import (
+    FASTSAC_BASELINE_TASK,
     FASTWMR_TASK,
     build_play_parser,
     build_train_parser,
@@ -106,6 +107,35 @@ def test_train_cli_accepts_fastwmr_ablation_matrix() -> None:
     assert args.recent_replay_horizon == 4096
     assert args.use_symmetry
     assert args.freeze_estimator
+
+
+def test_train_cli_accepts_fastsac_with_shared_penalty_override() -> None:
+    args = build_train_parser().parse_args(
+        [
+            "--task",
+            FASTSAC_BASELINE_TASK,
+            "--penalty-min-completed-episodes",
+            "1000000",
+        ]
+    )
+
+    validate_train_args(args)
+
+    assert args.penalty_min_completed_episodes == 1_000_000
+
+
+def test_train_cli_rejects_fastsac_recent_replay_ablation() -> None:
+    args = build_train_parser().parse_args(
+        [
+            "--task",
+            FASTSAC_BASELINE_TASK,
+            "--recent-replay-horizon",
+            "4096",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="require the FastWMR task"):
+        validate_train_args(args)
 
 
 def test_train_cli_rejects_frozen_no_cutoff_combination() -> None:

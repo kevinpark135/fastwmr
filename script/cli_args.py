@@ -12,6 +12,7 @@ FASTWMR_TASK = "Isaac-Velocity-G1-FastWMR-v0"
 FASTSAC_BASELINE_PLAY_TASK = "Isaac-Velocity-G1-FastSAC-Baseline-Play-v0"
 FASTWMR_PLAY_TASK = "Isaac-Velocity-G1-FastWMR-Play-v0"
 TRAIN_TASKS = (FASTSAC_BASELINE_TASK, FASTWMR_TASK)
+DEFAULT_RECENT_REPLAY_HORIZON = 200_000
 EVALUATION_CONDITIONS = (
     "nominal_rough",
     "friction_low",
@@ -160,7 +161,11 @@ def build_train_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--freeze-estimator", action="store_true")
     parser.add_argument("--disable-gradient-cutoff", action="store_true")
-    parser.add_argument("--recent-replay-horizon", type=int, default=200_000)
+    parser.add_argument(
+        "--recent-replay-horizon",
+        type=int,
+        default=DEFAULT_RECENT_REPLAY_HORIZON,
+    )
     parser.add_argument("--use-symmetry", action="store_true")
     parser.add_argument("--disable-penalty-curriculum", action="store_true")
     parser.add_argument(
@@ -274,7 +279,7 @@ def validate_train_args(args: argparse.Namespace) -> None:
         args.control_feature_mode != "obs_and_reconstruction"
         or args.freeze_estimator
         or args.disable_gradient_cutoff
-        or args.recent_replay_horizon is not None
+        or args.recent_replay_horizon != DEFAULT_RECENT_REPLAY_HORIZON
         or args.use_symmetry
     )
     if args.task == FASTSAC_BASELINE_TASK and fastwmr_ablation_requested:
