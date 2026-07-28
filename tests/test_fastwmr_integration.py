@@ -540,7 +540,7 @@ def test_v2_qualifies_target_fields_and_never_closes_snapshot_gate(monkeypatch) 
     env = pipeline[0]
     controller = pipeline[6]
     assert isinstance(controller, FastWMRV2EstimatorController)
-    quality = torch.tensor(0.4)
+    quality = torch.tensor(1.0)
     base_velocity_mse = torch.tensor(1.0)
     contact_bce = torch.tensor(0.5)
     monkeypatch.setattr(
@@ -565,6 +565,8 @@ def test_v2_qualifies_target_fields_and_never_closes_snapshot_gate(monkeypatch) 
     base_velocity_mse.fill_(0.36)
     controller.validate_reconstruction_gate(None)
     assert controller.gate_state.value == "ramping"
+    assert controller.gate_control_passed
+    assert controller.gate_control_score == pytest.approx(0.6 / 0.65)
     controller.synchronize_control_estimator()
     assert controller.snapshot_active
     assert controller.consume_snapshot_activation()
@@ -580,6 +582,95 @@ def test_v2_qualifies_target_fields_and_never_closes_snapshot_gate(monkeypatch) 
     assert controller.gate_state.value == "open"
     assert controller.reconstruction_gate == pytest.approx(1.0)
     assert controller.snapshot_estimator_version == controller.control_estimator_version
+    env.close()
+
+
+@pytest.mark.parametrize(
+    ("control_fields", "base_velocity_mse", "contact_bce"),
+    (
+        (("base_lin_vel",), 0.36, 1.0),
+        (("foot_contacts",), 4.0, 0.5),
+    ),
+)
+def test_v2_gate_only_requires_controller_routed_fields(
+    monkeypatch,
+    control_fields,
+    base_velocity_mse,
+    contact_bce,
+) -> None:
+    v2_cfg = FastWMRV2Cfg(
+        control_reconstruction_fields=control_fields,
+        reconstruction_gate_quality_threshold=0.45,
+        reconstruction_gate_base_velocity_rmse_threshold=0.65,
+        reconstruction_gate_contact_bce_threshold=0.55,
+        reconstruction_gate_quality_ema_decay=0.0,
+        reconstruction_gate_quality_patience=1,
+        reconstruction_gate_validation_interval=1,
+    )
+    pipeline = _integrated_pipeline(version="v2", v2_cfg=v2_cfg)
+    env = pipeline[0]
+    controller = pipeline[6]
+    assert isinstance(controller, FastWMRV2EstimatorController)
+    monkeypatch.setattr(
+        controller.estimator_updater,
+        "evaluate_sequence",
+        lambda _sequence: SimpleNamespace(
+            metrics=SimpleNamespace(
+                total_loss=torch.tensor(10.0),
+                physical_field_losses={
+                    "base_lin_vel_mse": torch.tensor(base_velocity_mse),
+                    "foot_contacts_bce": torch.tensor(contact_bce),
+                },
+            )
+        ),
+    )
+    controller.estimator_updates = 1
+
+    controller.validate_reconstruction_gate(None)
+
+    assert controller.gate_control_passed
+    assert controller.gate_state.value == "ramping"
+    env.close()
+
+
+def test_v2_gate_uses_total_loss_fallback_for_other_routed_fields(
+    monkeypatch,
+) -> None:
+    v2_cfg = FastWMRV2Cfg(
+        control_reconstruction_fields=("friction",),
+        reconstruction_gate_quality_threshold=0.45,
+        reconstruction_gate_quality_ema_decay=0.0,
+        reconstruction_gate_quality_patience=1,
+        reconstruction_gate_validation_interval=1,
+    )
+    pipeline = _integrated_pipeline(version="v2", v2_cfg=v2_cfg)
+    env = pipeline[0]
+    controller = pipeline[6]
+    assert isinstance(controller, FastWMRV2EstimatorController)
+    quality = torch.tensor(0.5)
+    monkeypatch.setattr(
+        controller.estimator_updater,
+        "evaluate_sequence",
+        lambda _sequence: SimpleNamespace(
+            metrics=SimpleNamespace(
+                total_loss=quality,
+                physical_field_losses={
+                    "base_lin_vel_mse": torch.tensor(0.01),
+                    "foot_contacts_bce": torch.tensor(0.01),
+                },
+            )
+        ),
+    )
+    controller.estimator_updates = 1
+
+    controller.validate_reconstruction_gate(None)
+    assert not controller.gate_control_passed
+    assert controller.gate_state.value == "closed"
+
+    quality.fill_(0.4)
+    controller.validate_reconstruction_gate(None)
+    assert controller.gate_control_passed
+    assert controller.gate_state.value == "ramping"
     env.close()
 
 

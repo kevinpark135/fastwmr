@@ -167,11 +167,11 @@ FastWMR v2 adds the following two-timescale controls:
 | `--control-reconstruction-fields` | `base_lin_vel foot_contacts` | Select estimator targets routed to the actor and critic; unselected target slots remain zero. |
 | `--reconstruction-gate-start-updates` | `0` | Require at least this many estimator updates before quality can open the gate. |
 | `--reconstruction-gate-warmup-updates` | `200` | Ramp the one-way gate after a control snapshot qualifies. |
-| `--reconstruction-gate-quality-threshold` | `0.45` | Require the normalized validation-loss EMA to be at or below this value. |
+| `--reconstruction-gate-quality-threshold` | `0.45` | Set the conservative total-loss fallback for routed fields without a dedicated threshold. |
 | `--reconstruction-gate-base-velocity-rmse-threshold` | `0.65` | Require physical base-linear-velocity RMSE EMA to be at or below this value. |
 | `--reconstruction-gate-contact-bce-threshold` | `0.55` | Require foot-contact BCE EMA to be at or below this value. |
 | `--reconstruction-gate-quality-ema-decay` | `0.9` | Smooth independently sampled gate-validation losses. |
-| `--reconstruction-gate-quality-patience` | `3` | Require this many consecutive passes across all qualification thresholds. |
+| `--reconstruction-gate-quality-patience` | `3` | Require this many consecutive passes across controller-routed field thresholds. |
 | `--reconstruction-gate-validation-interval` | `8` | Validate snapshot quality every N estimator attempts before qualification. |
 | `--continue-online-estimator-after-snapshot` | disabled | Continue training the online estimator after qualification while keeping the control snapshot fixed. |
 | `--reset-replay-on-snapshot` | disabled | Clear all replay when the snapshot activates; intended only for reset ablations. |
@@ -185,9 +185,11 @@ reconstruction slots; the other reconstructed fields are zero-masked while the
 
 FastWMR v2 first trains SAC with proprioception while the online recurrent
 estimator learns from replay. A separately sampled validation sequence must pass
-the total-loss, physical base-velocity RMSE, and contact-BCE thresholds for the
-configured patience. FastWMR then hard-copies one qualified estimator snapshot
-to the control path, freezes that snapshot, and ramps reconstruction into SAC
+the thresholds for every reconstruction field routed to control. The default
+controller therefore qualifies on physical base-velocity RMSE and contact BCE;
+whole-estimator loss remains diagnostic and cannot block these routed fields.
+FastWMR then hard-copies one qualified estimator snapshot to the control path,
+freezes that snapshot, and ramps reconstruction into SAC
 monotonically. Pre-snapshot transitions remain in replay, but only
 reconstructions whose version exactly matches the frozen snapshot receive
 non-zero confidence. This preserves their proprioception, action, reward, and
@@ -328,7 +330,8 @@ python script/train.py \
 Run these experiments sequentially to avoid GPU contention. Pin
 `episode/return_mean`, `sac/policy_entropy`, `normalizer/frozen`,
 `normalizer/samples_seen`, `v2/reconstruction_gate`,
-`v2/gate_quality_ema`, `v2/gate_state`, `sac/q_gap_mean`,
+`v2/gate_control_score`, `v2/gate_control_pass`, `v2/gate_quality_ema`,
+`v2/gate_state`, `sac/q_gap_mean`,
 `sac/c51_lower_endpoint_mass`, `sac/c51_upper_endpoint_mass`,
 `sac/c51_distribution_entropy`, `sac/policy_action_saturation_fraction`, and
 `estimator/context_exact_fraction` in TensorBoard. For snapshot qualification,

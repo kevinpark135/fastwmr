@@ -275,6 +275,7 @@ def fastwmr_v2_metrics_dict(update_loop: object) -> dict[str, float | int]:
         "v2/gate_quality_passes": int(controller.gate_quality_passes),
         "v2/gate_quality_failures": int(controller.gate_quality_failures),
         "v2/gate_validation_checks": int(controller.gate_validation_checks),
+        "v2/gate_control_pass": int(controller.gate_control_passed),
         "v2/snapshot_active": int(controller.snapshot_active),
         "v2/snapshot_estimator_version": int(
             -1
@@ -298,6 +299,8 @@ def fastwmr_v2_metrics_dict(update_loop: object) -> dict[str, float | int]:
     }
     if controller.gate_quality_ema is not None:
         metrics["v2/gate_quality_ema"] = float(controller.gate_quality_ema)
+    if controller.gate_control_score is not None:
+        metrics["v2/gate_control_score"] = float(controller.gate_control_score)
     if controller.gate_base_velocity_rmse_ema is not None:
         metrics["v2/gate_base_velocity_rmse_ema"] = float(
             controller.gate_base_velocity_rmse_ema

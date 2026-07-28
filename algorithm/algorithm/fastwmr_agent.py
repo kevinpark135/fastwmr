@@ -509,6 +509,45 @@ class FastWMRV2EstimatorController:
         return self._reconstruction_gate
 
     @property
+    def gate_control_score(self) -> float | None:
+        """Return the worst normalized error among controller-routed fields."""
+
+        ratios: list[float] = []
+        fallback_required = False
+        for field_name in self.control_reconstruction_fields:
+            if field_name == "base_lin_vel":
+                if self.gate_base_velocity_rmse_ema is None:
+                    return None
+                ratios.append(
+                    self.gate_base_velocity_rmse_ema
+                    / self.cfg.reconstruction_gate_base_velocity_rmse_threshold
+                )
+            elif field_name == "foot_contacts":
+                if self.gate_contact_bce_ema is None:
+                    return None
+                ratios.append(
+                    self.gate_contact_bce_ema
+                    / self.cfg.reconstruction_gate_contact_bce_threshold
+                )
+            else:
+                fallback_required = True
+        if fallback_required:
+            if self.gate_quality_ema is None:
+                return None
+            ratios.append(
+                self.gate_quality_ema
+                / self.cfg.reconstruction_gate_quality_threshold
+            )
+        return max(ratios) if ratios else None
+
+    @property
+    def gate_control_passed(self) -> bool:
+        """Whether every routed reconstruction field is ready for control."""
+
+        score = self.gate_control_score
+        return score is not None and score <= 1.0
+
+    @property
     def online_estimator_frozen(self) -> bool:
         return self.estimator_frozen or (
             self.snapshot_active
@@ -588,15 +627,7 @@ class FastWMRV2EstimatorController:
             + (1.0 - decay) * contact_bce
         )
         self.gate_validation_checks += 1
-        quality_passed = (
-            self.gate_quality_ema
-            <= self.cfg.reconstruction_gate_quality_threshold
-            and self.gate_base_velocity_rmse_ema
-            <= self.cfg.reconstruction_gate_base_velocity_rmse_threshold
-            and self.gate_contact_bce_ema
-            <= self.cfg.reconstruction_gate_contact_bce_threshold
-        )
-        if quality_passed:
+        if self.gate_control_passed:
             self.gate_quality_passes += 1
             self.gate_quality_failures = 0
         else:

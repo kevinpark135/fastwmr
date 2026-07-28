@@ -162,6 +162,8 @@ def test_v2_metrics_report_full_replay_freshness_and_confidence() -> None:
         gate_quality_ema=0.4,
         gate_base_velocity_rmse_ema=0.3,
         gate_contact_bce_ema=0.2,
+        gate_control_score=0.75,
+        gate_control_passed=True,
         snapshot_active=True,
         snapshot_estimator_version=3,
         snapshot_replay_resets=1,
@@ -202,6 +204,8 @@ def test_v2_metrics_report_full_replay_freshness_and_confidence() -> None:
     assert metrics["replay/snapshot_reset"] == 1
     assert metrics["v2/gate_base_velocity_rmse_ema"] == pytest.approx(0.3)
     assert metrics["v2/gate_contact_bce_ema"] == pytest.approx(0.2)
+    assert metrics["v2/gate_control_score"] == pytest.approx(0.75)
+    assert metrics["v2/gate_control_pass"] == 1
     assert metrics["representation/active_reconstruction_fraction"] == pytest.approx(
         5.0 / 13.0
     )
