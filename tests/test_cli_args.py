@@ -49,6 +49,7 @@ def test_train_cli_defaults_to_fastwmr_and_validates() -> None:
     assert args.learning_length > 0
     assert args.episode_start_fraction == pytest.approx(0.25)
     assert args.recent_replay_horizon == 200_000
+    assert args.penalty_fixed is None
 
 
 def test_train_cli_accepts_resume_and_sequence_overrides(tmp_path) -> None:
@@ -131,6 +132,48 @@ def test_train_cli_accepts_fastsac_with_shared_penalty_override() -> None:
     validate_train_args(args)
 
     assert args.penalty_min_completed_episodes == 1_000_000
+
+
+@pytest.mark.parametrize("option", ("--penalty_fixed", "--penalty-fixed"))
+def test_train_cli_accepts_fixed_penalty_scale(option: str) -> None:
+    args = build_train_parser().parse_args(
+        [
+            "--task",
+            FASTSAC_BASELINE_TASK,
+            option,
+            "0.25",
+        ]
+    )
+
+    validate_train_args(args)
+
+    assert args.penalty_fixed == pytest.approx(0.25)
+
+
+@pytest.mark.parametrize("scale", ("0", "1"))
+def test_train_cli_accepts_fixed_penalty_scale_boundaries(scale: str) -> None:
+    args = build_train_parser().parse_args(["--penalty_fixed", scale])
+
+    validate_train_args(args)
+
+    assert args.penalty_fixed == pytest.approx(float(scale))
+
+
+@pytest.mark.parametrize("scale", ("-0.01", "1.01", "nan"))
+def test_train_cli_rejects_invalid_fixed_penalty_scale(scale: str) -> None:
+    args = build_train_parser().parse_args(["--penalty_fixed", scale])
+
+    with pytest.raises(ValueError, match=r"lie in \[0, 1\]"):
+        validate_train_args(args)
+
+
+def test_train_cli_rejects_conflicting_fixed_penalty_modes() -> None:
+    args = build_train_parser().parse_args(
+        ["--penalty_fixed", "0.1", "--disable-penalty-curriculum"]
+    )
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        validate_train_args(args)
 
 
 def test_train_cli_rejects_fastsac_recent_replay_ablation() -> None:

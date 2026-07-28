@@ -117,6 +117,21 @@ python script/train.py \
   --run-name g1_fastsac_baseline
 ```
 
+The episode-length-driven dynamic penalty curriculum remains enabled by default.
+Use `--penalty_fixed SCALE` with either training task to disable that curriculum
+for one run and hold all shared penalty terms at a stationary scale in `[0, 1]`:
+
+```bash
+python script/train.py \
+  --task Isaac-Velocity-G1-FastWMR-v0 \
+  --penalty_fixed 0.1 \
+  --run-name g1_fastwmr_fixed_penalty
+```
+
+Fixed runs log `curriculum/penalty_fixed = 1` and the selected
+`curriculum/penalty_scale` throughout training. Omitting `--penalty_fixed`
+preserves the default `0.1, 0.3, 0.6, 1.0` dynamic schedule.
+
 #### FastWMR-specific options
 
 These options configure the estimator and sequence learner used by the FastWMR

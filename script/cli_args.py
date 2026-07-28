@@ -203,6 +203,18 @@ def build_train_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use-symmetry", action="store_true")
     parser.add_argument("--disable-penalty-curriculum", action="store_true")
     parser.add_argument(
+        "--penalty_fixed",
+        "--penalty-fixed",
+        dest="penalty_fixed",
+        type=float,
+        default=None,
+        metavar="SCALE",
+        help=(
+            "Disable the dynamic penalty curriculum and hold the shared penalty "
+            "weights at SCALE in [0, 1]."
+        ),
+    )
+    parser.add_argument(
         "--penalty-scales",
         type=float,
         nargs=4,
@@ -299,6 +311,15 @@ def validate_train_args(args: argparse.Namespace) -> None:
     if args.reconstruction_gate_contact_bce_threshold <= 0.0:
         raise ValueError(
             "--reconstruction-gate-contact-bce-threshold must be positive."
+        )
+    if args.penalty_fixed is not None and (
+        not math.isfinite(args.penalty_fixed)
+        or not 0.0 <= args.penalty_fixed <= 1.0
+    ):
+        raise ValueError("--penalty_fixed must be finite and lie in [0, 1].")
+    if args.penalty_fixed is not None and args.disable_penalty_curriculum:
+        raise ValueError(
+            "--penalty_fixed cannot be combined with --disable-penalty-curriculum."
         )
     if not 0.0 <= args.reconstruction_gate_quality_ema_decay < 1.0:
         raise ValueError("--reconstruction-gate-quality-ema-decay must be in [0, 1).")

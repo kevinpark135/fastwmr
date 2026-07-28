@@ -40,6 +40,18 @@ DEFAULT_EPISODE_LENGTH_THRESHOLDS = (0.25, 0.5, 0.75)
 PENALTY_CURRICULUM_STATE_ATTR = "fastwmr_penalty_curriculum_state"
 
 
+def apply_fixed_penalty_scale(rewards_cfg: object, scale: float) -> None:
+    """Set the shared penalty weights to one stationary scale."""
+
+    if not math.isfinite(scale) or not 0.0 <= scale <= 1.0:
+        raise ValueError("Fixed penalty scale must be finite and lie in [0, 1].")
+    for term_name, target_weight in PENALTY_TARGET_WEIGHTS.items():
+        term_cfg = getattr(rewards_cfg, term_name, None)
+        if term_cfg is None:
+            raise ValueError(f"Reward configuration is missing penalty term {term_name!r}.")
+        term_cfg.weight = target_weight * scale
+
+
 def _validate_schedule(
     scales: Sequence[float],
     episode_length_thresholds: Sequence[float],

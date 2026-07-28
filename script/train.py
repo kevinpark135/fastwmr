@@ -99,6 +99,7 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.u
     sac_metrics_dict,
 )
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.curriculum import (
+    apply_fixed_penalty_scale,
     penalty_curriculum_state,
     terrain_curriculum_state,
 )
@@ -131,10 +132,14 @@ def _apply_rough_debug_overrides(cfg: object) -> None:
 
 
 def _apply_penalty_curriculum_overrides(cfg: object) -> None:
-    term = cfg.curriculum.penalty_weights
+    if ARGS.penalty_fixed is not None:
+        apply_fixed_penalty_scale(cfg.rewards, ARGS.penalty_fixed)
+        cfg.curriculum.penalty_weights = None
+        return
     if ARGS.disable_penalty_curriculum:
         cfg.curriculum.penalty_weights = None
         return
+    term = cfg.curriculum.penalty_weights
     term.params["scales"] = tuple(ARGS.penalty_scales)
     term.params["episode_length_thresholds"] = tuple(ARGS.penalty_length_thresholds)
     term.params["ema_decay"] = ARGS.penalty_ema_decay
@@ -738,6 +743,9 @@ def run() -> None:
                             }
                         )
                 curriculum_state = penalty_curriculum_state(raw_env.unwrapped)
+                metrics["curriculum/penalty_fixed"] = int(
+                    ARGS.penalty_fixed is not None
+                )
                 if curriculum_state is not None:
                     metrics.update(
                         {
@@ -745,6 +753,10 @@ def run() -> None:
                             for name, value in curriculum_state.items()
                         }
                     )
+                elif ARGS.penalty_fixed is not None:
+                    metrics["curriculum/penalty_scale"] = ARGS.penalty_fixed
+                elif ARGS.disable_penalty_curriculum:
+                    metrics["curriculum/penalty_scale"] = 1.0
                 record = logger.log(global_step, metrics)
                 print(format_console_metrics(record))
                 interval_reward_sum = 0.0

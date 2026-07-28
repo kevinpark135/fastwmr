@@ -9,6 +9,7 @@ import torch
 
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.curriculum import (
     PENALTY_TARGET_WEIGHTS,
+    apply_fixed_penalty_scale,
     penalty_curriculum_state,
     penalty_weight_curriculum,
     terrain_curriculum_state,
@@ -37,6 +38,26 @@ def _environment() -> SimpleNamespace:
         episode_length_buf=torch.zeros(4, dtype=torch.int64),
         reward_manager=_RewardManager(),
     )
+
+
+def test_fixed_penalty_scale_updates_every_shared_term() -> None:
+    rewards_cfg = SimpleNamespace(
+        **{
+            name: SimpleNamespace(weight=target)
+            for name, target in PENALTY_TARGET_WEIGHTS.items()
+        }
+    )
+
+    apply_fixed_penalty_scale(rewards_cfg, 0.25)
+
+    assert rewards_cfg.action_rate.weight == pytest.approx(-0.5)
+    assert rewards_cfg.close_feet.weight == pytest.approx(-2.5)
+
+
+@pytest.mark.parametrize("scale", (-0.1, 1.1, float("nan")))
+def test_fixed_penalty_scale_rejects_invalid_values(scale: float) -> None:
+    with pytest.raises(ValueError, match=r"lie in \[0, 1\]"):
+        apply_fixed_penalty_scale(SimpleNamespace(), scale)
 
 
 def test_penalty_curriculum_starts_weak_and_only_moves_up() -> None:
