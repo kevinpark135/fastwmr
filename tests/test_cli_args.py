@@ -42,7 +42,7 @@ def test_train_cli_defaults_to_fastwmr_and_validates() -> None:
         "foot_contacts",
     )
     assert not args.continue_online_estimator_after_snapshot
-    assert not args.keep_pre_snapshot_replay
+    assert not args.reset_replay_on_snapshot
     assert resolve_network_hidden_dims(args) == (512, 768)
     assert args.normalizer_freeze_iteration is None
     assert args.burn_in_length == 32

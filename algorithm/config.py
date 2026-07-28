@@ -346,7 +346,7 @@ class FastWMRV2Cfg:
     reconstruction_gate_quality_patience: int = 3
     reconstruction_gate_validation_interval: int = 8
     freeze_online_estimator_after_snapshot: bool = True
-    reset_replay_on_snapshot: bool = True
+    reset_replay_on_snapshot: bool = False
 
     def __post_init__(self) -> None:
         if self.estimator_update_interval <= 0:

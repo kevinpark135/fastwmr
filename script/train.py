@@ -397,7 +397,7 @@ def _build_components(
             freeze_online_estimator_after_snapshot=(
                 not ARGS.continue_online_estimator_after_snapshot
             ),
-            reset_replay_on_snapshot=not ARGS.keep_pre_snapshot_replay,
+            reset_replay_on_snapshot=ARGS.reset_replay_on_snapshot,
         )
         control_estimator = copy.deepcopy(estimator).to(device)
         ema_estimator = EMAControlEstimator(

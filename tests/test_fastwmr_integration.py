@@ -395,6 +395,7 @@ def test_v2_splits_sac_and_estimator_with_ema_gate_and_one_rebuild() -> None:
         reconstruction_gate_contact_bce_threshold=1.0e9,
         reconstruction_gate_quality_patience=1,
         reconstruction_gate_validation_interval=1,
+        reset_replay_on_snapshot=True,
     )
     (
         env,
@@ -469,6 +470,59 @@ def test_v2_splits_sac_and_estimator_with_ema_gate_and_one_rebuild() -> None:
     )
     newest = replay.chronological().reconstructions[-env.num_envs :]
     assert torch.count_nonzero(newest) > 0
+    env.close()
+
+
+def test_v2_preserves_replay_and_only_routes_exact_snapshot_features() -> None:
+    v2_cfg = FastWMRV2Cfg(
+        estimator_update_interval=8,
+        estimator_updates_per_trigger=1,
+        max_estimator_feature_age=100,
+        reconstruction_gate_warmup_updates=2,
+        reconstruction_gate_quality_threshold=1.0e9,
+        reconstruction_gate_base_velocity_rmse_threshold=1.0e9,
+        reconstruction_gate_contact_bce_threshold=1.0e9,
+        reconstruction_gate_quality_patience=1,
+        reconstruction_gate_validation_interval=1,
+    )
+    (
+        env,
+        replay,
+        _normalizer,
+        _online_estimator,
+        _estimator_updater,
+        _runtime,
+        controller,
+        update_loop,
+        collector,
+    ) = _integrated_pipeline(
+        version="v2",
+        num_updates=4,
+        v2_cfg=v2_cfg,
+    )
+    assert isinstance(controller, FastWMRV2EstimatorController)
+    assert isinstance(update_loop, FastWMRV2UpdateLoop)
+
+    collector.reset(seed=44)
+    for _ in range(3):
+        collector.collect_step()
+
+    assert controller.snapshot_active
+    assert controller.snapshot_replay_resets == 0
+    assert len(replay) == 6
+    assert update_loop.last_fresh_features == 0
+    assert update_loop.last_stale_features == 6
+
+    collector.collect_step()
+
+    assert len(replay) == 8
+    assert update_loop.last_fresh_features == 2
+    assert update_loop.last_stale_features == 6
+    assert replay.eligible_reconstruction_count(
+        current_estimator_version=controller.snapshot_estimator_version,
+        max_estimator_feature_age=0,
+        recent_transition_horizon=None,
+    ) == 2
     env.close()
 
 
@@ -860,6 +914,7 @@ def test_v2_checkpoint_restores_online_ema_scheduler_gate_and_policy_state(tmp_p
         reconstruction_gate_contact_bce_threshold=1.0e9,
         reconstruction_gate_quality_patience=1,
         reconstruction_gate_validation_interval=1,
+        reset_replay_on_snapshot=True,
     )
     source = _integrated_pipeline(
         version="v2",

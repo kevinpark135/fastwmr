@@ -1180,7 +1180,7 @@ class FastWMRV2UpdateLoop(FastSACReplayUpdateLoop):
         return self.replay.can_sample_reconstructions(
             self.cfg.batch_size,
             current_estimator_version=self.estimator_controller.control_estimator_version,
-            max_estimator_feature_age=self.v2_cfg.max_estimator_feature_age,
+            max_estimator_feature_age=self._effective_max_estimator_feature_age(),
             recent_transition_horizon=self.v2_cfg.stored_feature_replay_horizon,
         )
 
@@ -1204,6 +1204,7 @@ class FastWMRV2UpdateLoop(FastSACReplayUpdateLoop):
         estimator_updates: list[EstimatorUpdateResult] = []
         for _ in range(self.cfg.num_updates):
             current_version = self.estimator_controller.control_estimator_version
+            maximum_feature_age = self._effective_max_estimator_feature_age()
             reconstruction_gate = self.estimator_controller.reconstruction_gate
             minimum_fresh_fraction = (
                 reconstruction_gate * self.v2_cfg.fresh_reconstruction_fraction
@@ -1212,7 +1213,7 @@ class FastWMRV2UpdateLoop(FastSACReplayUpdateLoop):
                 replay_batch = self.replay.sample_reconstructions(
                     self.cfg.batch_size,
                     current_estimator_version=current_version,
-                    max_estimator_feature_age=self.v2_cfg.max_estimator_feature_age,
+                    max_estimator_feature_age=maximum_feature_age,
                     recent_transition_horizon=self.v2_cfg.stored_feature_replay_horizon,
                     minimum_fresh_fraction=minimum_fresh_fraction,
                     generator=generator,
@@ -1220,8 +1221,8 @@ class FastWMRV2UpdateLoop(FastSACReplayUpdateLoop):
                 feature_ages = replay_batch.feature_ages(current_version)
                 freshness = (
                     torch.ones_like(feature_ages, dtype=torch.bool)
-                    if self.v2_cfg.max_estimator_feature_age is None
-                    else feature_ages <= self.v2_cfg.max_estimator_feature_age
+                    if maximum_feature_age is None
+                    else feature_ages <= maximum_feature_age
                 )
             with self.profiler.measure("transfer"):
                 replay_batch = replay_batch.to(self.learner_device)
@@ -1267,7 +1268,7 @@ class FastWMRV2UpdateLoop(FastSACReplayUpdateLoop):
 
         self.last_fresh_features = self.replay.eligible_reconstruction_count(
             current_estimator_version=self.estimator_controller.control_estimator_version,
-            max_estimator_feature_age=self.v2_cfg.max_estimator_feature_age,
+            max_estimator_feature_age=self._effective_max_estimator_feature_age(),
             recent_transition_horizon=self.v2_cfg.stored_feature_replay_horizon,
         )
         self.last_eligible_features = self.replay.available_reconstruction_count(
@@ -1278,6 +1279,13 @@ class FastWMRV2UpdateLoop(FastSACReplayUpdateLoop):
         self.last_rejected_features = len(self.replay) - self.last_eligible_features
         self.last_estimator_updates = tuple(estimator_updates)
         return metrics
+
+    def _effective_max_estimator_feature_age(self) -> int | None:
+        # Once the control estimator is frozen, only that exact representation
+        # may contribute reconstruction. Older transitions remain valid SAC data.
+        if self.estimator_controller.snapshot_active:
+            return 0
+        return self.v2_cfg.max_estimator_feature_age
 
     def state_dict(self) -> dict[str, bool | int | float | str | None]:
         return {

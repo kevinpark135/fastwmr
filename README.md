@@ -159,7 +159,7 @@ FastWMR v2 adds the following two-timescale controls:
 | `--reconstruction-gate-quality-patience` | `3` | Require this many consecutive passes across all qualification thresholds. |
 | `--reconstruction-gate-validation-interval` | `8` | Validate snapshot quality every N estimator attempts before qualification. |
 | `--continue-online-estimator-after-snapshot` | disabled | Continue training the online estimator after qualification while keeping the control snapshot fixed. |
-| `--keep-pre-snapshot-replay` | disabled | Retain pre-qualification replay instead of clearing it when the snapshot activates. |
+| `--reset-replay-on-snapshot` | disabled | Clear all replay when the snapshot activates; intended only for reset ablations. |
 
 FastWMR control features contain normalized proprioception, 13 reconstructed
 world-state values, and one reconstruction-confidence value. The confidence is
@@ -172,11 +172,12 @@ FastWMR v2 first trains SAC with proprioception while the online recurrent
 estimator learns from replay. A separately sampled validation sequence must pass
 the total-loss, physical base-velocity RMSE, and contact-BCE thresholds for the
 configured patience. FastWMR then hard-copies one qualified estimator snapshot
-to the control path, freezes that snapshot, clears pre-snapshot replay, and
-ramps reconstruction into SAC monotonically. New transitions retain the fixed
-snapshot representation, so estimator drift no longer changes replay semantics.
-When confidence is zero, only reconstruction is masked; proprioception, action,
-reward, and bootstrap state remain usable.
+to the control path, freezes that snapshot, and ramps reconstruction into SAC
+monotonically. Pre-snapshot transitions remain in replay, but only
+reconstructions whose version exactly matches the frozen snapshot receive
+non-zero confidence. This preserves their proprioception, action, reward, and
+bootstrap state as a stable SAC anchor while estimator drift can no longer
+change replay semantics.
 
 The actor and critic use separate width controls: `--actor-hidden-dim 512` and
 `--critic-hidden-dim 768`. The legacy `--hidden-dim` option still overrides

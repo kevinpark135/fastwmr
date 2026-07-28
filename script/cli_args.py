@@ -160,9 +160,9 @@ def build_train_parser() -> argparse.ArgumentParser:
         help="Keep training the online estimator while the qualified control snapshot stays frozen.",
     )
     parser.add_argument(
-        "--keep-pre-snapshot-replay",
+        "--reset-replay-on-snapshot",
         action="store_true",
-        help="Do not clear pre-gate transitions when the control snapshot is qualified.",
+        help="Clear all replay when the control snapshot qualifies; intended for ablation.",
     )
     parser.add_argument("--sequence-batch-size", type=int, default=256)
     parser.add_argument("--burn-in-length", type=int, default=32)
@@ -319,7 +319,7 @@ def validate_train_args(args: argparse.Namespace) -> None:
         or tuple(args.control_reconstruction_fields)
         != DEFAULT_CONTROL_RECONSTRUCTION_FIELDS
         or args.continue_online_estimator_after_snapshot
-        or args.keep_pre_snapshot_replay
+        or args.reset_replay_on_snapshot
     )
     if args.task == FASTSAC_BASELINE_TASK and fastwmr_ablation_requested:
         raise ValueError("FastWMR estimator and sequence ablations require the FastWMR task.")
