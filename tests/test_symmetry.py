@@ -87,6 +87,28 @@ def test_action_mirror_matches_resolved_g1_joint_order() -> None:
     )
 
 
+def test_policy_mirror_swaps_left_and_right_gait_phase_channels() -> None:
+    cfg = DEFAULT_INTERFACE_CFG
+    observation = torch.zeros(1, cfg.policy_observation_dim)
+    observation[:, cfg.policy_observation_layout.field_slice("sin_phase")] = torch.tensor(
+        [[0.25, -0.75]]
+    )
+    observation[:, cfg.policy_observation_layout.field_slice("cos_phase")] = torch.tensor(
+        [[0.5, -0.5]]
+    )
+
+    mirrored = mirror_policy_observation(observation)
+
+    torch.testing.assert_close(
+        mirrored[:, cfg.policy_observation_layout.field_slice("sin_phase")],
+        torch.tensor([[-0.75, 0.25]]),
+    )
+    torch.testing.assert_close(
+        mirrored[:, cfg.policy_observation_layout.field_slice("cos_phase")],
+        torch.tensor([[-0.5, 0.5]]),
+    )
+
+
 def test_sequence_augmentation_appends_mirrored_raw_recurrent_inputs() -> None:
     sequence = _sequence()
     mirrored = mirror_sequence_batch(sequence)

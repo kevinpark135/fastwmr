@@ -205,13 +205,31 @@ def privileged_reconstruction_target(
     )
 
 
+def gait_phase_sin(
+    env: "ManagerBasedEnv",
+    command_name: str = "gait_phase",
+) -> torch.Tensor:
+    """Return sine-encoded left/right gait phases."""
+
+    return torch.sin(env.command_manager.get_command(command_name))
+
+
+def gait_phase_cos(
+    env: "ManagerBasedEnv",
+    command_name: str = "gait_phase",
+) -> torch.Tensor:
+    """Return cosine-encoded left/right gait phases."""
+
+    return torch.cos(env.command_manager.get_command(command_name))
+
+
 @configclass
 class FastWMRObservationsCfg:
     """Observation groups exposed by the FastWMR environment."""
 
     @configclass
     class PolicyCfg(ObsGroup):
-        """Deployable proprioception ``o_t`` in the canonical 96D order."""
+        """Deployable proprioception plus gait clock in canonical 100D order."""
 
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
         projected_gravity = ObsTerm(func=mdp.projected_gravity, noise=Unoise(n_min=-0.05, n_max=0.05))
@@ -227,6 +245,14 @@ class FastWMRObservationsCfg:
             noise=Unoise(n_min=-1.5, n_max=1.5),
         )
         previous_action = ObsTerm(func=mdp.last_action)
+        sin_phase = ObsTerm(
+            func=gait_phase_sin,
+            params={"command_name": "gait_phase"},
+        )
+        cos_phase = ObsTerm(
+            func=gait_phase_cos,
+            params={"command_name": "gait_phase"},
+        )
 
         def __post_init__(self) -> None:
             self.enable_corruption = True

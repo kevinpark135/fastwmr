@@ -3,7 +3,7 @@
 
 """FastSAC baseline task sharing the FastWMR G1 environment.
 
-The baseline changes only the observation schema: it receives deployable 96D
+The baseline changes only the observation schema: it receives deployable 100D
 proprioception without the privileged reconstruction target. Terrain, robot,
 actions, rewards, events, commands, and termination rules are inherited from
 the corresponding FastWMR training/play configs.

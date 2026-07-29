@@ -12,12 +12,17 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.c
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.fastwmr_env_cfg import (
     G1FastWMREnvCfg,
 )
+from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.g1_locomotion import (
+    G1_LOCOMOTION_ACTION_SCALE,
+)
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.observations import (
     FastWMRObservationsCfg,
     G1_29DOF_JOINT_PATTERNS,
     POLICY_TERM_NAMES,
     PRIVILEGED_TERM_NAMES,
     assemble_privileged_reconstruction_target,
+    gait_phase_cos,
+    gait_phase_sin,
     privileged_friction,
 )
 
@@ -50,10 +55,21 @@ def test_policy_observation_order_and_dimension() -> None:
         "joint_pos",
         "joint_vel",
         "previous_action",
+        "sin_phase",
+        "cos_phase",
     )
     assert layout.names == POLICY_TERM_NAMES
     assert _term_names(observations.policy) == POLICY_TERM_NAMES
-    assert layout.dim == 96
+    assert layout.dim == 100
+
+
+def test_gait_phase_observations_share_the_command_state() -> None:
+    phase = torch.tensor([[0.0, torch.pi], [-torch.pi / 2.0, torch.pi / 2.0]])
+    command_manager = SimpleNamespace(get_command=lambda name: phase)
+    env = SimpleNamespace(command_manager=command_manager)
+
+    torch.testing.assert_close(gait_phase_sin(env), torch.sin(phase))
+    torch.testing.assert_close(gait_phase_cos(env), torch.cos(phase))
 
 
 def test_privileged_target_order_and_loss_partition() -> None:
@@ -87,6 +103,7 @@ def test_environment_uses_the_same_29dof_contract() -> None:
 
     assert env_cfg.scene.robot.spawn.usd_path.endswith("/Unitree/G1/g1.usd")
     assert tuple(env_cfg.actions.joint_pos.joint_names) == G1_29DOF_JOINT_PATTERNS
+    assert env_cfg.actions.joint_pos.scale == G1_LOCOMOTION_ACTION_SCALE
     assert _term_names(env_cfg.observations.policy) == POLICY_TERM_NAMES
     assert _term_names(env_cfg.observations.privileged) == PRIVILEGED_TERM_NAMES
 

@@ -65,7 +65,7 @@ G1_29DOF_POSE_WEIGHTS = (
 DEFAULT_ROBOT_CFG = SceneEntityCfg("robot")
 DEFAULT_CONTROLLED_JOINT_CFG = SceneEntityCfg("robot", joint_names=list(G1_29DOF_JOINT_PATTERNS))
 DEFAULT_FEET_CFG = SceneEntityCfg("robot", body_names=[".*_ankle_roll_link"])
-DEFAULT_CONTACT_SENSOR_CFG = SceneEntityCfg("contact_forces", body_names=[".*_ankle_roll_link"])
+DEFAULT_HEIGHT_SENSOR_CFG = SceneEntityCfg("height_scanner")
 
 
 def base_stability_l2(
@@ -100,47 +100,95 @@ def weighted_joint_pose_l2(
     return torch.sum(torch.square(joint_pos - default_joint_pos) * weights, dim=-1)
 
 
-def swing_foot_height_exp(
-    env: "ManagerBasedRLEnv",
-    command_name: str,
-    target_height: float,
-    std: float,
-    asset_cfg: SceneEntityCfg = DEFAULT_FEET_CFG,
-    sensor_cfg: SceneEntityCfg = DEFAULT_CONTACT_SENSOR_CFG,
+def expected_foot_height(
+    phase: torch.Tensor,
+    swing_height: float,
 ) -> torch.Tensor:
-    """Reward swing feet for clearing the support foot by the target height.
+    """Map gait phase to Holosoma's cubic Bézier foot-height profile."""
 
-    Holosoma uses a phase-conditioned foot-height trajectory. FastWMR's fixed
-    96D policy observation intentionally has no gait phase, so this equivalent
-    uses foot contact and relative kinematics without an exteroceptive terrain
-    sensor or a hidden clock.
-    """
+    if swing_height <= 0.0:
+        raise ValueError("swing_height must be positive.")
+    normalized_phase = (phase + torch.pi) / (2.0 * torch.pi)
 
-    if target_height <= 0.0 or std <= 0.0:
-        raise ValueError("target_height and std must be positive.")
+    def cubic_bezier(start: torch.Tensor, end: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        blend = x**3 + 3.0 * x**2 * (1.0 - x)
+        return start + (end - start) * blend
 
+    zeros = torch.zeros_like(normalized_phase)
+    peaks = torch.full_like(normalized_phase, swing_height)
+    rising = cubic_bezier(zeros, peaks, 2.0 * normalized_phase)
+    falling = cubic_bezier(peaks, zeros, 2.0 * normalized_phase - 1.0)
+    return torch.where(normalized_phase <= 0.5, rising, falling)
+
+
+def terrain_relative_foot_heights(
+    foot_positions_w: torch.Tensor,
+    ray_hits_w: torch.Tensor,
+    fallback_terrain_height: torch.Tensor,
+) -> torch.Tensor:
+    """Estimate each foot's terrain clearance from its nearest scanner ray."""
+
+    if foot_positions_w.ndim != 3 or foot_positions_w.shape[1:] != (2, 3):
+        raise ValueError("foot_positions_w must have shape (N, 2, 3).")
+    if ray_hits_w.ndim != 3 or ray_hits_w.shape[0] != foot_positions_w.shape[0] or ray_hits_w.shape[-1] != 3:
+        raise ValueError("ray_hits_w must have shape (N, R, 3).")
+    if fallback_terrain_height.shape != (foot_positions_w.shape[0],):
+        raise ValueError("fallback_terrain_height must have shape (N,).")
+
+    finite_hits = torch.isfinite(ray_hits_w).all(dim=-1)
+    safe_hit_xy = torch.where(
+        finite_hits.unsqueeze(-1),
+        ray_hits_w[..., :2],
+        torch.zeros_like(ray_hits_w[..., :2]),
+    )
+    distance_squared = torch.sum(
+        torch.square(
+            foot_positions_w[:, :, None, :2] - safe_hit_xy[:, None, :, :]
+        ),
+        dim=-1,
+    )
+    distance_squared.masked_fill_(~finite_hits[:, None, :], torch.inf)
+    nearest_ray = distance_squared.argmin(dim=-1)
+    terrain_height = torch.gather(ray_hits_w[..., 2], 1, nearest_ray)
+    terrain_height = torch.where(
+        finite_hits.any(dim=-1, keepdim=True),
+        terrain_height,
+        fallback_terrain_height.unsqueeze(1),
+    )
+    return foot_positions_w[..., 2] - terrain_height
+
+
+def feet_phase_exp(
+    env: "ManagerBasedRLEnv",
+    gait_command_name: str,
+    swing_height: float,
+    tracking_sigma: float,
+    asset_cfg: SceneEntityCfg = DEFAULT_FEET_CFG,
+    height_sensor_cfg: SceneEntityCfg = DEFAULT_HEIGHT_SENSOR_CFG,
+) -> torch.Tensor:
+    """Reward terrain-relative foot heights that follow the shared gait phase."""
+
+    if swing_height <= 0.0 or tracking_sigma <= 0.0:
+        raise ValueError("swing_height and tracking_sigma must be positive.")
     asset = env.scene[asset_cfg.name]
-    contact_sensor = env.scene[sensor_cfg.name]
-    foot_z = asset.data.body_pos_w.torch[:, asset_cfg.body_ids, 2]
+    foot_positions_w = asset.data.body_pos_w.torch[:, asset_cfg.body_ids]
+    if foot_positions_w.shape[1] != 2:
+        raise ValueError(f"Expected two feet, got {foot_positions_w.shape[1]} bodies.")
+    height_sensor = env.scene[height_sensor_cfg.name]
+    foot_heights = terrain_relative_foot_heights(
+        foot_positions_w,
+        height_sensor.data.ray_hits_w.torch,
+        env.scene.env_origins[:, 2],
+    )
 
-    force_history = contact_sensor.data.net_forces_w_history
-    if force_history is None:
-        raise RuntimeError("Foot-height reward requires contact-force history.")
-    contacts = force_history.torch[:, :, sensor_cfg.body_ids, :].norm(dim=-1).amax(dim=1) > 1.0
-    stance = contacts.to(dtype=foot_z.dtype)
-    stance_count = stance.sum(dim=-1, keepdim=True)
-    support_z = (foot_z * stance).sum(dim=-1, keepdim=True) / stance_count.clamp_min(1.0)
-    support_z = torch.where(stance_count > 0, support_z, foot_z.amin(dim=-1, keepdim=True))
-    height_error = torch.square(foot_z - support_z - target_height)
-
-    swing = ~contacts
-    per_foot_reward = torch.exp(-height_error / std) * swing
-    swing_count = swing.sum(dim=-1)
-    tracked_swing = per_foot_reward.sum(dim=-1) / swing_count.clamp_min(1)
-
-    command = env.command_manager.get_command(command_name)
-    moving = torch.linalg.vector_norm(command[:, :3], dim=-1) > 0.1
-    return torch.where(moving & (swing_count > 0), tracked_swing, torch.ones_like(tracked_swing))
+    phase = env.command_manager.get_command(gait_command_name)
+    if phase.shape != foot_heights.shape:
+        raise ValueError(
+            f"Gait phase must have shape {tuple(foot_heights.shape)}, got {tuple(phase.shape)}."
+        )
+    target_heights = expected_foot_height(phase, swing_height)
+    total_error = torch.square(foot_heights - target_heights).sum(dim=-1)
+    return torch.exp(-total_error / tracking_sigma)
 
 
 def close_feet_xy(
@@ -198,15 +246,15 @@ class FastSACMinimalRewardsCfg:
         params={"orientation_scale": 10.0, "asset_cfg": DEFAULT_ROBOT_CFG},
     )
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-2.0)
-    swing_foot_height = RewTerm(
-        func=swing_foot_height_exp,
+    feet_phase = RewTerm(
+        func=feet_phase_exp,
         weight=5.0,
         params={
-            "command_name": "base_velocity",
-            "target_height": 0.09,
-            "std": 0.008,
+            "gait_command_name": "gait_phase",
+            "swing_height": 0.09,
+            "tracking_sigma": 0.008,
             "asset_cfg": DEFAULT_FEET_CFG,
-            "sensor_cfg": DEFAULT_CONTACT_SENSOR_CFG,
+            "height_sensor_cfg": DEFAULT_HEIGHT_SENSOR_CFG,
         },
     )
     joint_pose = RewTerm(
@@ -232,7 +280,7 @@ FASTSAC_REWARD_TERM_NAMES = (
     "track_ang_vel",
     "base_stability",
     "action_rate",
-    "swing_foot_height",
+    "feet_phase",
     "joint_pose",
     "close_feet",
     "feet_orientation",

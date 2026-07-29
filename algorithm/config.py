@@ -99,6 +99,8 @@ def make_policy_observation_layout(action_dim: int) -> TensorLayoutSpec:
             TensorFieldSpec("joint_pos", action_dim),
             TensorFieldSpec("joint_vel", action_dim),
             TensorFieldSpec("previous_action", action_dim),
+            TensorFieldSpec("sin_phase", 2),
+            TensorFieldSpec("cos_phase", 2),
         )
     )
 
@@ -182,7 +184,7 @@ class FastWMRInterfaceCfg:
 
 
 DEFAULT_INTERFACE_CFG = FastWMRInterfaceCfg()
-"""Default 29-DoF contract: 96D policy obs, 13D target, 1D confidence."""
+"""Default 29-DoF contract: 100D policy obs, 13D target, 1D confidence."""
 
 
 @dataclass(frozen=True)

@@ -93,6 +93,77 @@ class EpisodeStatisticsTracker:
         self._lengths.zero_()
 
 
+class RewardTermStatisticsTracker:
+    """Average weighted reward-term contributions over one logging interval."""
+
+    def __init__(
+        self,
+        term_names: tuple[str, ...],
+        *,
+        step_dt: float,
+        device: torch.device | str,
+    ) -> None:
+        if not term_names or any(not name for name in term_names):
+            raise ValueError("Reward term names must be non-empty.")
+        if len(term_names) != len(set(term_names)):
+            raise ValueError("Reward term names must be unique.")
+        if not math.isfinite(step_dt) or step_dt <= 0.0:
+            raise ValueError("step_dt must be finite and positive.")
+        self.term_names = term_names
+        self.step_dt = step_dt
+        self.device = torch.device(device)
+        self._sums = torch.zeros(
+            len(term_names),
+            device=self.device,
+            dtype=torch.float64,
+        )
+        self._steps = 0
+
+    @torch.no_grad()
+    def update(self, weighted_terms_per_second: torch.Tensor) -> None:
+        """Accumulate IsaacLab's weighted per-second reward term tensor."""
+
+        if (
+            weighted_terms_per_second.ndim != 2
+            or weighted_terms_per_second.shape[1] != len(self.term_names)
+            or weighted_terms_per_second.shape[0] == 0
+        ):
+            raise ValueError(
+                "Reward term values must have shape "
+                f"(N, {len(self.term_names)}) with N > 0."
+            )
+        if weighted_terms_per_second.device != self.device:
+            raise ValueError("Reward term values must share the tracker device.")
+        if (
+            not weighted_terms_per_second.dtype.is_floating_point
+            or not torch.isfinite(weighted_terms_per_second).all()
+        ):
+            raise ValueError("Reward term values must be finite floating-point values.")
+
+        per_step_contribution = weighted_terms_per_second.mean(dim=0) * self.step_dt
+        self._sums.add_(per_step_contribution.to(dtype=torch.float64))
+        self._steps += 1
+
+    def drain(self, *, prefix: str = "reward/") -> dict[str, float]:
+        """Return interval means and reset the accumulator."""
+
+        if not prefix:
+            raise ValueError("Reward metric prefix must not be empty.")
+        if self._steps == 0:
+            return {}
+        means = (self._sums / self._steps).cpu().tolist()
+        metrics = {
+            f"{prefix}{name}_mean": float(value)
+            for name, value in zip(self.term_names, means, strict=True)
+        }
+        self.reset()
+        return metrics
+
+    def reset(self) -> None:
+        self._sums.zero_()
+        self._steps = 0
+
+
 class TrainingMetricsLogger:
     """Write finite scalar records to JSONL and TensorBoard together."""
 

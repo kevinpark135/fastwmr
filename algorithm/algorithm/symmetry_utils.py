@@ -68,6 +68,9 @@ def mirror_policy_observation(
     for name in ("joint_pos", "joint_vel", "previous_action"):
         field_slice = layout.field_slice(name)
         mirrored[..., field_slice] = mirror_action(observation[..., field_slice])
+    for name in ("sin_phase", "cos_phase"):
+        field_slice = layout.field_slice(name)
+        mirrored[..., field_slice] = observation[..., field_slice].flip(-1)
     return mirrored
 
 

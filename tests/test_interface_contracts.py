@@ -15,12 +15,12 @@ def test_default_interface_dimensions() -> None:
     cfg = DEFAULT_INTERFACE_CFG
 
     assert cfg.action_dim == 29
-    assert cfg.policy_observation_dim == 96
+    assert cfg.policy_observation_dim == 100
     assert cfg.reconstruction_target_dim == 13
     assert cfg.reconstruction_confidence_dim == 1
-    assert cfg.control_feature_dim == 110
+    assert cfg.control_feature_dim == 114
     assert cfg.actor_input_dim == cfg.critic_state_dim == cfg.control_feature_dim
-    assert cfg.critic_input_dim == 139
+    assert cfg.critic_input_dim == 143
 
 
 def test_reconstruction_only_ablation_changes_both_control_inputs() -> None:

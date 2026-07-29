@@ -130,6 +130,18 @@ def _validate_range(value_range: tuple[float, float], name: str) -> None:
         raise ValueError(f"{name} lower bound must not exceed its upper bound.")
 
 
+def external_wrench_curriculum_scale(common_step: int, warmup_steps: int, ramp_steps: int) -> float:
+    """Return the disturbance multiplier for the current environment step."""
+
+    if common_step < 0 or warmup_steps < 0 or ramp_steps < 0:
+        raise ValueError("Wrench curriculum steps must be non-negative.")
+    if common_step <= warmup_steps:
+        return 0.0
+    if ramp_steps == 0:
+        return 1.0
+    return min(1.0, (common_step - warmup_steps) / ramp_steps)
+
+
 def _asset_env_ids(env: "ManagerBasedEnv", env_ids: torch.Tensor | None, device: torch.device) -> torch.Tensor:
     return _resolve_env_ids(env, env_ids, device).to(dtype=torch.int32)
 
@@ -256,8 +268,10 @@ def sample_apply_record_external_wrench(
     force_range: tuple[float, float],
     torque_range: tuple[float, float],
     asset_cfg: SceneEntityCfg,
+    warmup_steps: int = 0,
+    ramp_steps: int = 0,
 ) -> None:
-    """Apply one body-frame pelvis wrench per episode and record the exact 6D value."""
+    """Apply and record a pelvis wrench with an optional early-training ramp."""
 
     _validate_range(force_range, "force_range")
     _validate_range(torque_range, "torque_range")
@@ -265,8 +279,10 @@ def sample_apply_record_external_wrench(
     ids = _asset_env_ids(env, env_ids, asset.device)
     body_ids = _single_body_id(asset_cfg, "external wrench randomization", asset.device)
     size = (ids.numel(), 1, 3)
-    forces = torch.empty(size, device=asset.device).uniform_(*force_range)
-    torques = torch.empty(size, device=asset.device).uniform_(*torque_range)
+    common_step = int(getattr(env, "common_step_counter", warmup_steps + ramp_steps))
+    scale = external_wrench_curriculum_scale(common_step, warmup_steps, ramp_steps)
+    forces = torch.empty(size, device=asset.device).uniform_(*force_range).mul_(scale)
+    torques = torch.empty(size, device=asset.device).uniform_(*torque_range).mul_(scale)
     asset.permanent_wrench_composer.set_forces_and_torques_index(
         forces=forces,
         torques=torques,

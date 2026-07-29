@@ -12,7 +12,9 @@ deployable proprioceptive observation and the estimator's reconstruction.
 ## Features
 
 - FastWMR and FastSAC baseline tasks on the same G1 rough-terrain environment.
-- A canonical 96D proprioceptive policy observation and 13D privileged world-state
+- A Holosoma-aligned G1 locomotion pose, joint-wise PD controller, 0.25 action
+  scale, and pelvis/hip/shoulder contact termination.
+- A canonical 100D proprioceptive/gait-phase policy observation and 13D privileged world-state
   reconstruction target.
 - Boundary-safe sequence replay with episode-aware sampling, recurrent burn-in,
   and a separate estimator rollout cache.
@@ -47,6 +49,7 @@ fastwmr/
 ├── tests/               # Unit, integration, contract, and task smoke tests
 ├── fastwmr_env_cfg.py   # FastWMR G1 environment configuration
 ├── baseline_env_cfg.py  # Shared-environment FastSAC baseline
+├── g1_locomotion.py     # G1 locomotion pose, PD gains, and terrain preset
 ├── observations.py      # Policy observations and privileged estimator targets
 ├── rewards.py           # Minimal locomotion reward specification
 ├── randomization.py     # Sample, apply, and record domain randomization

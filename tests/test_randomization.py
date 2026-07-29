@@ -18,6 +18,7 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.randomizati
     FASTWMR_FRICTION_ATTR,
     FASTWMR_PAYLOAD_MASS_ATTR,
     FASTWMR_PUSH_FORCE_TORQUES_ATTR,
+    external_wrench_curriculum_scale,
     initialize_fastwmr_dr_buffers,
     randomize_and_record_friction,
     randomize_and_record_payload_mass,
@@ -104,11 +105,25 @@ def test_environment_registers_exact_sample_apply_record_events() -> None:
     assert cfg.events.push_robot is None
     assert cfg.events.randomize_fastwmr_friction.func is randomize_and_record_friction
     assert cfg.events.randomize_fastwmr_friction.mode == "startup"
-    assert cfg.events.randomize_fastwmr_friction.params["friction_range"] == (0.2, 1.5)
+    assert cfg.events.randomize_fastwmr_friction.params["friction_range"] == (0.5, 1.25)
     assert cfg.events.randomize_fastwmr_payload.func is randomize_and_record_payload_mass
     assert cfg.events.randomize_fastwmr_payload.mode == "startup"
-    assert cfg.events.randomize_fastwmr_payload.params["payload_mass_range"] == (-5.0, 5.0)
+    assert cfg.events.randomize_fastwmr_payload.params["payload_mass_range"] == (-1.0, 3.0)
     assert cfg.events.base_external_force_torque.func is sample_apply_record_external_wrench
     assert cfg.events.base_external_force_torque.mode == "reset"
-    assert cfg.events.base_external_force_torque.params["force_range"] == (-50.0, 50.0)
-    assert cfg.events.base_external_force_torque.params["torque_range"] == (-10.0, 10.0)
+    assert cfg.events.base_external_force_torque.params["force_range"] == (-20.0, 20.0)
+    assert cfg.events.base_external_force_torque.params["torque_range"] == (-5.0, 5.0)
+    assert cfg.events.base_external_force_torque.params["warmup_steps"] == 500
+    assert cfg.events.base_external_force_torque.params["ramp_steps"] == 1000
+
+
+def test_external_wrench_curriculum_waits_then_ramps_monotonically() -> None:
+    assert external_wrench_curriculum_scale(0, 500, 1000) == 0.0
+    assert external_wrench_curriculum_scale(500, 500, 1000) == 0.0
+    assert external_wrench_curriculum_scale(750, 500, 1000) == pytest.approx(0.25)
+    assert external_wrench_curriculum_scale(1000, 500, 1000) == pytest.approx(0.5)
+    assert external_wrench_curriculum_scale(1500, 500, 1000) == 1.0
+    assert external_wrench_curriculum_scale(5000, 500, 1000) == 1.0
+
+    with pytest.raises(ValueError, match="non-negative"):
+        external_wrench_curriculum_scale(-1, 500, 1000)

@@ -20,6 +20,7 @@ from .feature_builder import (
 from .logging_utils import (
     CompletedEpisodeStatistics,
     EpisodeStatisticsTracker,
+    RewardTermStatisticsTracker,
     TrainingMetricsLogger,
     estimator_metrics_dict,
     fastwmr_agent_metrics_dict,
@@ -54,6 +55,7 @@ __all__ = [
     "RecurrentState",
     "RecurrentStateManager",
     "RunningObservationNormalizer",
+    "RewardTermStatisticsTracker",
     "StageProfiler",
     "TrainingMetricsLogger",
     "aggregate_evaluation_records",

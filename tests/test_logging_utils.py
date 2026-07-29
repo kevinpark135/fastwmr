@@ -14,6 +14,7 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.c
 )
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.utils import (
     EpisodeStatisticsTracker,
+    RewardTermStatisticsTracker,
     TrainingMetricsLogger,
     fastwmr_agent_metrics_dict,
     fastwmr_v2_metrics_dict,
@@ -48,6 +49,26 @@ def test_episode_statistics_track_asynchronous_vector_resets() -> None:
     assert third.count == 1
     assert third.mean_return == pytest.approx(12.0)
     assert third.mean_length == pytest.approx(3.0)
+
+
+def test_reward_term_statistics_match_weighted_per_step_contributions() -> None:
+    tracker = RewardTermStatisticsTracker(
+        ("tracking", "penalty"),
+        step_dt=0.1,
+        device="cpu",
+    )
+    tracker.update(torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
+    tracker.update(torch.tensor([[5.0, 6.0], [7.0, 8.0]]))
+
+    metrics = tracker.drain()
+
+    assert metrics == pytest.approx(
+        {
+            "reward/tracking_mean": 0.4,
+            "reward/penalty_mean": 0.5,
+        }
+    )
+    assert tracker.drain() == {}
 
 
 def test_training_logger_writes_flat_finite_jsonl_and_appends(tmp_path) -> None:

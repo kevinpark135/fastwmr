@@ -3,21 +3,25 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+from copy import deepcopy
 
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.configclass import configclass
 
 from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import (
+    CommandsCfg,
     LocomotionVelocityRoughEnvCfg,
 )
 
-##
-# Pre-defined configs
-##
-from isaaclab_assets import G1_29DOF_CFG  # isort: skip
-
 from .curriculum import FastWMRCurriculumCfg
+from .gait import GaitPhaseCommandCfg
+from .g1_locomotion import (
+    G1_LOCOMOTION_ACTION_SCALE,
+    G1_LOCOMOTION_CFG,
+    G1_LOCOMOTION_TERMINATION_BODY_NAMES,
+    G1_LOCOMOTION_TERRAINS_CFG,
+)
 from .observations import FastWMRObservationsCfg, G1_29DOF_JOINT_PATTERNS
 from .randomization import (
     initialize_fastwmr_dr_buffers,
@@ -26,6 +30,13 @@ from .randomization import (
     sample_apply_record_external_wrench,
 )
 from .rewards import FastSACMinimalRewardsCfg
+
+
+@configclass
+class FastWMRCommandsCfg(CommandsCfg):
+    """Velocity command plus the gait phase shared by policy and reward."""
+
+    gait_phase = GaitPhaseCommandCfg()
 
 
 @configclass
@@ -41,6 +52,7 @@ class G1FastWMREnvCfg(LocomotionVelocityRoughEnvCfg):
     rewards: FastSACMinimalRewardsCfg = FastSACMinimalRewardsCfg()
     observations: FastWMRObservationsCfg = FastWMRObservationsCfg()
     curriculum: FastWMRCurriculumCfg = FastWMRCurriculumCfg()
+    commands: FastWMRCommandsCfg = FastWMRCommandsCfg()
 
     def __post_init__(self):
         # post init of parent
@@ -50,16 +62,21 @@ class G1FastWMREnvCfg(LocomotionVelocityRoughEnvCfg):
         # threshold to 0.8 rad/s (defaults work for quadrupeds).
         self.commands.base_velocity.vel_yaw_success_threshold = 0.8
         # Scene
-        self.scene.robot = G1_29DOF_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        self.scene.robot = G1_LOCOMOTION_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
         # Contact rewards and the privileged foot-contact target both require
         # PhysX contact reporters on the robot bodies.
         self.scene.robot.spawn.activate_contact_sensors = True
         self.scene.height_scanner.prim_path = "{ENV_REGEX_NS}/Robot/pelvis"
+        self.scene.terrain.terrain_generator = deepcopy(G1_LOCOMOTION_TERRAINS_CFG)
+        # Begin at the easiest generated row. Isaac Lab's terrain curriculum
+        # promotes successful environments instead of spawning G1 at level 0-5.
+        self.scene.terrain.max_init_terrain_level = 0
 
         # Action, joint-position observation, and joint-velocity observation
         # must resolve against the same 29 body joints in articulation order.
         self.actions.joint_pos.joint_names = list(G1_29DOF_JOINT_PATTERNS)
         self.actions.joint_pos.preserve_order = False
+        self.actions.joint_pos.scale = G1_LOCOMOTION_ACTION_SCALE
 
         # Each FastWMR DR event owns sample -> physics application -> recording.
         # Disable the inherited terms because their internal samples are not
@@ -76,7 +93,7 @@ class G1FastWMREnvCfg(LocomotionVelocityRoughEnvCfg):
             func=randomize_and_record_friction,
             mode="startup",
             params={
-                "friction_range": (0.2, 1.5),
+                "friction_range": (0.5, 1.25),
                 "restitution": 0.0,
                 "num_buckets": 64,
                 "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
@@ -86,7 +103,7 @@ class G1FastWMREnvCfg(LocomotionVelocityRoughEnvCfg):
             func=randomize_and_record_payload_mass,
             mode="startup",
             params={
-                "payload_mass_range": (-5.0, 5.0),
+                "payload_mass_range": (-1.0, 3.0),
                 "asset_cfg": SceneEntityCfg("robot", body_names="pelvis"),
                 "min_mass": 1.0,
             },
@@ -95,9 +112,11 @@ class G1FastWMREnvCfg(LocomotionVelocityRoughEnvCfg):
             func=sample_apply_record_external_wrench,
             mode="reset",
             params={
-                "force_range": (-50.0, 50.0),
-                "torque_range": (-10.0, 10.0),
+                "force_range": (-20.0, 20.0),
+                "torque_range": (-5.0, 5.0),
                 "asset_cfg": SceneEntityCfg("robot", body_names="pelvis"),
+                "warmup_steps": 500,
+                "ramp_steps": 1000,
             },
         )
         self.events.push_robot = None
@@ -108,9 +127,13 @@ class G1FastWMREnvCfg(LocomotionVelocityRoughEnvCfg):
         self.commands.base_velocity.ranges.lin_vel_x = (0.0, 1.0)
         self.commands.base_velocity.ranges.lin_vel_y = (-0.0, 0.0)
         self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
+        self.commands.base_velocity.rel_standing_envs = 0.2
 
         # terminations
-        self.terminations.base_contact.params["sensor_cfg"].body_names = "pelvis"
+        self.terminations.base_contact.params["sensor_cfg"].body_names = list(
+            G1_LOCOMOTION_TERMINATION_BODY_NAMES
+        )
+        self.terminations.base_contact.params["threshold"] = 1.0
 
 
 @configclass
@@ -135,6 +158,8 @@ class G1FastWMREnvCfg_PLAY(G1FastWMREnvCfg):
         self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
         self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
         self.commands.base_velocity.ranges.heading = (0.0, 0.0)
+        self.commands.gait_phase.randomize_phase = False
+        self.commands.gait_phase.frequency_randomization_width = 0.0
         # disable randomization for play
         self.observations.policy.enable_corruption = False
         self.events.randomize_fastwmr_friction.params["friction_range"] = (0.8, 0.8)
