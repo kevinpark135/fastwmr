@@ -12,6 +12,8 @@ from pathlib import Path
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
+from .locomotion_diagnostics import LOCOMOTION_TENSORBOARD_LAYOUT
+
 
 _CONSOLE_HEADERS = (
     "Step",
@@ -192,6 +194,7 @@ class TrainingMetricsLogger:
             max_queue=100,
             flush_secs=10,
         )
+        self._tensorboard.add_custom_scalars(LOCOMOTION_TENSORBOARD_LAYOUT)
         self.records_written = 0
 
     def log(self, step: int, metrics: Mapping[str, int | float]) -> Mapping[str, int | float | str]:

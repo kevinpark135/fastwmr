@@ -7,11 +7,14 @@ from copy import deepcopy
 
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils.configclass import configclass
 
+import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import (
     CommandsCfg,
     LocomotionVelocityRoughEnvCfg,
+    TerminationsCfg,
 )
 
 from .curriculum import FastWMRCurriculumCfg
@@ -19,7 +22,7 @@ from .gait import GaitPhaseCommandCfg
 from .g1_locomotion import (
     G1_LOCOMOTION_ACTION_SCALE,
     G1_LOCOMOTION_CFG,
-    G1_LOCOMOTION_TERMINATION_BODY_NAMES,
+    G1_LOCOMOTION_TERMINATION_BODY_GROUPS,
     G1_LOCOMOTION_TERRAINS_CFG,
 )
 from .observations import FastWMRObservationsCfg, G1_29DOF_JOINT_PATTERNS
@@ -40,6 +43,43 @@ class FastWMRCommandsCfg(CommandsCfg):
 
 
 @configclass
+class FastWMRTerminationsCfg(TerminationsCfg):
+    """Split illegal contacts so each G1 fall source is observable."""
+
+    base_contact = None
+    pelvis_contact = DoneTerm(
+        func=mdp.illegal_contact,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=list(G1_LOCOMOTION_TERMINATION_BODY_GROUPS["pelvis_contact"]),
+            ),
+            "threshold": 1.0,
+        },
+    )
+    hip_contact = DoneTerm(
+        func=mdp.illegal_contact,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=list(G1_LOCOMOTION_TERMINATION_BODY_GROUPS["hip_contact"]),
+            ),
+            "threshold": 1.0,
+        },
+    )
+    shoulder_contact = DoneTerm(
+        func=mdp.illegal_contact,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=list(G1_LOCOMOTION_TERMINATION_BODY_GROUPS["shoulder_contact"]),
+            ),
+            "threshold": 1.0,
+        },
+    )
+
+
+@configclass
 class G1FastWMREnvCfg(LocomotionVelocityRoughEnvCfg):
     """FastWMR G1 velocity task.
 
@@ -53,6 +93,7 @@ class G1FastWMREnvCfg(LocomotionVelocityRoughEnvCfg):
     observations: FastWMRObservationsCfg = FastWMRObservationsCfg()
     curriculum: FastWMRCurriculumCfg = FastWMRCurriculumCfg()
     commands: FastWMRCommandsCfg = FastWMRCommandsCfg()
+    terminations: FastWMRTerminationsCfg = FastWMRTerminationsCfg()
 
     def __post_init__(self):
         # post init of parent
@@ -128,13 +169,6 @@ class G1FastWMREnvCfg(LocomotionVelocityRoughEnvCfg):
         self.commands.base_velocity.ranges.lin_vel_y = (-0.0, 0.0)
         self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
         self.commands.base_velocity.rel_standing_envs = 0.2
-
-        # terminations
-        self.terminations.base_contact.params["sensor_cfg"].body_names = list(
-            G1_LOCOMOTION_TERMINATION_BODY_NAMES
-        )
-        self.terminations.base_contact.params["threshold"] = 1.0
-
 
 @configclass
 class G1FastWMREnvCfg_PLAY(G1FastWMREnvCfg):

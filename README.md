@@ -233,6 +233,26 @@ root. Monitor all runs with:
 tensorboard --logdir ~/IsaacLab/logs/fastwmr --port 6006
 ```
 
+Locomotion diagnostics are grouped under `locomotion/` in both TensorBoard and
+`metrics.jsonl`. TensorBoard's Custom Scalars page also exposes a
+`Locomotion Pins` layout for command tracking, stability, gait, and control.
+For the standard eight-card Time Series view, pin:
+
+```text
+episode/return_mean
+locomotion/linear_velocity_rmse
+locomotion/yaw_rate_rmse
+locomotion/non_timeout_termination_rate
+locomotion/base_height_mean
+locomotion/single_support_fraction
+locomotion/joint_tracking_rmse
+locomotion/torque_clipping_fraction
+```
+
+Additional `locomotion/` metrics separate pelvis, hip, and shoulder contact
+terminations and report foot contact balance, double support, airborne time,
+contacting-foot slip speed, action saturation, and base tilt.
+
 ### Resume Training
 
 Resume FastWMR from a versioned checkpoint while restoring model, optimizer,

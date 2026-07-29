@@ -119,29 +119,37 @@ def _check_reward_terms(task_id: str, env: object) -> None:
 
 
 def _check_termination_contract(task_id: str, env: object) -> None:
-    term_cfg = env.termination_manager.get_term_cfg("base_contact")
-    sensor_cfg = term_cfg.params["sensor_cfg"]
-    contact_sensor = env.scene[sensor_cfg.name]
-    resolved_names = {contact_sensor.body_names[index] for index in sensor_cfg.body_ids}
-    expected_names = {
-        "pelvis",
-        "left_hip_pitch_link",
-        "left_hip_roll_link",
-        "left_hip_yaw_link",
-        "right_hip_pitch_link",
-        "right_hip_roll_link",
-        "right_hip_yaw_link",
-        "left_shoulder_pitch_link",
-        "left_shoulder_roll_link",
-        "left_shoulder_yaw_link",
-        "right_shoulder_pitch_link",
-        "right_shoulder_roll_link",
-        "right_shoulder_yaw_link",
+    expected_groups = {
+        "pelvis_contact": {"pelvis"},
+        "hip_contact": {
+            "left_hip_pitch_link",
+            "left_hip_roll_link",
+            "left_hip_yaw_link",
+            "right_hip_pitch_link",
+            "right_hip_roll_link",
+            "right_hip_yaw_link",
+        },
+        "shoulder_contact": {
+            "left_shoulder_pitch_link",
+            "left_shoulder_roll_link",
+            "left_shoulder_yaw_link",
+            "right_shoulder_pitch_link",
+            "right_shoulder_roll_link",
+            "right_shoulder_yaw_link",
+        },
     }
-    if resolved_names != expected_names:
-        raise AssertionError(
-            f"{task_id} termination bodies are {sorted(resolved_names)}, expected {sorted(expected_names)}."
-        )
+    for term_name, expected_names in expected_groups.items():
+        term_cfg = env.termination_manager.get_term_cfg(term_name)
+        sensor_cfg = term_cfg.params["sensor_cfg"]
+        contact_sensor = env.scene[sensor_cfg.name]
+        resolved_names = {
+            contact_sensor.body_names[index] for index in sensor_cfg.body_ids
+        }
+        if resolved_names != expected_names:
+            raise AssertionError(
+                f"{task_id}/{term_name} bodies are {sorted(resolved_names)}, "
+                f"expected {sorted(expected_names)}."
+            )
 
 
 def _check_privileged_target(

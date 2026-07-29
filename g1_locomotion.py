@@ -28,6 +28,13 @@ G1_LOCOMOTION_TERMINATION_BODY_NAMES = (
 )
 """Bodies whose non-foot ground contact terminates a locomotion episode."""
 
+G1_LOCOMOTION_TERMINATION_BODY_GROUPS = {
+    "pelvis_contact": ("pelvis",),
+    "hip_contact": (".*_hip_.*_link",),
+    "shoulder_contact": (".*_shoulder_.*_link",),
+}
+"""Named contact groups used for both termination and fall diagnostics."""
+
 
 G1_LOCOMOTION_CFG = G1_29DOF_CFG.copy()
 G1_LOCOMOTION_CFG.init_state = ArticulationCfg.InitialStateCfg(
@@ -153,5 +160,6 @@ __all__ = [
     "G1_LOCOMOTION_ACTION_SCALE",
     "G1_LOCOMOTION_CFG",
     "G1_LOCOMOTION_TERMINATION_BODY_NAMES",
+    "G1_LOCOMOTION_TERMINATION_BODY_GROUPS",
     "G1_LOCOMOTION_TERRAINS_CFG",
 ]

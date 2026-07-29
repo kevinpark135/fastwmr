@@ -43,11 +43,21 @@ def test_locomotion_pd_gains_and_effort_limits_match_holosoma_g1() -> None:
 
 def test_environment_applies_locomotion_action_and_contact_contracts() -> None:
     cfg = G1FastWMREnvCfg()
-    termination_sensor = cfg.terminations.base_contact.params["sensor_cfg"]
 
     assert cfg.actions.joint_pos.scale == pytest.approx(G1_LOCOMOTION_ACTION_SCALE)
-    assert tuple(termination_sensor.body_names) == G1_LOCOMOTION_TERMINATION_BODY_NAMES
-    assert cfg.terminations.base_contact.params["threshold"] == pytest.approx(1.0)
+    assert cfg.terminations.base_contact is None
+    termination_terms = {
+        "pelvis_contact": ("pelvis",),
+        "hip_contact": (".*_hip_.*_link",),
+        "shoulder_contact": (".*_shoulder_.*_link",),
+    }
+    resolved_patterns = []
+    for name, expected_patterns in termination_terms.items():
+        term = getattr(cfg.terminations, name)
+        assert tuple(term.params["sensor_cfg"].body_names) == expected_patterns
+        assert term.params["threshold"] == pytest.approx(1.0)
+        resolved_patterns.extend(expected_patterns)
+    assert tuple(resolved_patterns) == G1_LOCOMOTION_TERMINATION_BODY_NAMES
 
 
 def test_environment_starts_with_holosoma_style_easy_mix() -> None:

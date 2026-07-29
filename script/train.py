@@ -88,6 +88,8 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.n
 )
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.utils import (
     EpisodeStatisticsTracker,
+    IsaacLabLocomotionDiagnosticSource,
+    LocomotionDiagnosticsTracker,
     IsaacLabEnvAdapter,
     RewardTermStatisticsTracker,
     RunningObservationNormalizer,
@@ -595,6 +597,15 @@ def run() -> None:
             step_dt=raw_env.unwrapped.step_dt,
             device=env.device,
         )
+        locomotion_source = IsaacLabLocomotionDiagnosticSource(
+            raw_env.unwrapped,
+            action_low=action_low,
+            action_high=action_high,
+        )
+        locomotion_tracker = LocomotionDiagnosticsTracker(
+            env.num_envs,
+            device=env.device,
+        )
         generator = torch.Generator(device="cpu").manual_seed(ARGS.seed)
         initial_gradient_steps = components.update_loop.gradient_steps
         interval_reward_sum = 0.0
@@ -614,6 +625,12 @@ def run() -> None:
             interval_reward_sum += float(result.rewards.mean().item())
             interval_steps += 1
             reward_term_tracker.update(reward_manager._step_reward)
+            locomotion_tracker.update(
+                locomotion_source.sample(
+                    terminated=result.terminated,
+                    truncated=result.truncated,
+                )
+            )
             completed = episode_tracker.update(
                 result.rewards,
                 result.terminated,
@@ -676,6 +693,7 @@ def run() -> None:
                     ),
                 }
                 metrics.update(reward_term_tracker.drain())
+                metrics.update(locomotion_tracker.drain())
                 oldest_insertion_id = components.replay.oldest_insertion_id
                 newest_insertion_id = components.replay.newest_insertion_id
                 if oldest_insertion_id is not None and newest_insertion_id is not None:

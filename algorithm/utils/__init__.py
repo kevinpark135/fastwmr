@@ -29,6 +29,13 @@ from .logging_utils import (
     format_console_metrics_header,
     sac_metrics_dict,
 )
+from .locomotion_diagnostics import (
+    IsaacLabLocomotionDiagnosticSource,
+    LOCOMOTION_PIN_METRICS,
+    LOCOMOTION_TENSORBOARD_LAYOUT,
+    LocomotionDiagnosticStep,
+    LocomotionDiagnosticsTracker,
+)
 from .normalization import RunningObservationNormalizer
 from .profiling import StageProfiler
 from .reconstruction import (
@@ -52,6 +59,11 @@ __all__ = [
     "EvaluationCondition",
     "EvaluationRecord",
     "IsaacLabEnvAdapter",
+    "IsaacLabLocomotionDiagnosticSource",
+    "LOCOMOTION_PIN_METRICS",
+    "LOCOMOTION_TENSORBOARD_LAYOUT",
+    "LocomotionDiagnosticStep",
+    "LocomotionDiagnosticsTracker",
     "RecurrentState",
     "RecurrentStateManager",
     "RunningObservationNormalizer",
