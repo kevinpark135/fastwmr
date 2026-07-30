@@ -128,7 +128,11 @@ def _apply_condition(cfg: object, condition: EvaluationCondition) -> None:
     cfg.curriculum.terrain_levels = None
     cfg.curriculum.penalty_weights = None
     cfg.observations.policy.enable_corruption = False
-    if condition is EvaluationCondition.FRICTION_LOW:
+    if condition is EvaluationCondition.NOMINAL_FLAT:
+        cfg.scene.terrain.terrain_type = "plane"
+        cfg.scene.terrain.terrain_generator = None
+        cfg.scene.terrain.max_init_terrain_level = None
+    elif condition is EvaluationCondition.FRICTION_LOW:
         cfg.events.randomize_fastwmr_friction.params["friction_range"] = (0.05, 0.05)
     elif condition is EvaluationCondition.FRICTION_HIGH:
         cfg.events.randomize_fastwmr_friction.params["friction_range"] = (2.0, 2.0)

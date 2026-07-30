@@ -5,6 +5,7 @@ import json
 import pytest
 
 from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.utils import (
+    EvaluationCondition,
     EvaluationRecord,
     aggregate_evaluation_records,
     load_evaluation_record,
@@ -12,6 +13,10 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.fastwmr.algorithm.u
     write_evaluation_record,
     write_evaluation_summary,
 )
+
+
+def test_evaluation_conditions_include_nominal_flat() -> None:
+    assert EvaluationCondition("nominal_flat") is EvaluationCondition.NOMINAL_FLAT
 
 
 def _record(

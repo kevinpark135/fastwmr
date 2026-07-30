@@ -279,8 +279,8 @@ python script/play.py \
 ```
 
 The evaluator infers FastWMR or FastSAC mode from the checkpoint. Available
-conditions are `nominal_rough`, `friction_low`, `friction_high`, `payload_heavy`,
-`strong_push`, `observation_noise`, and `observation_masking`.
+conditions are `nominal_flat`, `nominal_rough`, `friction_low`, `friction_high`,
+`payload_heavy`, `strong_push`, `observation_noise`, and `observation_masking`.
 
 Run the reproducible robustness matrix with at least three independently trained
 checkpoints per variant. Repeat `--checkpoint` and `--variant` as a pair; checkpoints

@@ -228,6 +228,21 @@ def test_play_cli_validates_fixed_budget(tmp_path) -> None:
     assert args.variant == "no_cutoff"
 
 
+def test_play_cli_accepts_nominal_flat_condition(tmp_path) -> None:
+    args = build_play_parser().parse_args(
+        [
+            "--checkpoint",
+            str(tmp_path / "checkpoint.pt"),
+            "--condition",
+            "nominal_flat",
+        ]
+    )
+
+    validate_play_args(args)
+
+    assert args.condition == "nominal_flat"
+
+
 @pytest.mark.parametrize(
     ("argument", "value", "message"),
     (

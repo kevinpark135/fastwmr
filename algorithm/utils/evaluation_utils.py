@@ -21,6 +21,7 @@ EVALUATION_FORMAT_VERSION = 2
 class EvaluationCondition(str, Enum):
     """Nominal and out-of-distribution rollout conditions from stage 9."""
 
+    NOMINAL_FLAT = "nominal_flat"
     NOMINAL_ROUGH = "nominal_rough"
     FRICTION_LOW = "friction_low"
     FRICTION_HIGH = "friction_high"

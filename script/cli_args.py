@@ -22,6 +22,7 @@ RECONSTRUCTION_FIELD_NAMES = (
     "foot_contacts",
 )
 EVALUATION_CONDITIONS = (
+    "nominal_flat",
     "nominal_rough",
     "friction_low",
     "friction_high",
